@@ -1,0 +1,37 @@
+{
+  "name": "dual-brain",
+  "version": "1.0.0",
+  "description": "Tiered model routing and GPT dual-brain code review for Claude Code",
+  "type": "module",
+  "bin": {
+    "dual-brain": "./install.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "orchestrator",
+    "model-routing",
+    "code-review",
+    "dual-brain",
+    "gpt",
+    "claude",
+    "ai-agent"
+  ],
+  "author": "joshfair2@gmail.com",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1xmint/dual-brain.git"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "install.mjs",
+    "hooks/",
+    "orchestrator.json",
+    "hookify.*.local.md",
+    "review-rules.md",
+    "README.md",
+    "LICENSE"
+  ]
+}
