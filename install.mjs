@@ -100,10 +100,16 @@ try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')); } catch {}
 
 const hooksConfig = {
   PreToolUse: [
-    { matcher: 'Agent', hooks: [`node ${join('.claude', 'hooks', 'enforce-tier.mjs')}`] },
+    {
+      matcher: 'Agent',
+      hooks: [{ type: 'command', command: `node ${join('.claude', 'hooks', 'enforce-tier.mjs')}` }],
+    },
   ],
   PostToolUse: [
-    { matcher: '', hooks: [`node ${join('.claude', 'hooks', 'cost-logger.mjs')}`] },
+    {
+      matcher: '',
+      hooks: [{ type: 'command', command: `node ${join('.claude', 'hooks', 'cost-logger.mjs')}` }],
+    },
   ],
 };
 

@@ -67,7 +67,7 @@ The `model_intelligence` section in `orchestrator.json` provides per-model metad
 ## Requirements
 
 - Node 20+
-- Codex CLI (optional) — for GPT-lane features: `npm i -g @anthropic-ai/codex` then `codex login`. Falls back to `OPENAI_API_KEY` env var. Without Codex, Claude-lane features work normally.
+- Codex CLI (optional) — for GPT-lane features: `npm i -g @openai/codex` then `codex login`. Falls back to `OPENAI_API_KEY` env var. Without Codex, Claude-lane features work normally.
 
 ## Works with any subscription
 
