@@ -1,7 +1,7 @@
 {
   "name": "dual-brain",
-  "version": "1.0.0",
-  "description": "Tiered model routing and GPT dual-brain code review for Claude Code",
+  "version": "2.0.0",
+  "description": "Dual-provider orchestration for Claude Code — tiered routing, budget balancing, and GPT dual-brain review across Claude + OpenAI subscriptions",
   "type": "module",
   "bin": {
     "dual-brain": "./install.mjs"
@@ -31,6 +31,7 @@
     "orchestrator.json",
     "hookify.*.local.md",
     "review-rules.md",
+    "CLAUDE.md",
     "README.md",
     "LICENSE"
   ]
