@@ -36,9 +36,10 @@ mkdirSync(join(TARGET, 'hooks'), { recursive: true });
 // Copy hooks
 const HOOKS = [
   'enforce-tier.mjs', 'cost-logger.mjs', 'cost-report.mjs',
-  'dual-brain-review.mjs', 'quality-gate.mjs', 'test-orchestrator.mjs',
-  'setup-wizard.mjs', 'health-check.mjs', 'install-git-hooks.mjs',
-  'session-report.mjs',
+  'dual-brain-review.mjs', 'dual-brain-think.mjs', 'quality-gate.mjs',
+  'test-orchestrator.mjs', 'setup-wizard.mjs', 'health-check.mjs',
+  'install-git-hooks.mjs', 'session-report.mjs', 'budget-balancer.mjs',
+  'gpt-work-dispatcher.mjs',
 ];
 
 for (const hook of HOOKS) {
@@ -71,6 +72,24 @@ if (!existsSync(rulesTarget)) {
 } else {
   console.log('  ⊘ review-rules.md already exists, skipping');
 }
+
+// Register hooks in .claude/settings.json
+const settingsPath = join(TARGET, 'settings.json');
+let settings = {};
+try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')); } catch {}
+
+const hooksConfig = {
+  PreToolUse: [
+    { matcher: 'Agent', hooks: [`node ${join('.claude', 'hooks', 'enforce-tier.mjs')}`] },
+  ],
+  PostToolUse: [
+    { matcher: '', hooks: [`node ${join('.claude', 'hooks', 'cost-logger.mjs')}`] },
+  ],
+};
+
+settings.hooks = { ...(settings.hooks || {}), ...hooksConfig };
+writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+console.log('  ✓ Registered hooks in .claude/settings.json');
 
 // Update .gitignore
 const gitignorePath = resolve(process.cwd(), '.gitignore');
