@@ -1,134 +1,83 @@
-# dual-brain
+# Dual-Brain Orchestrator
 
-Tiered model routing and GPT dual-brain code review for Claude Code.
+Dual-provider orchestration for Claude Code across Claude ($100 Max) and OpenAI ($100 Pro) subscriptions. Routes search work to Haiku, execution to Sonnet, and reserves Opus for thinking on the Claude lane. Dispatches isolated and long-running tasks to GPT via Codex CLI, with dual-brain analysis for high-risk decisions.
 
----
+## Install
 
-### What it does
+1. Copy the `.claude/` folder into your project root
+2. Run the setup wizard: `node .claude/hooks/setup-wizard.mjs`
+3. Restart your Claude Code session
 
-- Routes search work to cheap models (Haiku), execution to mid-tier (Sonnet), reserves expensive models (Opus) for thinking
-- Optionally sends diffs to GPT-5.5 for independent "dual-brain" code review via your ChatGPT subscription
-- Enforces quality gates at session end and git commit time
-- Tracks costs, detects drift, prevents duplicate work, and reports compliance
+The wizard asks about your subscription plans and generates `orchestrator.json` with the right models and cost rates for your tier.
 
----
+## How it works
 
-### Install
+Three hookify rules in `.claude/hookify.orchestrator-*.local.md` inject system messages at key moments:
 
-```bash
-npx dual-brain init
-node .claude/hooks/setup-wizard.mjs
-```
+- **Route** (UserPromptSubmit): Reminds the session to delegate subagents at the right tier
+- **Gate** (Stop): Catches code changes that weren't reviewed before the session ends
+- **Cost** (PostToolUse on Agent): Checks that dispatched subagents use the correct model tier
 
-Then restart Claude Code.
+A PreToolUse hook (`hooks/enforce-tier.mjs`) classifies Agent calls by keyword and advises the correct model when there's a mismatch.
 
----
+## Scripts
 
-### How it works
+| Script | Purpose |
+|--------|---------|
+| `hooks/setup-wizard.mjs` | Interactive setup — configure your subscription and preferences |
+| `hooks/cost-report.mjs` | Activity & cost estimates by model tier |
+| `hooks/dual-brain-review.mjs` | Send current git diff to GPT for independent review |
+| `hooks/quality-gate.mjs` | Config-driven quality gate with review artifacts |
+| `hooks/test-orchestrator.mjs` | Self-test harness — validates all hooks work correctly |
+| `hooks/cost-logger.mjs` | PostToolUse hook that logs usage data (runs automatically) |
+| `hooks/enforce-tier.mjs` | PreToolUse hook that enforces model tier routing (runs automatically) |
+| `hooks/install-git-hooks.mjs` | Install a git pre-commit hook that enforces the quality gate at commit time |
+| `hooks/health-check.mjs` | Verify all hooks and dependencies are configured and reachable |
+| `hooks/session-report.mjs` | Comprehensive session-end summary: activity, routing compliance, quality gate, data quality, drift warnings |
+| `hooks/budget-balancer.mjs` | Show provider balance and routing recommendations |
+| `hooks/gpt-work-dispatcher.mjs` | Dispatch execution tasks to GPT via Codex CLI |
+| `hooks/dual-brain-think.mjs` | Dual-perspective analysis on architecture decisions |
 
-Three tiers:
+## Codex Skills
 
-| Tier    | Model  | Use For                                  |
-|---------|--------|------------------------------------------|
-| Search  | Haiku  | File lookups, grep, explore, read-only   |
-| Execute | Sonnet | Implementation, edits, tests, git ops    |
-| Think   | Opus   | Architecture, review, planning, security |
+The `codex_skills` section in `orchestrator.json` registers CLI commands that can be invoked from any session:
 
-Two hooks run automatically:
+- `node .claude/hooks/dual-brain-review.mjs` — GPT code review via ChatGPT subscription
+- `node .claude/hooks/quality-gate.mjs` — run the quality gate (checks config, filters files, triggers review)
+- `node .claude/hooks/cost-report.mjs` — session activity and cost breakdown
+- `node .claude/hooks/test-orchestrator.mjs` — validate all hooks pass
+- `node .claude/hooks/session-report.mjs` — comprehensive session-end summary report
 
-- **PreToolUse** (`enforce-tier.mjs`): Classifies Agent calls by tier, warns on mismatches, detects duplicates, checks pricing drift
-- **PostToolUse** (`cost-logger.mjs`): Logs every tool call with daily rotation, budget alerts
+## Model Intelligence
 
----
+The `model_intelligence` section in `orchestrator.json` provides per-model metadata:
 
-### Dual-Brain Review
+- **strengths/weaknesses** — what each model is good and bad at
+- **best_for/avoid_for** — task guidance for the tier router
+- **context_window/max_output** — token limits per model
+- **codex_compatible** — whether the model works with `codex exec`
 
-Uses your ChatGPT subscription via Codex CLI — no API key needed. Claude writes code, GPT reviews it independently. Different models catch different bugs.
+The `enforce-tier.mjs` hook reads this data to give context-aware routing advice.
 
-```bash
-# Install Codex CLI and login
-npm i -g @openai/codex
-codex login
+### Known Issues
 
-# Run a review
-node .claude/hooks/dual-brain-review.mjs
-```
+- The `model:` parameter on Agent calls may be silently ignored in some Claude Code versions ([#43869](https://github.com/anthropics/claude-code/issues/43869)). Set `CLAUDE_CODE_SUBAGENT_MODEL` as env var fallback.
+- Opus 4.7 uses a new tokenizer that consumes 12-35% more tokens for the same text. Factor this into cost estimates.
+- Pricing was last verified 2026-05-13. Run the setup wizard to update rates.
 
-Falls back to `OPENAI_API_KEY` if Codex isn't available.
+## Customize
 
----
+Edit `orchestrator.json` to change:
+- `subscriptions` — your plans and available models per provider
+- `tiers` — which task types map to which tier
+- `quality_gate` — file extensions that trigger review, patterns to skip
+- `routing_rules` — subagent type defaults, concurrency limits
+- `codex_skills` — registered CLI skills
+- `review-rules.md` — project-specific rules injected into GPT review prompts
 
-### Scripts
+## Requirements
 
-| Script                    | What it does                                        |
-|---------------------------|-----------------------------------------------------|
-| `setup-wizard.mjs`        | Interactive config for your subscription plan       |
-| `health-check.mjs`        | Verify hooks are wired and system is healthy        |
-| `cost-report.mjs`         | Session cost estimates by model tier                |
-| `session-report.mjs`      | Full session summary: costs, compliance, gate status|
-| `quality-gate.mjs`        | Run GPT review on changed files                     |
-| `dual-brain-review.mjs`   | Send current diff to GPT for independent review     |
-| `install-git-hooks.mjs`   | Add quality gate to git pre-commit hook             |
-| `test-orchestrator.mjs`   | Self-test harness for all hooks                     |
-
----
-
-### Configuration
-
-`orchestrator.json` has four main sections:
-
-- **`subscriptions`** — your Claude and OpenAI plans with per-model pricing
-- **`model_intelligence`** — strengths, weaknesses, and best-for guidance per model
-- **`quality_gate`** — which file extensions trigger GPT review, what to skip
-- **`budgets`** — daily warn/limit thresholds for cost alerts
-
-Run `setup-wizard.mjs` to auto-configure based on your subscription plan.
-
----
-
-### Subscription Compatibility
-
-Works with any combination:
-
-| Claude plan   | OpenAI plan       | Dual-brain review |
-|---------------|-------------------|-------------------|
-| $20 / $100+   | $100+ / API       | Full (GPT-5.5)    |
-| $20 / $100+   | $20               | Partial (GPT-5.4) |
-| Any           | None              | Claude-only mode  |
-
-The setup wizard configures the right models and rates for your plan.
-
----
-
-### Requirements
-
-- Node 20+
-- Claude Code (CLI, desktop, or web)
-- Codex CLI (optional, for dual-brain review): `npm i -g @openai/codex`
-
----
-
-### Example output
-
-```
-  ╔══════════════════════════════════════╗
-  ║     Session Summary Report           ║
-  ╠══════════════════════════════════════╣
-  ║ Activity Summary                     ║
-  ║ Tier     │ Calls │ Est. Cost         ║
-  ║ Search   │    12 │      $0.04        ║
-  ║ Execute  │     8 │      $0.19        ║
-  ║ Think    │     2 │      $0.14        ║
-  ╠══════════════════════════════════════╣
-  ║ Routing Compliance                   ║
-  ║ Followed: 20 (91%)                   ║
-  ╠══════════════════════════════════════╣
-  ║ Quality Gate: pass                   ║
-  ╚══════════════════════════════════════╝
-```
-
----
-
-### License
-
-MIT
+- Node 20+ (for native fetch in dual-brain-review)
+- Python 3.12+ (optional, for hookify rule engine)
+- Hookify plugin installed (comes with Claude Code marketplace)
+- Codex CLI installed and logged into ChatGPT (`codex login`) — for GPT dual-brain review via subscription. Falls back to `OPENAI_API_KEY` env var if Codex isn't available.

@@ -3,13 +3,14 @@
 Project-specific rules for the dual-brain GPT review. Edit these for your repo.
 
 ## Framework & Tooling
-<!-- Example: Must use Express, not Koa -->
-<!-- Example: Must use pnpm, not npm -->
+- Must use Hono, not Fastify
+- Must use npm, not pnpm
+- Must use better-sqlite3 with raw SQL, no ORM
 
 ## Code Patterns
-<!-- Example: Use BigDecimal for currency math -->
-<!-- Example: Never use console.log in production code -->
+- Use round6() for all credit math
+- Use maskApiKey(), never raw .slice() for key masking
+- Import DB helpers from src/db/index.ts, not domain files
 
-## Architecture
-<!-- Example: All API routes must go through middleware/auth.ts -->
-<!-- Example: Database queries must use the query builder, no raw SQL -->
+## Data Integrity
+- Soma origin does not prove factual truth
