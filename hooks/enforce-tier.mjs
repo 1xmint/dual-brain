@@ -226,11 +226,11 @@ try {
     if (burstMode) {
       // In burst mode, only warn on exact hash matches (same description+prompt)
       if (duplicate.prompt_hash === promptHash) {
-        duplicateWarning = `**[Wave] [Duplicate Warning]** A similar agent task was dispatched ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago. Reuse the prior result unless the scope changed.`;
+        duplicateWarning = `Heads up — a similar task ran ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago (wave detected). Reuse that result if the scope hasn't changed.`;
       }
       // Otherwise suppress — similar-but-different agents in a wave are expected
     } else {
-      duplicateWarning = `**[Duplicate Warning]** A similar agent task was dispatched ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago. Reuse the prior result unless the scope changed.`;
+      duplicateWarning = `Heads up — a similar task ran ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago. Reuse that result if the scope hasn't changed.`;
     }
   }
 
@@ -278,10 +278,10 @@ try {
     ].filter(Boolean);
 
     if (detectedTiers.length > 1) {
-      const splitMsg = `**[Tier Enforcer]** This spans **${detectedTiers.join(' + ')}** work. Consider splitting: ` +
+      const splitMsg = `This spans ${detectedTiers.join(' + ')} work. Consider splitting: ` +
         (hasSearch ? 'search first (haiku), ' : '') +
         (hasExecute ? 'then execute edits (sonnet), ' : '') +
-        (hasThink ? 'keep planning/review on think tier (opus).' : '');
+        (hasThink ? 'keep planning/review on the main session (opus).' : '');
       const fullMsg = prependWarnings(splitMsg.replace(/, $/, '.'));
       logRecommendation({
         tier: detectedTiers.join('+'),
@@ -310,8 +310,8 @@ try {
   if ((riskResult.level === 'critical' || riskResult.level === 'high') && tier !== 'think') {
     tier = 'think';
     autoStatus = riskResult.level === 'critical'
-      ? `Dual-brain: dual-brain review recommended — ${riskResult.reason.split(':')[0]} detected`
-      : `Dual-brain: promoting to think tier — ${riskResult.reason.split(':')[0]}`;
+      ? `This touches ${riskResult.reason.split(':')[0].toLowerCase()} — recommending dual-brain review for safety.`
+      : `Promoting to think tier — this is ${riskResult.reason.split(':')[0].toLowerCase()}.`;
   }
 
   // Failure loop detection
@@ -320,11 +320,11 @@ try {
   if (failureCheck.isLoop) {
     if (failureCheck.suggestion === 'promote_tier' && tier === 'execute') {
       tier = 'think';
-      autoStatus = 'Dual-brain: escalating to think tier — previous attempt failed';
+      autoStatus = 'Escalating to think tier — this has failed before, let\'s take a different approach.';
     } else if (failureCheck.suggestion === 'escalate_to_dual_brain') {
-      autoStatus = 'Dual-brain: dual-brain review recommended — repeated failures detected';
+      autoStatus = 'Repeated failures detected — recommending dual-brain review to diagnose the issue.';
     }
-    failureMessage = `**[Failure Loop]** ${failureCheck.count} failed attempts in 2hrs. Consider: \`node .claude/hooks/dual-brain-think.mjs --question "why is this failing?"\``;
+    failureMessage = `⚠️ This has failed ${failureCheck.count} times in the last 2 hours. Consider a dual-brain think session to diagnose the root cause.`;
   }
 
   // Apply profile-driven tier adjustments
@@ -344,7 +344,7 @@ try {
       const biasThreshold = profileSettings.bias >= 0 ? 10 : 20;
       if (balance && balance.claudeCalls > balance.openaiCalls * 2 && balance.claudeCalls > biasThreshold) {
         const dispatchModel = tier === 'think' ? 'gpt-5.5' : tier === 'execute' ? 'gpt-5.4' : 'gpt-4.1-mini';
-        balanceHint = `\n\n💡 **Balance tip:** Claude has ${balance.claudeCalls} ${tier} calls vs OpenAI's ${balance.openaiCalls} in the last 5hrs. Consider dispatching isolated work to GPT: \`node .claude/hooks/gpt-work-dispatcher.mjs --task "..." --model ${dispatchModel}\``;
+        balanceHint = `\n\n💡 Claude is handling most work right now (${balance.claudeCalls} ${tier} calls vs ${balance.openaiCalls} GPT). For isolated tasks, consider routing to GPT to balance subscriptions.`;
       }
     }
   }
@@ -374,8 +374,7 @@ try {
     // If we get here, a non-think model is being used for think work
     const thinkBestFor = intelligence[expected || 'opus']?.best_for;
     const thinkBestForSuffix = thinkBestFor ? ` (best for: ${thinkBestFor})` : '';
-    const msg = `**[Tier Enforcer]** This looks like **think** work (architecture/review/planning). ` +
-      `Don't send it to "${currentModel}" — keep it on the main session (${expected || 'opus'}${thinkBestForSuffix}) for best results.`;
+    const msg = `This looks like think-level work (architecture/review/planning) — better kept on the main session (${expected || 'opus'}${thinkBestForSuffix}) rather than delegated to ${currentModel}.`;
     logRecommendation({
       tier,
       recommended: expected,
@@ -406,8 +405,7 @@ try {
     const savings = tier === 'search' ? 'Haiku is 19x cheaper than Opus for read-only lookups.' : 'Sonnet is 5x cheaper than Opus for implementation work.';
     const bestFor = intelligence[expected]?.best_for;
     const bestForSuffix = bestFor ? ` (best for: ${bestFor})` : '';
-    const msg = `**[Tier Enforcer]** This looks like **${tier}** work. ` +
-      `Use \`model: "${expected}"\`${bestForSuffix} instead of "${currentModel || 'opus (inherited)'}". ${savings}`;
+    const msg = `This looks like ${tier} work — use ${expected}${bestForSuffix} instead of ${currentModel || 'opus (inherited)'}. ${savings}`;
     logRecommendation({
       tier,
       recommended: expected,

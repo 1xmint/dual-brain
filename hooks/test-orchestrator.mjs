@@ -693,8 +693,8 @@ test('enforce-tier: burst mode suppresses duplicate warnings', () => {
 
     // In burst mode: either no duplicate warning at all, or a [Wave]-prefixed one
     const msg = parsed.systemMessage || '';
-    const hasDuplicateWarning = msg.toLowerCase().includes('duplicate');
-    if (hasDuplicateWarning && !msg.includes('[Wave]'))
+    const hasDuplicateWarning = msg.toLowerCase().includes('duplicate') || msg.toLowerCase().includes('similar task');
+    if (hasDuplicateWarning && !msg.includes('[Wave]') && !msg.includes('wave detected'))
       return `expected no duplicate warning or [Wave]-prefixed in burst mode, got: ${msg}`;
     return true;
   } finally {
@@ -720,7 +720,7 @@ test('enforce-tier: non-burst mode still warns on duplicates', () => {
     if (!parsed) return 'no valid JSON output';
 
     const msg = parsed.systemMessage || '';
-    if (!msg.toLowerCase().includes('duplicate'))
+    if (!msg.toLowerCase().includes('similar task') && !msg.toLowerCase().includes('duplicate'))
       return `expected duplicate warning in non-burst mode, got: ${msg || '(empty)'}`;
     return true;
   } finally {

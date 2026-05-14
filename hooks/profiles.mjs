@@ -26,9 +26,9 @@ const ALIASES = {
   // balanced
   'balanced': 'balanced', 'even': 'balanced', 'equal': 'balanced',
   // cost-saver
-  'cost-saver': 'cost-saver', 'cheap': 'cost-saver', 'save': 'cost-saver', 'conservative': 'cost-saver', 'frugal': 'cost-saver', 'budget': 'cost-saver',
+  'cost-saver': 'cost-saver', 'cheap': 'cost-saver', 'save': 'cost-saver', 'conservative': 'cost-saver', 'frugal': 'cost-saver', 'budget': 'cost-saver', 'fast': 'cost-saver', 'quick': 'cost-saver',
   // quality-first
-  'quality-first': 'quality-first', 'aggressive': 'quality-first', 'quality': 'quality-first', 'max': 'quality-first', 'full': 'quality-first', 'both': 'quality-first',
+  'quality-first': 'quality-first', 'aggressive': 'quality-first', 'quality': 'quality-first', 'max': 'quality-first', 'full': 'quality-first', 'both': 'quality-first', 'careful': 'quality-first', 'thorough': 'quality-first', 'safe': 'quality-first',
 };
 
 function resolveProfileName(input) {

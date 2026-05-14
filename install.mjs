@@ -315,6 +315,7 @@ function generateGitignoreEntries(workspace) {
     '.claude/hooks/usage-summary-*.json',
     '.claude/hooks/decision-ledger.jsonl',
     '.claude/.launched',
+    '.claude/dual-brain.memory.json',
   ];
   let existing = '';
   try { existing = readFileSync(join(workspace, '.gitignore'), 'utf8'); } catch {}
@@ -338,6 +339,7 @@ function install(workspace, env, mode) {
     'gpt-work-dispatcher.mjs', 'profiles.mjs',
     'summary-checkpoint.mjs', 'decision-ledger.mjs', 'control-panel.mjs',
     'risk-classifier.mjs', 'failure-detector.mjs',
+    'vibe-router.mjs', 'plan-generator.mjs', 'vibe-memory.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
   actions.push(`✓ ${HOOKS.length} hook scripts`);
