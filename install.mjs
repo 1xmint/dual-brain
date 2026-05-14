@@ -24,6 +24,11 @@ const force = flag('--force');
 const dryRun = flag('--dry-run');
 const jsonOut = flag('--json');
 
+if (flag('--version') || flag('-v')) {
+  console.log(`dual-brain v${VERSION}`);
+  process.exit(0);
+}
+
 if (flag('--help') || flag('-h')) {
   console.log(`
   dual-brain v${VERSION} — Dual-provider orchestrator for Claude Code
@@ -240,7 +245,20 @@ function generateSettings(workspace) {
     ],
   };
 
-  return { ...existing, hooks };
+  const DUAL_BRAIN_CMDS = [
+    'node .claude/hooks/enforce-tier.mjs',
+    'node .claude/hooks/cost-logger.mjs',
+  ];
+
+  const merged = { ...(existing.hooks || {}) };
+  for (const [event, entries] of Object.entries(hooks)) {
+    const existingEntries = (merged[event] || []).filter(e =>
+      !e.hooks?.some(h => DUAL_BRAIN_CMDS.includes(h.command))
+    );
+    merged[event] = [...existingEntries, ...entries];
+  }
+
+  return { ...existing, hooks: merged };
 }
 
 function generateClaudeMd(mode) {
@@ -322,7 +340,7 @@ function install(workspace, env, mode) {
   if (needed.length > 0) {
     writeFileSync(
       join(workspace, '.gitignore'),
-      gi + '\n# Dual-Brain Orchestrator\n' + needed.join('\n') + '\n'
+      (gi && !gi.endsWith('\n') ? gi + '\n' : gi) + '\n# Dual-Brain Orchestrator\n' + needed.join('\n') + '\n'
     );
     actions.push('✓ .gitignore updated');
   }
