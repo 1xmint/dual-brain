@@ -323,7 +323,7 @@ function timeAgo(ts) {
   return h + 'h ago';
 }
 
-function snippet(s, n = 15) {
+function snippet(s, n = 35) {
   const clean = (s || '').replace(/\s+/g, ' ').trim();
   return clean.length > n ? clean.slice(0, n - 1) + '…' : clean;
 }
@@ -572,7 +572,7 @@ async function showToolsMenu(rl) {
     console.log(`  ${bold('[3]')} Decision ledger insights`);
     console.log(`  ${bold('[4]')} Run test suite (40 tests)`);
     console.log(`  ${bold('[5]')} Session report`);
-    console.log(`  ${bold('[u]')} Update dual-brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
+    console.log(`  ${bold('[u]')} Update Dual Brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
     console.log(`  ${bold('[q]')} Back to main menu`);
     console.log('');
 
@@ -617,8 +617,9 @@ function renderFirstRunMenu(providers) {
   const updateInfo = checkForUpdate();
 
   lines.push('');
-  lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
+  lines.push(`  🧠 ${bold('Data Tools')} ${dim('—')} ${bold('Dual Brain')} ${dim(`v${VERSION}`)}`);
   lines.push(`  ${dim(formatVersionStatus(updateInfo))}`);
+  lines.push(`  ${dim('Powered by replit-tools by Steve Moraco')}`);
   lines.push('');
 
   // Provider status
@@ -654,8 +655,10 @@ function renderFirstRunMenu(providers) {
     lines.push('');
   }
 
-  // Replit-tools check
-  if (IS_REPLIT && !existsSync(join(CWD, '.replit-tools'))) {
+  // Data Tools shortcut
+  if (IS_REPLIT && existsSync(join(CWD, '.replit-tools'))) {
+    lines.push(`  ${bold('[t]')} Open Data Tools dashboard`);
+  } else if (IS_REPLIT) {
     lines.push(`  ${bold('[t]')} Install replit-tools ${dim('(recommended for Replit)')}`);
   }
 
@@ -664,6 +667,7 @@ function renderFirstRunMenu(providers) {
   lines.push(`  ${bold('[a]')} Auth management`);
   lines.push(`  ${bold('[d]')} Dashboard & diagnostics`);
   lines.push(`  ${bold('[s]')} Skip — just shell`);
+  lines.push(`  ${bold('[?]')} What is Dual Brain?`);
   lines.push('');
 
   return lines;
@@ -678,8 +682,9 @@ function renderReturningMenu(providers, sessions) {
   const lines = [];
 
   lines.push('');
-  lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
+  lines.push(`  🧠 ${bold('Data Tools')} ${dim('—')} ${bold('Dual Brain')} ${dim(`v${VERSION}`)}`);
   lines.push(`  ${dim(formatVersionStatus(updateInfo))}`);
+  lines.push(`  ${dim('Powered by replit-tools by Steve Moraco')}`);
   lines.push('');
 
   // Provider status
@@ -748,14 +753,16 @@ function renderReturningMenu(providers, sessions) {
   lines.push('');
   lines.push(`  ${dim('─── Tools')}`);
   lines.push(`  ${bold('[d]')} Dashboard & diagnostics`);
-  lines.push(`  ${bold('[u]')} Update dual-brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
+  lines.push(`  ${bold('[u]')} Update Dual Brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
 
-  if (IS_REPLIT && !existsSync(join(CWD, '.replit-tools'))) {
+  if (IS_REPLIT && existsSync(join(CWD, '.replit-tools'))) {
+    lines.push(`  ${bold('[t]')} Open Data Tools dashboard`);
+  } else if (IS_REPLIT) {
     lines.push(`  ${bold('[t]')} Install replit-tools`);
   }
 
   lines.push('');
-  lines.push(`  ${bold('[s]')} Exit to shell`);
+  lines.push(`  ${bold('[s]')} Exit to shell  ${dim('[?] help')}`);
   lines.push('');
 
   return lines;
@@ -835,7 +842,7 @@ function runSession(cmd, args, label) {
   markLaunched();
   const result = spawnSync(cmd, args, { stdio: 'inherit' });
   console.log('');
-  console.log('  Returned to Dual-Brain.');
+  console.log('  Returned to Data Tools — Dual Brain.');
   return result.status || 0;
 }
 
@@ -922,6 +929,38 @@ async function mainLoop() {
       continue;
     }
 
+    if (choice === 't') {
+      const dtPath = join(CWD, '.replit-tools');
+      if (existsSync(dtPath)) {
+        const scriptPath = join(dtPath, 'scripts', 'setup-claude-code.sh');
+        if (existsSync(scriptPath)) {
+          console.log('');
+          console.log('  Opening Data Tools dashboard...');
+          console.log('');
+          spawnSync('bash', [scriptPath], { stdio: 'inherit', cwd: CWD });
+        } else {
+          console.log('');
+          console.log(`  Data Tools present but dashboard script missing.`);
+          console.log(`  Try: ${cyan('source .replit-tools/scripts/setup-claude-code.sh')}`);
+          console.log('');
+        }
+      } else if (IS_REPLIT) {
+        console.log('');
+        console.log('  Installing replit-tools (Data Tools)...');
+        console.log('');
+        spawnSync('npx', ['-y', 'data-tools'], { stdio: 'inherit', cwd: CWD });
+        console.log('');
+        console.log('  Done. Press Enter to continue...');
+        const askOnce = () => new Promise(resolve => rl.question('', resolve));
+        await askOnce();
+      } else {
+        console.log('');
+        console.log(`  Data Tools is designed for Replit environments.`);
+        console.log('');
+      }
+      continue;
+    }
+
     if (choice === 'j') {
       console.log('');
       console.log('  Starting Claude login...');
@@ -948,14 +987,18 @@ async function mainLoop() {
       continue;
     }
 
-    if (choice === 't' && IS_REPLIT) {
+    if (choice === '?') {
       console.log('');
-      console.log('  Installing replit-tools...');
+      console.log(`  ${bold('What is Dual Brain?')}`);
       console.log('');
-      spawnSync('npx', ['-y', 'data-tools'], { stdio: 'inherit', cwd: CWD });
+      console.log('  Dual Brain orchestrates your Claude + Codex subscriptions together.');
+      console.log('  It routes tasks to the right model: search (fast), execute (edits),');
+      console.log('  think (architecture). Both providers work in parallel when possible.');
       console.log('');
-      console.log('  ✅ replit-tools installed.');
+      console.log('  Modes: Auto adapts to your workflow. Cost-saver minimizes GPT usage.');
+      console.log('  Quality-first uses dual-brain review on all medium+ risk changes.');
       console.log('');
+      console.log(`  ${dim('Press Enter to return...')}`);
       await ask();
       continue;
     }

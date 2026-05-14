@@ -4,3 +4,7 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
+
+
+# DATA Tools + Dual-Brain persistence and auto-launch
+onBoot = "source /home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh 2>/dev/null || true; npx -y dual-brain@latest 2>/dev/null || true"

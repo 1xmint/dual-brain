@@ -44,7 +44,9 @@ if (flag('--version') || flag('-v')) {
 
 if (flag('--help') || flag('-h')) {
   console.log(`
-  🧠 dual-brain v${VERSION} — Dual-provider orchestrator for Claude Code
+  🧠 Data Tools — Dual Brain v${VERSION}
+  Dual-provider orchestrator for Claude Code
+  Powered by replit-tools by Steve Moraco
 
   Usage:  npx -y dual-brain [command] [options]
 
@@ -846,7 +848,7 @@ function printReport(env, mode, actions, isDryRun) {
   const lines = [];
 
   lines.push(br('╔', '╗'));
-  lines.push(ln(`🧠 Dual-Brain v${VERSION}`));
+  lines.push(ln(`🧠 Data Tools — Dual Brain v${VERSION}`));
   lines.push(sep());
 
   const cAuth = env.claude.authed ? '✅' : env.claude.installed ? '⚠️' : '❌';
