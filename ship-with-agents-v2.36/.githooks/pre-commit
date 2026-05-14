@@ -1,4 +1,0 @@
-#!/bin/sh
-
-powershell.exe -ExecutionPolicy Bypass -File "orchestration/scripts/live-surface-check.ps1" -Root "orchestration" || exit $?
-powershell.exe -ExecutionPolicy Bypass -File "orchestration/scripts/skills-drift-check.ps1" -Root "orchestration" || exit $?

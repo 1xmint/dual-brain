@@ -140,6 +140,46 @@ function determineQualityGates(tasks) {
   return [...gates];
 }
 
+// ─── Ordered Language Detection ───────────────────────────────────────────
+
+const DEPENDENCY_MARKERS = /\b(then|after\s+that|once\s+\S+\s+is\s+done|before|first|next|finally|afterwards|subsequently|followed\s+by|depends?\s+on|requires?)\b/i;
+
+// ─── Subsystem Detection ─────────────────────────────────────────────────
+
+const SUBSYSTEM_PATTERNS = [
+  { key: 'auth', regex: /\b(auth|login|sign[-\s]?in|sign[-\s]?up|session|credential|password|oauth|jwt|token)\b/i },
+  { key: 'billing', regex: /\b(billing|payment|subscription|invoice|charge|stripe|pricing)\b/i },
+  { key: 'api', regex: /\b(api|endpoint|route|controller|handler|middleware|rest|graphql)\b/i },
+  { key: 'ui', regex: /\b(ui|nav|button|page|component|layout|style|css|modal|form|menu|sidebar|header|footer|dashboard)\b/i },
+  { key: 'db', regex: /\b(database|db|schema|migration|model|query|table|column|index|sql|prisma|sequelize|knex)\b/i },
+  { key: 'infra', regex: /\b(deploy|ci|cd|docker|k8s|terraform|infra|pipeline|build|config|env)\b/i },
+  { key: 'test', regex: /\b(test|spec|fixture|mock|stub|assert|coverage)\b/i },
+  { key: 'docs', regex: /\b(doc|readme|changelog|guide|tutorial|comment)\b/i },
+];
+
+function detectSubsystems(text) {
+  const subs = new Set();
+  for (const pat of SUBSYSTEM_PATTERNS) {
+    if (pat.regex.test(text)) subs.add(pat.key);
+  }
+  return subs;
+}
+
+// ─── Risk Domain Extraction ──────────────────────────────────────────────
+
+function getRiskDomains(task) {
+  const domains = new Set();
+  // Use subsystem as risk domain
+  const subs = detectSubsystems(task.title);
+  for (const s of subs) domains.add(s);
+  // Also include explicit risk reason label
+  if (task.reason) {
+    const match = task.reason.match(/^([^(]+)/);
+    if (match) domains.add(match[1].trim().toLowerCase());
+  }
+  return domains;
+}
+
 // ─── Complexity + Wave Recommendation ──────────────────────────────────────
 
 function determineComplexity(tasks) {
@@ -157,18 +197,102 @@ function determineComplexity(tasks) {
   return 'simple';
 }
 
-function determineWave(tasks, complexity) {
-  if (tasks.length === 1) return 'single';
+/**
+ * determineWave — Sequential by default, parallel only when tasks are truly independent.
+ *
+ * Returns { wave, reasons } where reasons is an array of reason codes:
+ *   shared_surface  — tasks likely touch same files
+ *   high_risk       — risky work should be sequential for review
+ *   dependency_marker — ordered language detected in utterance
+ *   same_subsystem  — tasks in same domain/subsystem
+ *   independent     — truly independent, safe for parallel
+ */
+function determineWave(tasks, complexity, utterance) {
+  if (tasks.length === 1) return { wave: 'single', reasons: [] };
 
-  // If any task depends on another (sequential markers like "then", "after that"
-  // were used), we already split them but keep sequential recommendation.
-  // For now, check if tasks share the same tier — parallel is fine for independent work.
-  const tiers = new Set(tasks.map(t => t.tier));
+  const reasons = [];
+
+  // 1. Check for ordered language in the original utterance
+  if (utterance && DEPENDENCY_MARKERS.test(utterance)) {
+    reasons.push('dependency_marker');
+  }
+
+  // 2. Check for high/critical risk tasks
   const hasHighRisk = tasks.some(t => t.risk === 'high' || t.risk === 'critical');
+  if (hasHighRisk) {
+    reasons.push('high_risk');
+  }
 
-  if (hasHighRisk) return 'sequential'; // high-risk tasks need careful ordering
-  if (tiers.size === 1 && complexity !== 'complex') return 'parallel';
-  return 'parallel';
+  // 3. Check for overlapping subsystems between tasks
+  const taskSubsystems = tasks.map(t => detectSubsystems(t.title));
+  let hasSharedSubsystem = false;
+  for (let i = 0; i < taskSubsystems.length; i++) {
+    for (let j = i + 1; j < taskSubsystems.length; j++) {
+      for (const sub of taskSubsystems[i]) {
+        if (taskSubsystems[j].has(sub)) {
+          hasSharedSubsystem = true;
+          break;
+        }
+      }
+      if (hasSharedSubsystem) break;
+    }
+    if (hasSharedSubsystem) break;
+  }
+  if (hasSharedSubsystem) {
+    reasons.push('same_subsystem');
+  }
+
+  // 4. Check for overlapping file paths / shared surface area
+  const taskPaths = tasks.map(t => extractPaths(t.title));
+  let hasSharedPaths = false;
+  for (let i = 0; i < taskPaths.length; i++) {
+    for (let j = i + 1; j < taskPaths.length; j++) {
+      for (const p of taskPaths[i]) {
+        // Check if any path from task j shares a directory prefix or exact match
+        for (const q of taskPaths[j]) {
+          if (p === q || p.startsWith(q + '/') || q.startsWith(p + '/') ||
+              p.split('/').slice(0, -1).join('/') === q.split('/').slice(0, -1).join('/')) {
+            hasSharedPaths = true;
+            break;
+          }
+        }
+        if (hasSharedPaths) break;
+      }
+      if (hasSharedPaths) break;
+    }
+    if (hasSharedPaths) break;
+  }
+  if (hasSharedPaths) {
+    reasons.push('shared_surface');
+  }
+
+  // 5. Check for shared risk domains
+  const taskDomains = tasks.map(t => getRiskDomains(t));
+  let hasSharedDomain = false;
+  for (let i = 0; i < taskDomains.length; i++) {
+    for (let j = i + 1; j < taskDomains.length; j++) {
+      for (const d of taskDomains[i]) {
+        if (taskDomains[j].has(d)) {
+          hasSharedDomain = true;
+          break;
+        }
+      }
+      if (hasSharedDomain) break;
+    }
+    if (hasSharedDomain) break;
+  }
+  // Only add same_subsystem if not already added (risk domains overlap with subsystems)
+  if (hasSharedDomain && !reasons.includes('same_subsystem')) {
+    reasons.push('same_subsystem');
+  }
+
+  // Decision: parallel ONLY when no sequential reasons found
+  if (reasons.length === 0) {
+    reasons.push('independent');
+    return { wave: 'parallel', reasons };
+  }
+
+  return { wave: 'sequential', reasons };
 }
 
 // ─── Summary Generation ────────────────────────────────────────────────────
@@ -229,7 +353,7 @@ function routeVibe(utterance) {
   const profileHint = detectProfileHint(utterance);
   const qualityGates = determineQualityGates(tasks);
   const complexity = determineComplexity(tasks);
-  const wave = determineWave(tasks, complexity);
+  const { wave, reasons } = determineWave(tasks, complexity, utterance);
   const summary = generateSummary(tasks, complexity, wave, qualityGates, profileHint);
 
   return {
@@ -238,6 +362,7 @@ function routeVibe(utterance) {
     profile_hint: profileHint,
     quality_gates: qualityGates,
     wave_recommendation: wave,
+    wave_reasons: reasons,
     summary,
   };
 }
