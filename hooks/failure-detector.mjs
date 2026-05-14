@@ -28,7 +28,7 @@ function checkFailureLoop(promptHash) {
         const entry = JSON.parse(line);
         if (entry.prompt_hash !== promptHash) continue;
         if (Date.parse(entry.timestamp) < twoHoursAgo) continue;
-        if (entry.success === false || entry.followed === false) {
+        if (entry.success === false) {
           failures++;
           lastTier = entry.tier;
         }

@@ -310,6 +310,33 @@ test('orchestrator.json: dual_thinking configured', () => {
   return true;
 });
 
+// ─── Test 15: profile consistency across modules ────────────────────────────
+test('profiles: consistent across modules', () => {
+  const profilesSrc = readFileSync(resolve(__dirname, 'profiles.mjs'), 'utf8');
+  const profileNames = ['auto', 'balanced', 'cost-saver', 'quality-first'];
+  for (const name of profileNames) {
+    if (!profilesSrc.includes(`${name}:`) && !profilesSrc.includes(`'${name}':`)) return `profiles.mjs missing: ${name}`;
+  }
+
+  const installSrc = readFileSync(resolve(__dirname, '..', 'install.mjs'), 'utf8');
+  for (const name of profileNames) {
+    if (!installSrc.includes(`${name}:`) && !installSrc.includes(`'${name}':`)) return `install.mjs missing profile: ${name}`;
+  }
+
+  const enforceSrc = readFileSync(resolve(__dirname, 'enforce-tier.mjs'), 'utf8');
+  if (!enforceSrc.includes('auto:')) return 'enforce-tier.mjs missing auto in PROFILE_SETTINGS';
+
+  return true;
+});
+
+// ─── Test 16: failure-detector only counts real failures ─────────────────────
+test('failure-detector: ignores followed=false', () => {
+  const src = readFileSync(resolve(__dirname, 'failure-detector.mjs'), 'utf8');
+  if (src.includes('followed === false')) return 'still conflates followed=false with failure';
+  if (!src.includes('success === false')) return 'missing success===false check';
+  return true;
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 const total = passed + failed;
 console.log(`\n${passed}/${total} tests passed`);

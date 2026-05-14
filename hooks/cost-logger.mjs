@@ -8,6 +8,7 @@
  * Output contract: must print "{}" to stdout and exit 0 within ~100 ms.
  */
 
+import { createHash } from "crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -25,8 +26,8 @@ mkdirSync(__dirname, { recursive: true });
 function loadActiveProfile() {
   try {
     const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
-    return data.active || 'balanced';
-  } catch { return 'balanced'; }
+    return data.active || 'auto';
+  } catch { return 'auto'; }
 }
 
 const SESSION_ID = process.env.CLAUDE_SESSION_ID || process.ppid?.toString() || null;
@@ -260,6 +261,15 @@ async function main() {
     const { updateSummary } = await import('./summary-checkpoint.mjs');
     updateSummary(entryObj);
   } catch {}
+
+  // Record failures for adaptive routing (failure-loop detection)
+  if (status === 'error' && toolName === 'Agent') {
+    try {
+      const { recordFailure } = await import('./failure-detector.mjs');
+      const promptHash = createHash('md5').update(JSON.stringify(toolInput)).digest('hex').slice(0, 12);
+      recordFailure(promptHash, tier, payload?.error || 'agent_error');
+    } catch {}
+  }
 
   const budgetMsg = await checkBudget();
 

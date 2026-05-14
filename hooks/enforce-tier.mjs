@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { dirname, resolve, join } from 'path';
 import { fileURLToPath } from 'url';
 import { classifyRisk, extractPaths } from './risk-classifier.mjs';
-import { checkFailureLoop } from './failure-detector.mjs';
+import { checkFailureLoop, recordFailure } from './failure-detector.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = resolve(__dirname, '..', 'orchestrator.json');

@@ -424,6 +424,12 @@ function profilePath(workspace) {
 }
 
 const PROFILES = {
+  auto: {
+    description: 'Adapts routing based on task risk, provider health, and outcomes',
+    routing: { prefer_provider: 'auto', think_threshold: 'adaptive', gpt_dispatch_bias: 0 },
+    budgets: { session_warn_usd: 5, session_limit_usd: 10, daily_warn_usd: 20, daily_limit_usd: 50 },
+    quality_gate: { sensitivity_floor: 'medium', dual_brain_minimum: 'high' },
+  },
   balanced: {
     description: 'Auto-routes by complexity, uses both providers evenly',
     routing: { prefer_provider: 'auto', think_threshold: 'normal', gpt_dispatch_bias: 0 },

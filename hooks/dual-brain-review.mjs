@@ -135,7 +135,7 @@ function hasIssues(text) {
   if (hasIssueIndicators) return true;
 
   // No concrete issues — check if review explicitly says it's clean
-  const good = ['lgtm', 'looks good', 'no issues', 'no problems', 'no concerns', 'all good', 'clean'];
+  const good = ['lgtm', 'looks good', 'no issues', 'no problems', 'no concerns', 'all good', 'clean', 'approved', 'ship it', 'ready to merge', 'good to go', 'looks fine', 'no blockers'];
   if (good.some(g => lower.includes(g))) return false;
 
   // Ambiguous — default to flagging for human review

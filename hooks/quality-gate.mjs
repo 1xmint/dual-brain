@@ -21,9 +21,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, extname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
+import { getProfileOverrides as _getProfileOverrides } from './profiles.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ORCHESTRATOR_CONFIG = resolve(__dirname, '..', 'orchestrator.json');
-const PROFILE_FILE = resolve(__dirname, '..', 'dual-brain.profile.json');
 const REVIEWS_DIR = resolve(__dirname, '..', 'reviews');
 const DUAL_BRAIN = resolve(__dirname, 'dual-brain-review.mjs');
 
@@ -31,14 +32,7 @@ const RISK_LEVELS = ['low', 'medium', 'high', 'critical'];
 
 function loadProfileGateSettings() {
   try {
-    const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
-    const name = data.active || 'balanced';
-    const defaults = {
-      balanced:        { sensitivity_floor: 'medium', dual_brain_minimum: 'high' },
-      'cost-saver':    { sensitivity_floor: 'high',   dual_brain_minimum: 'critical' },
-      'quality-first': { sensitivity_floor: 'low',    dual_brain_minimum: 'medium' },
-    };
-    return defaults[name] || defaults.balanced;
+    return _getProfileOverrides('quality-gate');
   } catch {
     return { sensitivity_floor: 'medium', dual_brain_minimum: 'high' };
   }
