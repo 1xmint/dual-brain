@@ -15,7 +15,7 @@
 import { readFileSync, existsSync, readdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -126,10 +126,17 @@ function estimateCost(tier, model, rateMap, record = {}) {
 function gitFallbackSummary() {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const log = execSync(
-      `git -C "${WORKSPACE}" log --oneline --since="${today} 00:00" --until="${today} 23:59"`,
-      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
-    ).trim();
+    const proc = spawnSync("git", [
+      "-C", WORKSPACE,
+      "log", "--oneline",
+      `--since=${today} 00:00`,
+      `--until=${today} 23:59`,
+    ], {
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+    const log = proc.status === 0 ? (proc.stdout || "").trim() : "";
     const commits = log ? log.split("\n").length : 0;
     return commits;
   } catch {

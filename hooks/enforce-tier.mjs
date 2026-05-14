@@ -254,6 +254,8 @@ try {
 
   // Balance hint — populated after tier is fully resolved
   let balanceHint = null;
+  let failureMessage = null;
+  let autoStatus = null;
 
   // Helper to prepend optional warnings (duplicate + drift + balance + auto) before a message
   const prependWarnings = (msg) => {
@@ -304,7 +306,6 @@ try {
   // Risk classification from file paths in description
   const filePaths = extractPaths(ti.description || '');
   const riskResult = classifyRisk(filePaths);
-  let autoStatus = null;
 
   // Bias high/critical risk toward think tier
   if ((riskResult.level === 'critical' || riskResult.level === 'high') && tier !== 'think') {
@@ -316,7 +317,6 @@ try {
 
   // Failure loop detection
   const failureCheck = checkFailureLoop(promptHash);
-  let failureMessage = null;
   if (failureCheck.isLoop) {
     if (failureCheck.suggestion === 'promote_tier' && tier === 'execute') {
       tier = 'think';

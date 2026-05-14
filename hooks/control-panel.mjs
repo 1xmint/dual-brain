@@ -16,7 +16,14 @@ import { spawnSync } from 'child_process';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROFILE_FILE = join(__dirname, '..', 'dual-brain.profile.json');
 const LAUNCHED_MARKER = join(__dirname, '..', '.launched');
+const VERSION_STAMP_FILE = join(__dirname, '..', 'dual-brain.version.json');
+const UPDATE_CACHE_FILE = join(__dirname, '..', 'dual-brain.update-check.json');
+const UPDATE_CACHE_TTL_MS = 60 * 60 * 1000;
 const VERSION = (() => {
+  try {
+    const stamp = JSON.parse(readFileSync(VERSION_STAMP_FILE, 'utf8'));
+    if (stamp.version) return stamp.version;
+  } catch {}
   try { return JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version; } catch {}
   return '?';
 })();
@@ -36,6 +43,92 @@ const green = s => e('32', s);
 const yellow = s => e('33', s);
 const orange = s => e('1;38;5;208', s);
 const blue = s => e('1;38;5;33', s);
+
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(path, value) {
+  writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
+}
+
+function compareVersions(a, b) {
+  const aParts = String(a || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const bParts = String(b || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (aParts[i] || 0) - (bParts[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function getInstalledVersion() {
+  return readJsonFile(VERSION_STAMP_FILE)?.version || VERSION;
+}
+
+function getCachedUpdateStatus() {
+  const cache = readJsonFile(UPDATE_CACHE_FILE);
+  if (!cache?.checked_at) return null;
+  const age = Date.now() - Date.parse(cache.checked_at);
+  if (!Number.isFinite(age) || age < 0 || age > UPDATE_CACHE_TTL_MS) return null;
+  return cache;
+}
+
+function writeUpdateStatusCache(result) {
+  writeJsonFile(UPDATE_CACHE_FILE, {
+    checked_at: new Date().toISOString(),
+    ...result,
+  });
+}
+
+function checkForUpdate({ force = false } = {}) {
+  const installed = getInstalledVersion();
+
+  if (!force) {
+    const cached = getCachedUpdateStatus();
+    if (cached && cached.installed === installed) {
+      return {
+        updateAvailable: !!cached.updateAvailable,
+        installed: cached.installed,
+        latest: cached.latest || installed,
+        checkedAt: cached.checked_at,
+      };
+    }
+  }
+
+  try {
+    const result = spawnSync('npm', ['view', 'dual-brain', 'version', '--json'], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) return null;
+    const latestRaw = JSON.parse(result.stdout);
+    const latest = Array.isArray(latestRaw) ? latestRaw[latestRaw.length - 1] : latestRaw;
+    if (!latest) return null;
+    const payload = {
+      updateAvailable: compareVersions(latest, installed) > 0,
+      installed,
+      latest,
+    };
+    writeUpdateStatusCache(payload);
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function formatVersionStatus(updateInfo) {
+  const installed = updateInfo?.installed || getInstalledVersion();
+  if (updateInfo?.updateAvailable && updateInfo.latest) return `v${installed} → v${updateInfo.latest} available`;
+  if (updateInfo?.latest && updateInfo.latest === installed) return `v${installed} (up to date)`;
+  return `v${installed}`;
+}
 
 // ─── Profiles ──────────────────────────────────────────────────────────────
 
@@ -122,7 +215,8 @@ function detectProviders() {
     codex.installed = true;
     const login = spawnSync(codexCheck.stdout.trim(), ['login', 'status'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
     const out = ((login.stdout || '') + (login.stderr || '')).toLowerCase();
-    if (login.status === 0 || out.includes('logged in') || out.includes('authenticated')) codex.authed = true;
+    const ok = login.status === 0 || (out.includes('logged in') && !out.includes('not logged in'));
+    if (ok) codex.authed = true;
   }
 
   return { claude, codex };
@@ -291,13 +385,240 @@ function balanceBar(claudePct, openaiPct, width = 20) {
   return `${cBar}${oBar}  ${orange(claudePct + '%')} Claude · ${green(openaiPct + '%')} GPT`;
 }
 
+// ─── Auth Detail Helpers ──────────────────────────────────────────────────
+
+function getClaudeAuthDetail() {
+  const credPaths = [
+    join(HOME, '.claude', '.credentials.json'),
+    join(HOME, '.claude', 'credentials.json'),
+    join(CWD, '.replit-tools', '.claude-persistent', '.credentials.json'),
+  ];
+  for (const p of credPaths) {
+    try {
+      const cred = JSON.parse(readFileSync(p, 'utf8'));
+      if (cred.claudeAiOauth) {
+        const exp = cred.claudeAiOauth.expiresAt;
+        let expiryText = 'n/a';
+        if (exp) {
+          const remaining = exp - Date.now();
+          if (remaining <= 0) expiryText = 'expired';
+          else {
+            const h = Math.floor(remaining / 3600000);
+            const m = Math.floor((remaining % 3600000) / 60000);
+            expiryText = `${h}h ${m}m remaining`;
+          }
+        }
+        return { method: 'subscription (OAuth)', expiry: expiryText, storage: p.replace(HOME, '~') };
+      }
+      if (cred.apiKey) return { method: 'API key', expiry: 'n/a', storage: p.replace(HOME, '~') };
+    } catch {}
+  }
+  return { method: 'unknown', expiry: 'n/a', storage: 'n/a' };
+}
+
+function getCodexAuthDetail() {
+  const authPath = join(HOME, '.codex', 'auth.json');
+  try {
+    const stat = statSync(authPath);
+    return {
+      method: 'subscription (device-auth)',
+      lastRefresh: timeAgo(stat.mtimeMs),
+      storage: '~/.codex/auth.json',
+    };
+  } catch {}
+  return { method: 'unknown', lastRefresh: 'n/a', storage: 'n/a' };
+}
+
+// ─── Submenu: Auth ────────────────────────────────────────────────────────
+
+async function showAuthMenu(rl, providers) {
+  const ask = () => new Promise(resolve => rl.question('  Choice: ', resolve));
+
+  while (true) {
+    const claudeDetail = getClaudeAuthDetail();
+    const codexDetail = getCodexAuthDetail();
+    const cStat = providers.claude.authed ? green('✅ authenticated') : yellow('❌ not authenticated');
+    const xStat = providers.codex.authed ? green('✅ authenticated') : yellow('❌ not authenticated');
+
+    console.log('');
+    console.log(`  ${bold('🔑 Auth Management')}`);
+    console.log('  ' + '─'.repeat(44));
+    console.log(`  🟠 Claude  ${cStat}`);
+    if (providers.claude.authed) {
+      console.log(`     Method:  ${dim(claudeDetail.method)}`);
+      console.log(`     Expiry:  ${dim(claudeDetail.expiry)}`);
+      console.log(`     Storage: ${dim(claudeDetail.storage)}`);
+    }
+    console.log('');
+    console.log(`  🟢 Codex   ${xStat}`);
+    if (providers.codex.authed) {
+      console.log(`     Method:  ${dim(codexDetail.method)}`);
+      console.log(`     Refresh: ${dim(codexDetail.lastRefresh)}`);
+      console.log(`     Storage: ${dim(codexDetail.storage)}`);
+    }
+    console.log('');
+    if (!providers.claude.authed) console.log(`  ${bold('[j]')} Sign in to Claude`);
+    if (providers.codex.installed && !providers.codex.authed) console.log(`  ${bold('[k]')} Sign in to Codex ${dim('(ChatGPT subscription)')}`);
+    if (providers.claude.authed || providers.codex.authed) console.log(`  ${bold('[r]')} Refresh all tokens`);
+    console.log(`  ${bold('[q]')} Back to main menu`);
+    console.log('');
+
+    const choice = (await ask()).trim().toLowerCase();
+    if (choice === 'q' || choice === '') return;
+
+    if (choice === 'j') {
+      console.log('');
+      spawnSync('claude', ['login'], { stdio: 'inherit' });
+      providers.claude.authed = true;
+      continue;
+    }
+    if (choice === 'k' && providers.codex.installed) {
+      const codexPath = spawnSync('which', ['codex'], { encoding: 'utf8', stdio: 'pipe', timeout: 3000 });
+      if (codexPath.status === 0) {
+        console.log('');
+        console.log(`  Open: ${cyan('https://auth.openai.com/codex/device')}`);
+        console.log('');
+        spawnSync(codexPath.stdout.trim(), ['login', '--device-auth'], { stdio: 'inherit' });
+        providers.codex.authed = true;
+      }
+      continue;
+    }
+    if (choice === 'r') {
+      console.log('');
+      const refreshScript = join(CWD, '.replit-tools', 'scripts', 'claude-auth-refresh.sh');
+      if (existsSync(refreshScript)) {
+        console.log('  Refreshing Claude token...');
+        const r = spawnSync('bash', [refreshScript, '--force'], { encoding: 'utf8', stdio: 'pipe', timeout: 10000 });
+        console.log(`  ${(r.stdout || '').trim() || 'Done'}`);
+      }
+      console.log('  Codex tokens refreshed on next API call.');
+      console.log('');
+      continue;
+    }
+  }
+}
+
+// ─── Submenu: Budget ──────────────────────────────────────────────────────
+
+async function showBudgetMenu(rl) {
+  const ask = () => new Promise(resolve => rl.question('  Choice: ', resolve));
+
+  while (true) {
+    const profile = loadProfile();
+    const balance = loadProviderBalance();
+
+    console.log('');
+    console.log(`  ${bold('💵 Budget & Spend')}`);
+    console.log('  ' + '─'.repeat(44));
+    console.log(`  Session:  ⚠️  $${profile.budgets.session_warn_usd} warn · 🛑 $${profile.budgets.session_limit_usd} limit`);
+    console.log(`  Daily:    ⚠️  $${profile.budgets.daily_warn_usd} warn · 🛑 $${profile.budgets.daily_limit_usd} limit`);
+    console.log('');
+    console.log(`  Today: ${balance.total} calls · ${balance.label}`);
+    console.log(`  ${balanceBar(balance.claude, balance.openai)}`);
+    console.log('');
+    console.log(`  ${bold('[c]')} Change budget limits`);
+    console.log(`  ${bold('[r]')} Full cost report`);
+    console.log(`  ${bold('[q]')} Back to main menu`);
+    console.log('');
+
+    const choice = (await ask()).trim().toLowerCase();
+    if (choice === 'q' || choice === '') return;
+
+    if (choice === 'c') {
+      const sessionAns = await new Promise(r => rl.question('  New session limit ($): ', r));
+      const sessionVal = parseFloat(sessionAns);
+      if (isNaN(sessionVal) || sessionVal <= 0) { console.log('  Invalid number.'); continue; }
+      const dailyAns = await new Promise(r => rl.question(`  New daily limit ($ default ${sessionVal * 3}): `, r));
+      const dailyVal = dailyAns.trim() ? parseFloat(dailyAns) : sessionVal * 3;
+      if (isNaN(dailyVal) || dailyVal <= 0) { console.log('  Invalid number.'); continue; }
+
+      const customOverrides = {
+        budgets: {
+          session_warn_usd: +(sessionVal * 0.6).toFixed(2),
+          session_limit_usd: sessionVal,
+          daily_warn_usd: +(dailyVal * 0.6).toFixed(2),
+          daily_limit_usd: dailyVal,
+        },
+      };
+      let existing = {};
+      try { existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8')); } catch {}
+      saveProfile(existing.active || 'auto', customOverrides);
+      console.log(`  ✅ Budget updated: $${sessionVal}/session, $${dailyVal}/day`);
+      continue;
+    }
+
+    if (choice === 'r') {
+      console.log('');
+      spawnSync(process.execPath, [join(__dirname, 'cost-report.mjs')], { stdio: 'inherit' });
+      console.log('');
+      await new Promise(r => rl.question('  Press Enter to continue...', r));
+      continue;
+    }
+  }
+}
+
+// ─── Submenu: Tools Dashboard ─────────────────────────────────────────────
+
+async function showToolsMenu(rl) {
+  const ask = () => new Promise(resolve => rl.question('  Choice: ', resolve));
+
+  while (true) {
+    const updateInfo = checkForUpdate();
+    console.log('');
+    console.log(`  ${bold('🛠️  Tools & Diagnostics')}`);
+    console.log('  ' + '─'.repeat(44));
+    console.log(`  ${bold('[1]')} Health check`);
+    console.log(`  ${bold('[2]')} Cost report`);
+    console.log(`  ${bold('[3]')} Decision ledger insights`);
+    console.log(`  ${bold('[4]')} Run test suite (40 tests)`);
+    console.log(`  ${bold('[5]')} Session report`);
+    console.log(`  ${bold('[u]')} Update dual-brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
+    console.log(`  ${bold('[q]')} Back to main menu`);
+    console.log('');
+
+    const choice = (await ask()).trim().toLowerCase();
+    if (choice === 'q' || choice === '') return;
+
+    const tools = {
+      '1': 'health-check.mjs',
+      '2': 'cost-report.mjs',
+      '3': 'decision-ledger.mjs',
+      '4': 'test-orchestrator.mjs',
+      '5': 'session-report.mjs',
+    };
+
+    if (tools[choice]) {
+      console.log('');
+      spawnSync(process.execPath, [join(__dirname, tools[choice])], { stdio: 'inherit' });
+      console.log('');
+      await new Promise(r => rl.question('  Press Enter to continue...', r));
+      continue;
+    }
+
+    if (choice === 'u') {
+      console.log('');
+      const result = spawnSync('npx', ['-y', 'dual-brain', 'update'], { stdio: 'inherit', cwd: CWD });
+      console.log('');
+      if (result.status === 0) {
+        console.log('  ✅ Dual-brain hooks refreshed.');
+      } else {
+        console.log('  ⚠️  Update did not complete.');
+      }
+      console.log('');
+      await new Promise(r => rl.question('  Press Enter to continue...', r));
+    }
+  }
+}
+
 // ─── Menu Renderers ───────────────────────────────────────────────────────
 
 function renderFirstRunMenu(providers) {
   const lines = [];
+  const updateInfo = checkForUpdate();
 
   lines.push('');
   lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
+  lines.push(`  ${dim(formatVersionStatus(updateInfo))}`);
   lines.push('');
 
   // Provider status
@@ -340,6 +661,8 @@ function renderFirstRunMenu(providers) {
 
   // Primary actions
   lines.push(`  ${bold('[n]')} Start new session`);
+  lines.push(`  ${bold('[a]')} Auth management`);
+  lines.push(`  ${bold('[d]')} Dashboard & diagnostics`);
   lines.push(`  ${bold('[s]')} Skip — just shell`);
   lines.push('');
 
@@ -351,10 +674,12 @@ function renderReturningMenu(providers, sessions) {
   const pf = PROFILES[profile.name];
   const running = countRunning();
   const balance = loadProviderBalance();
+  const updateInfo = checkForUpdate();
   const lines = [];
 
   lines.push('');
   lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
+  lines.push(`  ${dim(formatVersionStatus(updateInfo))}`);
   lines.push('');
 
   // Provider status
@@ -398,18 +723,39 @@ function renderReturningMenu(providers, sessions) {
   if (running.codex > 0) runParts.push(`${running.codex} codex`);
   if (runParts.length > 0) lines.push(`  ${dim('(' + runParts.join(', ') + ' running)')}`);
 
-  // Menu options
+  // ── Sessions
+  lines.push(`  ${dim('─── Sessions')}`);
   lines.push(`  ${bold('[c]')} Continue last session`);
   if (sessions.length > 0) lines.push(`  ${bold('[1-9]')} Resume numbered above`);
   lines.push(`  ${bold('[n]')} New session`);
+
+  // ── Settings
+  lines.push('');
+  lines.push(`  ${dim('─── Settings')}`);
   lines.push(`  ${bold('[p]')} Mode: ${dim(pf.uiLabel)}`);
+  lines.push(`  ${bold('[b]')} Budget: ${dim('$' + profile.budgets.session_limit_usd + '/session, $' + profile.budgets.daily_limit_usd + '/day')}`);
 
-  // Auth if needed
-  if (!providers.claude.authed) lines.push(`  ${bold('[j]')} Sign in to Claude`);
-  if (providers.codex.installed && !providers.codex.authed) lines.push(`  ${bold('[k]')} Sign in to Codex`);
-  if (IS_REPLIT && !existsSync(join(CWD, '.replit-tools'))) lines.push(`  ${bold('[t]')} Install replit-tools`);
+  // ── Auth
+  lines.push('');
+  const authSummary = providers.claude.authed && providers.codex.authed
+    ? green('both connected')
+    : providers.claude.authed ? yellow('Claude only')
+    : yellow('needs setup');
+  lines.push(`  ${dim('─── Auth')}`);
+  lines.push(`  ${bold('[a]')} Auth management ${dim('(' + authSummary + ')')}`);
 
-  lines.push(`  ${bold('[s]')} Shell`);
+  // ── Tools
+  lines.push('');
+  lines.push(`  ${dim('─── Tools')}`);
+  lines.push(`  ${bold('[d]')} Dashboard & diagnostics`);
+  lines.push(`  ${bold('[u]')} Update dual-brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
+
+  if (IS_REPLIT && !existsSync(join(CWD, '.replit-tools'))) {
+    lines.push(`  ${bold('[t]')} Install replit-tools`);
+  }
+
+  lines.push('');
+  lines.push(`  ${bold('[s]')} Exit to shell`);
   lines.push('');
 
   return lines;
@@ -553,6 +899,29 @@ async function mainLoop() {
       continue;
     }
 
+    if (choice === 'a') {
+      await showAuthMenu(rl, providers);
+      continue;
+    }
+
+    if (choice === 'b') {
+      await showBudgetMenu(rl);
+      continue;
+    }
+
+    if (choice === 'd') {
+      await showToolsMenu(rl);
+      continue;
+    }
+
+    if (choice === 'u') {
+      console.log('');
+      console.log('  Updating dual-brain...');
+      console.log('');
+      spawnSync('npx', ['-y', 'dual-brain', 'update'], { stdio: 'inherit', cwd: CWD });
+      continue;
+    }
+
     if (choice === 'j') {
       console.log('');
       console.log('  Starting Claude login...');
@@ -573,7 +942,9 @@ async function mainLoop() {
       console.log('');
       console.log('  Starting Codex login...');
       console.log('');
-      spawnSync(codexPath.stdout.trim(), ['login'], { stdio: 'inherit' });
+      console.log(`  Open: ${cyan('https://auth.openai.com/codex/device')}`);
+      console.log('');
+      spawnSync(codexPath.stdout.trim(), ['login', '--device-auth'], { stdio: 'inherit' });
       continue;
     }
 

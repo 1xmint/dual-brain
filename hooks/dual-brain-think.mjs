@@ -19,7 +19,7 @@
  *   });
  */
 
-import { execSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { appendFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -54,6 +54,13 @@ function findCodex() {
     try { spawnSync(p, ['--version'], { stdio: 'pipe', timeout: 3000 }); return p; } catch {}
   }
   return null;
+}
+
+function isCodexAuthenticated(result) {
+  const out = ((result?.stdout || '') + (result?.stderr || '')).toLowerCase();
+  if (/\b(not\s+logged\s+in|unauthenticated|logged\s+out|no\s+auth)\b/.test(out)) return false;
+  return result?.status === 0 ||
+    /\b(logged\s+in|authenticated|signed\s+in)\b/.test(out);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,13 +217,12 @@ export async function dualThink({ question, context, files, round, claudePerspec
     };
   }
 
-  try {
-    execSync(`${codexBin} login status`, {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 5000,
-    });
-  } catch {
+  const login = spawnSync(codexBin, ['login', 'status'], {
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 5000,
+  });
+  if (!isCodexAuthenticated(login)) {
     return {
       gpt: null,
       error: 'Codex CLI not authenticated — run `codex login`',

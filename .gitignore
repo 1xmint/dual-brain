@@ -4,3 +4,18 @@ hooks/usage.jsonl
 hooks/.drift-warned
 hooks/.budget-alerted
 reviews/
+
+# Dual-Brain Orchestrator
+.claude/hooks/usage-*.jsonl
+.claude/hooks/usage.jsonl
+.claude/reviews/
+.claude/hooks/.drift-warned
+.claude/hooks/.budget-alerted
+.claude/dual-brain.profile.json
+.claude/hooks/usage-summary-*.json
+.claude/hooks/decision-ledger.jsonl
+.claude/.launched
+.claude/dual-brain.memory.json
+
+# DATA Tools - All sensitive data in one place (added by DATA Tools)
+.replit-tools/

@@ -4,17 +4,22 @@
  *
  * Usage:
  *   npx -y dual-brain              # auto-detect, configure, done
+ *   npx -y dual-brain update       # refresh hooks to latest package version
  *   npx dual-brain --force          # overwrite existing config
  *   npx dual-brain --dry-run        # detect only, don't install
  *   npx dual-brain --help
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { createInterface } from 'readline';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')).version;
+const VERSION_STAMP_FILE = '.claude/dual-brain.version.json';
+const UPDATE_CACHE_FILE = '.claude/dual-brain.update-check.json';
+const UPDATE_CACHE_TTL_MS = 60 * 60 * 1000;
 
 // ─── Replit Detection ──────────────────────────────────────────────────────
 
@@ -46,9 +51,11 @@ if (flag('--help') || flag('-h')) {
   ⌨️  Commands:
     (none)       🧠 Auto-detect and install/update orchestrator
     status       🟢 Open live control panel
+    auth         🔑 Show, login, or refresh provider auth
     mode         🎛️  Show or switch profile
     budget       💵 Set session/daily spend limits
     explain      🧭 Explain last routing decision
+    update       🔄 Force re-install of latest hooks
     init         Alias for default install
 
   Options:
@@ -66,14 +73,18 @@ if (flag('--help') || flag('-h')) {
   🚀 Examples:
     ${cmd('npx dual-brain')}                  # install or update
     ${cmd('npx dual-brain status')}           # open control panel
+    ${cmd('npx dual-brain auth')}             # show Claude/Codex auth
+    ${cmd('npx dual-brain auth login')}       # sign in missing providers
+    ${cmd('npx dual-brain auth refresh')}     # refresh provider auth
     ${cmd('npx dual-brain mode cost-saver')}  # switch profile
     ${cmd('npx dual-brain budget 8 25')}      # \$8 session / \$25 daily
     ${cmd('npx dual-brain explain')}          # last routing decision
+    ${cmd('npx dual-brain update')}           # refresh installed hooks
   `);
   process.exit(0);
 }
 
-const SUBCOMMANDS = ['init', 'status', 'mode', 'budget', 'explain'];
+const SUBCOMMANDS = ['init', 'status', 'auth', 'mode', 'budget', 'explain', 'update'];
 if (subcommand && !SUBCOMMANDS.includes(subcommand)) {
   console.error(`  Unknown command: ${subcommand}`);
   console.error(`  Run: ${cmd('npx dual-brain --help')}`);
@@ -100,6 +111,121 @@ function run(cmd, args, opts = {}) {
     timeout: 8000,
     ...opts,
   });
+}
+
+function compareVersions(a, b) {
+  const aParts = String(a || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const bParts = String(b || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (aParts[i] || 0) - (bParts[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(path, value) {
+  writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
+}
+
+function getVersionStamp(workspace) {
+  return readJsonFile(join(workspace, VERSION_STAMP_FILE));
+}
+
+function writeVersionStamp(workspace) {
+  const target = join(workspace, VERSION_STAMP_FILE);
+  const now = new Date().toISOString();
+  const existing = readJsonFile(target);
+  const stamp = {
+    version: VERSION,
+    installed_at: existing?.installed_at || now,
+    updated_at: now,
+  };
+  writeJsonFile(target, stamp);
+  return stamp;
+}
+
+function getUpdateCache(workspace) {
+  const cache = readJsonFile(join(workspace, UPDATE_CACHE_FILE));
+  if (!cache?.checked_at) return null;
+  const age = Date.now() - Date.parse(cache.checked_at);
+  if (!Number.isFinite(age) || age < 0 || age > UPDATE_CACHE_TTL_MS) return null;
+  return cache;
+}
+
+function writeUpdateCache(workspace, result) {
+  writeJsonFile(join(workspace, UPDATE_CACHE_FILE), {
+    checked_at: new Date().toISOString(),
+    ...result,
+  });
+}
+
+function checkForUpdate(workspace, { force = false } = {}) {
+  const installedStamp = getVersionStamp(workspace);
+  const installed = installedStamp?.version || VERSION;
+
+  if (!force) {
+    const cached = getUpdateCache(workspace);
+    if (cached && cached.installed === installed) {
+      return {
+        updateAvailable: !!cached.updateAvailable,
+        installed: cached.installed,
+        latest: cached.latest || installed,
+        checkedAt: cached.checked_at,
+      };
+    }
+  }
+
+  try {
+    const result = spawnSync('npm', ['view', 'dual-brain', 'version', '--json'], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) {
+      return null;
+    }
+
+    const latestRaw = JSON.parse(result.stdout);
+    const latest = Array.isArray(latestRaw) ? latestRaw[latestRaw.length - 1] : latestRaw;
+    if (!latest) return null;
+
+    const updateAvailable = compareVersions(latest, installed) > 0;
+    const payload = { updateAvailable, installed, latest };
+    writeUpdateCache(workspace, payload);
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function performUpdate(workspace, env, mode) {
+  return install(workspace, env, mode);
+}
+
+function promptForUpdate(updateInfo) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`Update available: v${updateInfo.installed} → v${updateInfo.latest}. Press [u] to update or Enter to continue. `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'u');
+    });
+  });
+}
+
+function isLoggedInStatus(result) {
+  const out = ((result?.stdout || '') + (result?.stderr || '')).toLowerCase();
+  if (/\b(not\s+logged\s+in|unauthenticated|logged\s+out|no\s+auth)\b/.test(out)) return false;
+  return result?.status === 0 ||
+    /\b(logged\s+in|authenticated|signed\s+in|valid\s+session)\b/.test(out);
 }
 
 function detectReplit() {
@@ -149,7 +275,7 @@ function detectClaude() {
 }
 
 function detectCodex() {
-  const result = { installed: false, version: null, authed: false, path: null };
+  const result = { installed: false, version: null, authed: false, path: null, authMethod: null };
 
   const which = run('which', ['codex']);
   if (which.status === 0 && which.stdout.trim()) {
@@ -174,10 +300,15 @@ function detectCodex() {
     if (ver.status === 0) result.version = ver.stdout.trim().split('\n')[0];
 
     const login = run(result.path, ['login', 'status']);
-    const out = ((login.stdout || '') + (login.stderr || '')).toLowerCase();
-    if (login.status === 0 || out.includes('logged in') || out.includes('authenticated')) {
+    if (isLoggedInStatus(login)) {
       result.authed = true;
+      result.authMethod = 'oauth';
     }
+  }
+
+  if (!result.authed && process.env.OPENAI_API_KEY) {
+    result.authed = true;
+    result.authMethod = 'api_key_env';
   }
 
   return result;
@@ -201,6 +332,310 @@ function detectEnvironment() {
     existing: detectExisting(process.cwd()),
     workspace: resolve(process.cwd()),
   };
+}
+
+// ─── Auth Self-Healing ─────────────────────────────────────────────────────
+
+function healClaudeAuth(env) {
+  if (env.claude.authed) return env;
+  const refreshScript = resolve(process.cwd(), '.replit-tools', 'scripts', 'claude-auth-refresh.sh');
+  if (existsSync(refreshScript)) {
+    const result = run('bash', [refreshScript, '--auto']);
+    const out = ((result.stdout || '') + (result.stderr || '')).toLowerCase();
+    if (out.includes('refreshed') || out.includes('success')) {
+      env.claude.authed = true;
+      console.log('  🔄 Claude token refreshed via data-tools');
+    }
+  }
+  return env;
+}
+
+function healCodexAuth(env) {
+  if (env.codex.authed) return env;
+  if (!env.codex.installed || !env.codex.path) return env;
+
+  // Try restoring persisted credentials from data-tools
+  if (restoreCodexCredentials()) {
+    const login = run(env.codex.path, ['login', 'status']);
+    if (isLoggedInStatus(login)) {
+      env.codex.authed = true;
+      env.codex.authMethod = 'restored_persistent';
+      console.log('  🔄 Codex credentials restored from data-tools');
+      return env;
+    }
+  }
+
+  if (process.env.OPENAI_API_KEY) {
+    const pipe = spawnSync(env.codex.path, ['login', '--with-api-key'], {
+      input: process.env.OPENAI_API_KEY,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10000,
+    });
+    if (pipe.status === 0) {
+      env.codex.authed = true;
+      env.codex.authMethod = 'api_key_env';
+      saveCodexCredentials();
+      console.log('  🔄 Codex authenticated via OPENAI_API_KEY');
+      return env;
+    }
+  }
+
+  return env;
+}
+
+function prompt(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans.trim()); }));
+}
+
+async function authGuidance(env) {
+  if (env.claude.authed && env.codex.authed) return env;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return env;
+
+  console.log('');
+  console.log('  ┌────────────────────────────────────────────┐');
+  console.log('  │  🔑 Auth Setup                             │');
+  console.log('  └────────────────────────────────────────────┘');
+
+  if (!env.claude.authed) {
+    console.log('');
+    console.log('  🟠 Claude — not authenticated');
+    if (env.isReplit) {
+      console.log('    Run in your terminal:  ! claude login');
+      console.log('    It will give you a URL + code to paste in your browser.');
+    } else {
+      console.log('    Run: claude login');
+    }
+  }
+
+  if (!env.codex.authed) {
+    console.log('');
+    console.log('  🟢 Codex — not authenticated');
+    if (!env.codex.installed) {
+      console.log('    Install first: npm i -g @openai/codex');
+      console.log('');
+    }
+
+    if (env.codex.installed && env.codex.path) {
+      console.log('');
+      console.log('    Sign in with your ChatGPT subscription (no API key needed):');
+      console.log('');
+
+      const answer = await prompt('  Press Enter to start device auth (or "skip" to skip): ');
+      if (answer.toLowerCase() === 'skip') {
+        console.log('  ⏭️  Skipped — GPT features disabled until Codex is authed');
+      } else {
+        console.log('');
+        if (runCodexDeviceAuth(env.codex.path)) {
+          env.codex.authed = true;
+          env.codex.authMethod = 'device_auth';
+          console.log('');
+          console.log('  ✅ Codex authenticated! (credentials saved for next session)');
+        } else {
+          console.log('');
+          console.log('  ❌ Auth failed — try again with: codex login --device-auth');
+        }
+      }
+    }
+  }
+
+  console.log('');
+  return env;
+}
+
+// ─── Codex Credential Persistence ──────────────────────────────────────────
+
+const CODEX_HOME = join(process.env.HOME || '', '.codex');
+const CODEX_PERSIST = resolve(process.cwd(), '.replit-tools', '.codex-persistent');
+
+function saveCodexCredentials() {
+  const authFile = join(CODEX_HOME, 'auth.json');
+  if (!existsSync(authFile)) return false;
+  try {
+    const auth = readFileSync(authFile, 'utf8');
+    if (!auth.trim() || auth.trim() === '{}') return false;
+    mkdirSync(CODEX_PERSIST, { recursive: true });
+    const persisted = join(CODEX_PERSIST, 'auth.json');
+    writeFileSync(persisted, auth, { mode: 0o600 });
+    try { chmodSync(persisted, 0o600); } catch {}
+    return true;
+  } catch { return false; }
+}
+
+function restoreCodexCredentials() {
+  const persistedAuth = join(CODEX_PERSIST, 'auth.json');
+  const targetAuth = join(CODEX_HOME, 'auth.json');
+  if (existsSync(targetAuth)) return false;
+  if (!existsSync(persistedAuth)) return false;
+  try {
+    const auth = readFileSync(persistedAuth, 'utf8');
+    if (!auth.trim() || auth.trim() === '{}') return false;
+    mkdirSync(CODEX_HOME, { recursive: true });
+    writeFileSync(targetAuth, auth, { mode: 0o600 });
+    try { chmodSync(targetAuth, 0o600); } catch {}
+    return true;
+  } catch { return false; }
+}
+
+function parseDateValue(value) {
+  if (!value) return null;
+  if (typeof value === 'number') {
+    const ms = value > 1e12 ? value : value * 1000;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatExpiry(value) {
+  const d = parseDateValue(value);
+  if (!d) return 'unknown';
+  const iso = d.toISOString();
+  return d.getTime() <= Date.now() ? `${iso} (expired)` : iso;
+}
+
+function formatTimestamp(value) {
+  const d = parseDateValue(value);
+  return d ? d.toISOString() : 'unknown';
+}
+
+function relPath(p) {
+  if (!p) return 'unknown';
+  const cwd = resolve(process.cwd());
+  const full = resolve(p);
+  if (full.startsWith(cwd + '/')) return full.slice(cwd.length + 1);
+  const home = process.env.HOME || '';
+  if (home && full.startsWith(home + '/')) return `~/${full.slice(home.length + 1)}`;
+  return full;
+}
+
+function readJsonIfExists(file) {
+  if (!file || !existsSync(file)) return null;
+  try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+function claudeCredentialCandidates() {
+  return [
+    join(process.env.HOME || '', '.claude', '.credentials.json'),
+    join(process.env.HOME || '', '.claude', 'credentials.json'),
+    resolve(process.cwd(), '.replit-tools', '.claude-persistent', '.credentials.json'),
+  ];
+}
+
+function getClaudeAuthDetails() {
+  const detected = detectClaude();
+  const status = detected.installed ? run('claude', ['auth', 'status']) : null;
+  let method = 'none';
+  let storage = null;
+  let expiry = null;
+
+  for (const file of claudeCredentialCandidates()) {
+    const cred = readJsonIfExists(file);
+    if (!cred) continue;
+    if (cred.claudeAiOauth) {
+      method = 'oauth';
+      storage = file;
+      expiry = cred.claudeAiOauth.expiresAt || null;
+      break;
+    }
+    if (cred.apiKey || cred.oauth_token) {
+      method = cred.apiKey ? 'api_key' : 'oauth_token';
+      storage = file;
+      break;
+    }
+  }
+
+  const statusText = ((status?.stdout || '') + (status?.stderr || '')).trim();
+  return {
+    provider: 'claude',
+    installed: detected.installed,
+    version: detected.version,
+    authed: detected.authed,
+    method,
+    expiry,
+    expiryText: formatExpiry(expiry),
+    storage,
+    storageText: relPath(storage),
+    statusText,
+  };
+}
+
+function getCodexAuthDetails() {
+  const detected = detectCodex();
+  const status = (detected.installed && detected.path) ? run(detected.path, ['login', 'status']) : null;
+  const authFile = join(CODEX_HOME, 'auth.json');
+  const persisted = join(CODEX_PERSIST, 'auth.json');
+  const activeFile = existsSync(authFile) ? authFile : existsSync(persisted) ? persisted : null;
+  const auth = readJsonIfExists(activeFile);
+
+  let method = detected.authMethod || 'none';
+  if (auth?.auth_mode === 'chatgpt') method = 'chatgpt_device_auth';
+  else if (auth?.auth_mode === 'api_key') method = 'api_key';
+  else if (!detected.authed && process.env.OPENAI_API_KEY) method = 'api_key_env';
+
+  const lastRefresh = auth?.last_refresh || null;
+  const statusText = ((status?.stdout || '') + (status?.stderr || '')).trim();
+  return {
+    provider: 'codex',
+    installed: detected.installed,
+    version: detected.version,
+    authed: detected.authed,
+    method,
+    expiry: null,
+    expiryText: 'n/a',
+    lastRefresh,
+    lastRefreshText: formatTimestamp(lastRefresh),
+    storage: activeFile,
+    storageText: relPath(activeFile),
+    statusText,
+    path: detected.path,
+  };
+}
+
+function getAuthState() {
+  return {
+    claude: getClaudeAuthDetails(),
+    codex: getCodexAuthDetails(),
+  };
+}
+
+function printAuthStatusBox(state) {
+  const c = state.claude;
+  const x = state.codex;
+  const cIcon = c.authed ? '✅' : c.installed ? '⚠️' : '❌';
+  const xIcon = x.authed ? '✅' : x.installed ? '⚠️' : '❌';
+
+  console.log('');
+  console.log(`  ${br('╔', '╗')}`);
+  console.log(`  ${ln(`🔑 Auth Status`)}`);
+  console.log(`  ${sep()}`);
+  console.log(`  ${ln(`🟠 Claude ${cIcon}  ${c.authed ? 'authenticated' : c.installed ? 'not authenticated' : 'not installed'}`)}`);
+  console.log(`  ${ln(`   Method:   ${c.method}`)}`);
+  console.log(`  ${ln(`   Expiry:   ${c.expiryText}`)}`);
+  console.log(`  ${ln(`   Storage:  ${c.storageText}`)}`);
+  console.log(`  ${sep()}`);
+  console.log(`  ${ln(`🟢 Codex  ${xIcon}  ${x.authed ? 'authenticated' : x.installed ? 'not authenticated' : 'not installed'}`)}`);
+  console.log(`  ${ln(`   Method:   ${x.method}`)}`);
+  console.log(`  ${ln(`   Expiry:   ${x.expiryText}`)}`);
+  console.log(`  ${ln(`   Storage:  ${x.storageText}`)}`);
+  if (x.lastRefresh) console.log(`  ${ln(`   Refreshed:${x.lastRefreshText}`)}`);
+  console.log(`  ${br('╚', '╝')}`);
+  console.log('');
+}
+
+function runCodexDeviceAuth(codexPath) {
+  if (!codexPath) return false;
+  const result = spawnSync(codexPath, ['login', '--device-auth'], {
+    stdio: 'inherit',
+    timeout: 900000,
+  });
+  if (result.status === 0) {
+    saveCodexCredentials();
+    return true;
+  }
+  return false;
 }
 
 // ─── Mode Resolution ────────────────────────────────────────────────────────
@@ -316,6 +751,8 @@ function generateGitignoreEntries(workspace) {
     '.claude/hooks/decision-ledger.jsonl',
     '.claude/.launched',
     '.claude/dual-brain.memory.json',
+    '.claude/dual-brain.version.json',
+    '.claude/dual-brain.update-check.json',
   ];
   let existing = '';
   try { existing = readFileSync(join(workspace, '.gitignore'), 'utf8'); } catch {}
@@ -380,6 +817,9 @@ function install(workspace, env, mode) {
     );
     actions.push('✓ .gitignore updated');
   }
+
+  const stamp = writeVersionStamp(workspace);
+  actions.push(`✓ version stamp (v${stamp.version})`);
 
   return actions;
 }
@@ -490,6 +930,132 @@ function launchPanel() {
     const { status } = spawnSync(process.execPath, [panel], { stdio: 'inherit' });
     process.exit(status || 0);
   }
+}
+
+// ─── Subcommand: auth ──────────────────────────────────────────────────────
+
+function cmdAuthStatus() {
+  const state = getAuthState();
+  if (jsonOut) {
+    console.log(JSON.stringify({ version: VERSION, auth: state }, null, 2));
+    return;
+  }
+  printAuthStatusBox(state);
+  console.log(`  Login:   ${cmd('npx dual-brain auth login')}`);
+  console.log(`  Refresh: ${cmd('npx dual-brain auth refresh')}`);
+  console.log('');
+}
+
+function cmdAuthLogin() {
+  const state = getAuthState();
+
+  console.log('');
+  if (!state.claude.authed) {
+    if (!state.claude.installed) {
+      console.log('  🟠 Claude is not installed.');
+    } else {
+      console.log('  🟠 Claude needs login.');
+      console.log(`    Run: ${cmd('claude login')}`);
+      console.log('    Claude uses its own browser/device flow from the CLI.');
+    }
+    console.log('');
+  }
+
+  if (!state.codex.authed) {
+    if (!state.codex.installed || !state.codex.path) {
+      console.log('  🟢 Codex is not installed.');
+      console.log('    Install first: npm i -g @openai/codex');
+      console.log('');
+    } else if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      console.log('  🟢 Codex login requires an interactive terminal.');
+      console.log(`    Run: ${cmd('codex login --device-auth')}`);
+      console.log('');
+    } else {
+      console.log('  🟢 Starting Codex device auth...');
+      console.log('');
+      if (runCodexDeviceAuth(state.codex.path)) {
+        console.log('');
+        console.log('  ✅ Codex authenticated and credentials saved.');
+      } else {
+        console.log('');
+        console.log(`  ❌ Codex auth failed. Retry with: ${cmd('codex login --device-auth')}`);
+      }
+      console.log('');
+    }
+  }
+
+  if (state.claude.authed && state.codex.authed) {
+    console.log('  ✅ Claude and Codex are already authenticated.');
+    console.log('');
+    return;
+  }
+
+  const finalState = getAuthState();
+  if (finalState.claude.authed && finalState.codex.authed) {
+    printAuthStatusBox(finalState);
+    return;
+  }
+
+  printAuthStatusBox(finalState);
+}
+
+function cmdAuthRefresh() {
+  let env = detectEnvironment();
+  let codexRefreshed = false;
+
+  console.log('');
+  console.log('  🔄 Refreshing provider auth...');
+  console.log('');
+
+  env = { ...env, claude: { ...env.claude, authed: false } };
+  env = healClaudeAuth(env);
+
+  if (env.codex.installed && env.codex.path && process.stdin.isTTY && process.stdout.isTTY) {
+    console.log('  🟢 Codex device auth refresh');
+    console.log('');
+    codexRefreshed = runCodexDeviceAuth(env.codex.path);
+    if (codexRefreshed) {
+      env.codex.authed = true;
+      env.codex.authMethod = 'device_auth';
+      console.log('');
+      console.log('  ✅ Codex auth refreshed and credentials saved.');
+      console.log('');
+    } else {
+      console.log('');
+      console.log(`  ❌ Codex refresh failed. Retry with: ${cmd('codex login --device-auth')}`);
+      console.log('');
+    }
+  } else {
+    env = { ...env, codex: { ...env.codex, authed: false } };
+    env = healCodexAuth(env);
+  }
+
+  if (env.claude.installed && !env.claude.authed) {
+    console.log(`  🟠 Claude refresh unavailable here. Run: ${cmd('claude login')}`);
+    console.log('');
+  }
+  if (env.codex.installed && !env.codex.authed && !codexRefreshed) {
+    console.log(`  🟢 Codex refresh incomplete. Run: ${cmd('codex login --device-auth')}`);
+    console.log('');
+  }
+
+  const finalState = getAuthState();
+  if (jsonOut) {
+    console.log(JSON.stringify({ version: VERSION, auth: finalState }, null, 2));
+    return;
+  }
+  printAuthStatusBox(finalState);
+}
+
+function cmdAuth() {
+  const action = positional[1] || 'status';
+  if (action === 'status')  { cmdAuthStatus(); return; }
+  if (action === 'login')   { cmdAuthLogin(); return; }
+  if (action === 'refresh') { cmdAuthRefresh(); return; }
+
+  console.error(`  Unknown auth command: ${action}`);
+  console.error(`  Run: ${cmd('npx dual-brain auth [status|login|refresh]')}`);
+  process.exit(1);
 }
 
 // ─── Subcommand: mode ──────────────────────────────────────────────────────
@@ -699,16 +1265,53 @@ function cmdExplain() {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-function main() {
+async function main() {
   if (subcommand === 'status') {
     launchPanel();
     return;
   }
+  if (subcommand === 'auth')    { cmdAuth();    return; }
   if (subcommand === 'mode')    { cmdMode();    return; }
   if (subcommand === 'budget')  { cmdBudget();  return; }
   if (subcommand === 'explain') { cmdExplain(); return; }
 
-  const env = detectEnvironment();
+  let env = detectEnvironment();
+  const startupUpdateInfo = (subcommand === 'update' || dryRun || jsonOut)
+    ? null
+    : checkForUpdate(env.workspace);
+
+  if (
+    startupUpdateInfo?.updateAvailable &&
+    process.stdin.isTTY &&
+    process.stdout.isTTY &&
+    !process.env.CI
+  ) {
+    console.log('');
+    const shouldUpdate = await promptForUpdate(startupUpdateInfo);
+    console.log('');
+    if (shouldUpdate) {
+      env = healClaudeAuth(env);
+      env = healCodexAuth(env);
+      const updateMode = resolveMode(env);
+      const updateActions = performUpdate(env.workspace, env, updateMode);
+      printReport(env, updateMode, updateActions);
+      if (process.stdin.isTTY && process.stdout.isTTY && !process.env.CI) {
+        launchPanel();
+      }
+      return;
+    }
+  }
+
+  // Auth self-healing: try to fix expired/missing auth silently
+  env = healClaudeAuth(env);
+  env = healCodexAuth(env);
+
+  // Interactive auth guidance if still not authed
+  if (!env.claude.authed || !env.codex.authed) {
+    env = await authGuidance(env);
+  }
+
+  // Re-resolve mode after healing
   const mode = resolveMode(env);
 
   if (dryRun || jsonOut) {
@@ -717,6 +1320,12 @@ function main() {
     } else {
       printReport(env, mode, null, true);
     }
+    process.exit(0);
+  }
+
+  if (subcommand === 'update') {
+    const actions = performUpdate(env.workspace, env, mode);
+    printReport(env, mode, actions);
     process.exit(0);
   }
 

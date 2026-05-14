@@ -42,6 +42,13 @@ function check(name, status, detail) {
   return { name, status, detail };
 }
 
+function isCodexAuthenticated(result) {
+  const output = ((result?.stdout || "") + (result?.stderr || "")).toLowerCase();
+  if (/\b(not\s+logged\s+in|unauthenticated|logged\s+out|no\s+auth)\b/.test(output)) return false;
+  return result?.status === 0 ||
+    /\b(logged\s+in|authenticated|signed\s+in)\b/.test(output);
+}
+
 // ---------------------------------------------------------------------------
 // Check implementations
 // ---------------------------------------------------------------------------
@@ -256,7 +263,7 @@ function checkCodexCli() {
 
   const output = (loginResult.stdout + loginResult.stderr).toLowerCase();
 
-  if (loginResult.status === 0 || output.includes("logged in") || output.includes("authenticated")) {
+  if (isCodexAuthenticated(loginResult)) {
     return check("codex CLI", STATUS.pass, "authenticated");
   }
 

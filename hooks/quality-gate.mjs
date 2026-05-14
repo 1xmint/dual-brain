@@ -16,7 +16,7 @@
  */
 
 import { createHash } from 'crypto';
-import { execSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, extname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -81,9 +81,14 @@ function exit(obj) {
   process.exit(0);
 }
 
-function runGit(cmd) {
+function runGit(args) {
   try {
-    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = spawnSync('git', args, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+    return proc.status === 0 ? proc.stdout : '';
   } catch {
     return '';
   }
@@ -165,8 +170,8 @@ function matchesSkipPattern(filePath, patterns) {
 }
 
 function getChangedFiles() {
-  const tracked = runGit('git diff --name-only HEAD') || '';
-  const untracked = runGit('git ls-files --others --exclude-standard') || '';
+  const tracked = runGit(['diff', '--name-only', 'HEAD']) || '';
+  const untracked = runGit(['ls-files', '--others', '--exclude-standard']) || '';
   const all = [...new Set([
     ...tracked.split('\n').filter(Boolean),
     ...untracked.split('\n').filter(Boolean),
@@ -252,7 +257,7 @@ function main() {
   }
 
   // Compute diff hash
-  const diff = runGit('git diff HEAD');
+  const diff = runGit(['diff', 'HEAD']);
   const diffHash = createHash('sha256').update(diff).digest('hex').slice(0, 8);
 
   // Build review record (includes sensitivity info)

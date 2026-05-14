@@ -12,7 +12,7 @@
  * Output: JSON to stdout — always valid, never crashes.
  */
 
-import { execSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -96,10 +96,22 @@ function findCodex() {
 
 const CODEX_BIN = findCodex();
 
-function runGit(cmd) {
+function runGit(args) {
   try {
-    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = spawnSync('git', args, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+    return proc.status === 0 ? proc.stdout : null;
   } catch { return null; }
+}
+
+function isCodexAuthenticated(result) {
+  const out = ((result?.stdout || '') + (result?.stderr || '')).toLowerCase();
+  if (/\b(not\s+logged\s+in|unauthenticated|logged\s+out|no\s+auth)\b/.test(out)) return false;
+  return result?.status === 0 ||
+    /\b(logged\s+in|authenticated|signed\s+in)\b/.test(out);
 }
 
 function countLines(str) {
@@ -153,11 +165,10 @@ function exit(obj) {
  */
 function tryCodexReview(diff, { round = 1, claudeReview = null } = {}) {
   if (!CODEX_BIN) return null;
-  try {
-    spawnSync(CODEX_BIN, ['login', 'status'], {
-      encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
-    });
-  } catch {
+  const login = spawnSync(CODEX_BIN, ['login', 'status'], {
+    encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+  });
+  if (!isCodexAuthenticated(login)) {
     return null;
   }
 
@@ -325,18 +336,18 @@ async function main() {
   const opts = { round, claudeReview };
 
   // 1. Get diff
-  let diff = runGit('git diff --staged') || '';
+  let diff = runGit(['diff', '--staged']) || '';
   if (countLines(diff) < MIN_DIFF_LINES) {
-    const headDiff = runGit('git diff HEAD') || '';
+    const headDiff = runGit(['diff', 'HEAD']) || '';
     if (countLines(headDiff) > countLines(diff)) diff = headDiff;
   }
 
   try {
-    const untracked = runGit('git ls-files --others --exclude-standard') || '';
+    const untracked = runGit(['ls-files', '--others', '--exclude-standard']) || '';
     const sourceExts = /\.(ts|tsx|js|jsx|py|rs|go|java|rb|swift|kt|mjs|cjs)$/;
     const untrackedSrc = untracked.split('\n').filter(f => f && sourceExts.test(f));
     for (const f of untrackedSrc.slice(0, 10)) {
-      const content = runGit(`git diff --no-index /dev/null "${f}"`);
+      const content = runGit(['diff', '--no-index', '/dev/null', f]);
       if (content) diff += '\n' + content;
     }
   } catch {}
