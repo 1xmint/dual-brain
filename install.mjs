@@ -397,6 +397,29 @@ function printReport(env, mode, actions) {
   console.log('');
   for (const l of lines) console.log(`  ${l}`);
   console.log('');
+
+  if (actions) {
+    console.log('  What just happened:');
+    console.log('  Every Claude Code session in this project now auto-routes');
+    console.log('  agent work by complexity — cheap models for search, mid-tier');
+    console.log('  for execution, best models for thinking. Cost is tracked.');
+    if (mode.mode === 'dual') {
+      console.log('  Both Claude and GPT are available as work providers.');
+    }
+    console.log('');
+    console.log('  Try these in your next Claude Code session:');
+    console.log('    node .claude/hooks/health-check.mjs     # verify setup');
+    console.log('    node .claude/hooks/cost-report.mjs      # see activity');
+    console.log('    node .claude/hooks/budget-balancer.mjs   # provider balance');
+    if (mode.openaiEnabled) {
+      console.log('    node .claude/hooks/dual-brain-review.mjs # GPT code review');
+    }
+    console.log('');
+    console.log('  Customize:');
+    console.log('    .claude/review-rules.md     # your project\'s review rules');
+    console.log('    .claude/orchestrator.json   # routing, budgets, tiers');
+    console.log('');
+  }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
