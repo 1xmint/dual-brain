@@ -15,7 +15,26 @@ Route subagents by task complexity:
 For isolated or parallel work, dispatch to GPT via Codex CLI:
 
 - `node .claude/hooks/gpt-work-dispatcher.mjs --task "..." --model gpt-5.4` — execution tasks
-- `node .claude/hooks/dual-brain-think.mjs --question "..."` — dual-perspective decisions
+
+## Dual-Brain Collaboration
+
+Dual-brain is a multi-round conversation between Claude and GPT — not a single-shot dispatch.
+
+**Think flow** (architecture decisions):
+1. Round 1: `node .claude/hooks/dual-brain-think.mjs --question "..."`
+   → GPT gives independent analysis
+2. You analyze the same question independently
+3. Round 2: `node .claude/hooks/dual-brain-think.mjs --question "..." --round 2 --claude-says "<your analysis>"`
+   → GPT responds to your points: agreements, pushback, refined recommendation
+4. You synthesize both rounds into a final decision
+
+**Review flow** (code review):
+1. Round 1: `node .claude/hooks/dual-brain-review.mjs`
+   → GPT reviews the diff independently
+2. You review the same diff independently
+3. Round 2: `node .claude/hooks/dual-brain-review.mjs --round 2 --claude-review "<your findings>"`
+   → GPT confirms shared findings, acknowledges misses, disputes false positives
+4. You synthesize into a final review verdict
 
 ## Routing Rules
 

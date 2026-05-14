@@ -39,34 +39,34 @@ if (flag('--version') || flag('-v')) {
 
 if (flag('--help') || flag('-h')) {
   console.log(`
-  dual-brain v${VERSION} — Dual-provider orchestrator for Claude Code
+  🧠 dual-brain v${VERSION} — Dual-provider orchestrator for Claude Code
 
   Usage:  npx -y dual-brain [command] [options]
 
-  Commands:
-    (none)       Auto-detect and install/update orchestrator
-    status       Live view of mode, spend, pressure, profile
-    mode         Show or switch profile (balanced, cost-saver, quality-first)
-    budget       Set session/daily spend limits
-    explain      Show why the last routing decision was made
-    init         Alias for default install (backward compat)
+  ⌨️  Commands:
+    (none)       🧠 Auto-detect and install/update orchestrator
+    status       🟢 Open live control panel
+    mode         🎛️  Show or switch profile
+    budget       💵 Set session/daily spend limits
+    explain      🧭 Explain last routing decision
+    init         Alias for default install
 
   Options:
-    --force      Overwrite all existing config (keeps review-rules.md)
-    --dry-run    Detect environment only, don't install
-    --json       Output detection as JSON (implies --dry-run)
+    --force      Overwrite all existing config
+    --dry-run    Detect environment only
+    --json       Output detection as JSON
     --help       Show this help
 
-  Profiles:
-    balanced       Standard routing — best model for each tier
-    cost-saver     Minimize spend — prefer cheaper models
-    quality-first  Maximum quality — dual-brain for medium+ risk
+  🎛️  Profiles:
+    ⚖️  balanced       Standard routing — best model per tier
+    💸 cost-saver     Minimize spend — prefer cheaper models
+    💎 quality-first  Maximum quality — dual-brain for medium+
 
-  Examples:
+  🚀 Examples:
     ${cmd('npx dual-brain')}                  # install or update
-    ${cmd('npx dual-brain status')}           # live dashboard
+    ${cmd('npx dual-brain status')}           # open control panel
     ${cmd('npx dual-brain mode cost-saver')}  # switch profile
-    ${cmd('npx dual-brain budget 8 25')}      # $8 session / $25 daily
+    ${cmd('npx dual-brain budget 8 25')}      # \$8 session / \$25 daily
     ${cmd('npx dual-brain explain')}          # last routing decision
   `);
   process.exit(0);
@@ -381,43 +381,50 @@ function install(workspace, env, mode) {
 
 // ─── Status Report ──────────────────────────────────────────────────────────
 
-function statusIcon(val) { return val ? '✓' : '✗'; }
+function statusIcon(val) { return val ? '✅' : '❌'; }
+
+const MODE_EMOJIS = {
+  'dual':        '🧠',
+  'claude-only': '🟠',
+  'openai-only': '🟢',
+  'detect-only': '🔎',
+};
 
 function printReport(env, mode, actions) {
   const lines = [];
 
   lines.push(br('╔', '╗'));
-  lines.push(ln(`Dual-Brain Orchestrator v${VERSION}`));
+  lines.push(ln(`🧠 Dual-Brain Orchestrator v${VERSION}`));
   lines.push(sep());
 
-  lines.push(ln('Environment'));
+  lines.push(ln('🌎 Environment'));
   if (env.isReplit) {
-    lines.push(ln(`  Platform:    Replit${env.hasReplitTools ? ' (replit-tools detected)' : ''}`));
+    lines.push(ln(`  🌀 Platform:  Replit${env.hasReplitTools ? ' + replit-tools' : ''}`));
   } else {
     lines.push(ln('  Platform:    standalone'));
   }
 
   const cVer = env.claude.version ? ` ${env.claude.version}` : '';
-  const cAuth = env.claude.authed ? 'authenticated' : env.claude.installed ? 'not authenticated' : 'not found';
-  lines.push(ln(`  Claude CLI:  ${statusIcon(env.claude.authed)} ${cAuth}${cVer}`));
+  const cAuth = env.claude.authed ? '✅ authenticated' : env.claude.installed ? '⚠️  login needed' : '❌ not found';
+  lines.push(ln(`  🟠 Claude:   ${cAuth}${cVer}`));
 
   const xVer = env.codex.version ? ` ${env.codex.version}` : '';
-  const xAuth = env.codex.authed ? 'authenticated' : env.codex.installed ? 'not authenticated' : 'not found';
-  lines.push(ln(`  Codex CLI:   ${statusIcon(env.codex.authed)} ${xAuth}${xVer}`));
+  const xAuth = env.codex.authed ? '✅ authenticated' : env.codex.installed ? '⚠️  login needed' : '❌ not found';
+  lines.push(ln(`  🟢 Codex:    ${xAuth}${xVer}`));
 
   lines.push(sep());
-  lines.push(ln(`Mode: ${MODE_LABELS[mode.mode]}`));
+  lines.push(ln(`${MODE_EMOJIS[mode.mode] || '🧠'} Mode: ${MODE_LABELS[mode.mode]}`));
 
   if (actions) {
     lines.push(sep());
-    lines.push(ln('Installed'));
+    lines.push(ln('📝 Installed'));
     for (const a of actions) lines.push(ln(`  ${a}`));
   }
 
   const needsAction = !env.claude.authed || !env.codex.authed;
   if (needsAction && mode.mode !== 'dual') {
     lines.push(sep());
-    lines.push(ln('To unlock full features:'));
+    lines.push(ln('🔓 Unlock full power:'));
     if (!env.claude.installed) {
       lines.push(ln('  curl -fsSL https://claude.ai/install.sh | sh'));
     }
@@ -436,8 +443,8 @@ function printReport(env, mode, actions) {
   lines.push(sep());
   if (actions) {
     lines.push(ln(mode.mode === 'dual'
-      ? 'Ready — both providers active, no restart needed'
-      : 'Ready — hooks active, run commands above for full power'));
+      ? '✅ Ready: both providers active, no restart needed'
+      : '✅ Ready: hooks active, run commands above for full power'));
   } else {
     lines.push(ln('Dry run — no files written'));
   }
@@ -448,35 +455,26 @@ function printReport(env, mode, actions) {
   console.log('');
 
   if (actions) {
-    console.log('  What just happened:');
-    console.log('  Every Claude Code session in this project now auto-routes');
-    console.log('  agent work by complexity — cheap models for search, mid-tier');
-    console.log('  for execution, best models for thinking. Cost is tracked.');
+    console.log('  🧭 What changed:');
+    console.log('  Every Claude Code session now auto-routes agent work by');
+    console.log('  complexity — cheap models for search, mid-tier for execution,');
+    console.log('  best models for thinking. Cost is tracked automatically.');
     if (mode.mode === 'dual') {
-      console.log('  Both Claude and GPT are available as work providers.');
+      console.log('  🧠 Both Claude and GPT are available as work providers.');
     }
     console.log('');
-    if (IS_REPLIT) {
-      console.log('  Try these in your Replit shell (paste with ! prefix):');
-      console.log(`    ${cmd('npx dual-brain status')}              # live dashboard`);
-      console.log(`    ${cmd('npx dual-brain mode cost-saver')}     # switch profile`);
-      console.log(`    ${cmd('npx dual-brain budget 8 25')}         # set limits`);
-    } else {
-      console.log('  Try these in your next Claude Code session:');
-      console.log('    npx dual-brain status              # live dashboard');
-      console.log('    npx dual-brain mode cost-saver     # switch profile');
-      console.log('    npx dual-brain budget 8 25         # set limits');
-    }
+    console.log('  ⌨️  Open the control panel:');
+    console.log(`    ${cmd('npx dual-brain status')}`);
     console.log('');
-    console.log('  In-session tools (ask Claude to run these):');
+    console.log('  🩺 In-session tools (ask Claude to run):');
     console.log('    node .claude/hooks/health-check.mjs     # verify setup');
     console.log('    node .claude/hooks/cost-report.mjs      # see activity');
-    console.log('    node .claude/hooks/budget-balancer.mjs   # provider balance');
+    console.log('    node .claude/hooks/decision-ledger.mjs  # routing insights');
     if (mode.openaiEnabled) {
       console.log('    node .claude/hooks/dual-brain-review.mjs # GPT code review');
     }
     console.log('');
-    console.log('  Customize:');
+    console.log('  ⚙️  Customize:');
     console.log('    .claude/review-rules.md     # your project\'s review rules');
     console.log('    .claude/orchestrator.json   # routing, budgets, tiers');
     console.log('');
@@ -616,12 +614,13 @@ function cmdMode() {
 
   if (!modeArg || modeArg === 'list') {
     const current = loadProfile(workspace);
+    const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '💸', 'quality-first': '💎' };
     console.log('');
-    console.log('  Available profiles:');
+    console.log('  🎛️  Profiles:');
     console.log('');
     for (const [name, p] of Object.entries(PROFILES)) {
-      const active = name === current.name ? ' ← active' : '';
-      console.log(`    ${name.padEnd(15)} ${p.description}${active}`);
+      const active = name === current.name ? ' ✅ active' : '';
+      console.log(`    ${PEMOJIS[name] || '  '} ${name.padEnd(15)} ${p.description}${active}`);
     }
     console.log('');
     console.log(`  Switch: ${cmd('npx dual-brain mode <profile>')}`);
@@ -647,17 +646,18 @@ function cmdMode() {
 
   saveProfile(workspace, modeArg, customOverrides);
 
+  const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '💸', 'quality-first': '💎' };
   console.log('');
-  console.log(`  Profile switched to: ${modeArg}`);
+  console.log(`  ✅ Profile switched: ${PEMOJIS[modeArg] || ''} ${modeArg}`);
   console.log(`  ${profile.description}`);
   console.log('');
-  console.log('  What changed:');
-  console.log(`    Routing:      ${profile.routing.prefer_provider}`);
-  console.log(`    Budget:       $${profile.budgets.session_limit_usd}/session, $${profile.budgets.daily_limit_usd}/day`);
-  console.log(`    Reviews from: ${profile.quality_gate.sensitivity_floor} risk+`);
-  console.log(`    Dual-brain:   ${profile.quality_gate.dual_brain_minimum} risk+`);
+  console.log('  🧭 Routing changes:');
+  console.log(`    Provider:     ${profile.routing.prefer_provider}`);
+  console.log(`    💵 Budget:    $${profile.budgets.session_limit_usd}/session, $${profile.budgets.daily_limit_usd}/day`);
+  console.log(`    🛡️  Reviews:   ${profile.quality_gate.sensitivity_floor} risk+`);
+  console.log(`    🧠 Dual-brain: ${profile.quality_gate.dual_brain_minimum} risk+`);
   console.log('');
-  console.log('  Active immediately — no restart needed.');
+  console.log('  🟢 Active immediately, no restart needed.');
   console.log('');
 }
 
@@ -671,9 +671,9 @@ function cmdBudget() {
   if (sessionArg == null) {
     const profile = loadProfile(workspace);
     console.log('');
-    console.log('  Current budget limits:');
-    console.log(`    Session: warn $${profile.budgets.session_warn_usd} / limit $${profile.budgets.session_limit_usd}`);
-    console.log(`    Daily:   warn $${profile.budgets.daily_warn_usd} / limit $${profile.budgets.daily_limit_usd}`);
+    console.log('  💵 Current budget:');
+    console.log(`    Session: ⚠️  $${profile.budgets.session_warn_usd} warn · 🛑 $${profile.budgets.session_limit_usd} limit`);
+    console.log(`    Daily:   ⚠️  $${profile.budgets.daily_warn_usd} warn · 🛑 $${profile.budgets.daily_limit_usd} limit`);
     console.log('');
     console.log(`  Set limits: ${cmd('npx dual-brain budget <session$> [daily$]')}`);
     console.log(`  Example:    ${cmd('npx dual-brain budget 8 25')}`);
@@ -710,11 +710,11 @@ function cmdBudget() {
   renameSync(budgetTmp, budgetTarget);
 
   console.log('');
-  console.log('  Budget limits updated:');
-  console.log(`    Session: warn $${customOverrides.budgets.session_warn_usd} / limit $${sessionArg}`);
-  console.log(`    Daily:   warn $${customOverrides.budgets.daily_warn_usd} / limit $${daily}`);
+  console.log('  ✅ Budget updated:');
+  console.log(`    Session: ⚠️  $${customOverrides.budgets.session_warn_usd} warn · 🛑 $${sessionArg} limit`);
+  console.log(`    Daily:   ⚠️  $${customOverrides.budgets.daily_warn_usd} warn · 🛑 $${daily} limit`);
   console.log('');
-  console.log('  Active immediately — no restart needed.');
+  console.log('  🟢 Active immediately, no restart needed.');
   console.log('');
 }
 
@@ -728,7 +728,7 @@ function cmdExplain() {
 
   if (!existsSync(logFile)) {
     console.log('');
-    console.log('  No routing decisions recorded today.');
+    console.log('  💤 No routing decisions recorded today.');
     console.log('  Start a Claude Code session and the tier enforcer will log decisions.');
     console.log('');
     return;
@@ -752,7 +752,7 @@ function cmdExplain() {
 
   if (!lastRec) {
     console.log('');
-    console.log('  No routing decisions found in today\'s log.');
+    console.log('  💤 No routing decisions found in today\'s log.');
     console.log('  The tier enforcer logs decisions when Agent tool is used.');
     console.log('');
     return;
@@ -761,23 +761,23 @@ function cmdExplain() {
   const profile = loadProfile(workspace);
 
   console.log('');
-  console.log('  Last Routing Decision');
+  console.log('  🧭 Last Routing Decision');
   console.log('  ' + '─'.repeat(40));
-  console.log(`  Time:        ${lastRec.timestamp?.slice(11, 19) || 'unknown'}`);
-  console.log(`  Detected:    ${lastRec.detected_tier || 'unknown'} tier`);
-  console.log(`  Recommended: ${lastRec.recommended_model || 'unknown'}`);
-  console.log(`  Actual:      ${lastRec.actual_model || 'unknown'}`);
-  console.log(`  Followed:    ${lastRec.followed ? 'yes' : 'no'}`);
-  console.log(`  Profile:     ${profile.name}`);
+  console.log(`  🕐 Time:         ${lastRec.timestamp?.slice(11, 19) || 'unknown'}`);
+  console.log(`  🔎 Detected:     ${lastRec.detected_tier || 'unknown'} tier`);
+  console.log(`  🧠 Recommended:  ${lastRec.recommended_model || 'unknown'}`);
+  console.log(`  🎯 Actual:       ${lastRec.actual_model || 'unknown'}`);
+  console.log(`  ${lastRec.followed ? '✅' : '⚠️'}  Followed:     ${lastRec.followed ? 'yes' : 'no'}`);
+  console.log(`  🎛️  Profile:      ${profile.name}`);
   console.log('');
 
   if (!lastRec.followed) {
-    console.log('  The recommendation was not followed. This may mean:');
+    console.log('  ⚠️  Recommendation was overridden. This may mean:');
     console.log('  - The task needed a different model (valid override)');
     console.log('  - The subagent_type forced a specific tier');
     console.log(`  - Profile "${profile.name}" adjusted the threshold`);
   } else {
-    console.log('  The recommendation was followed — routing worked as expected.');
+    console.log('  ✅ Routing matched the recommendation.');
   }
 
   let total = 0, followed = 0;
@@ -796,7 +796,18 @@ function cmdExplain() {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 function main() {
-  if (subcommand === 'status')  { cmdStatus();  return; }
+  if (subcommand === 'status') {
+    // Launch interactive TUI if available and TTY
+    const panelPath = join(resolve(process.cwd()), '.claude', 'hooks', 'control-panel.mjs');
+    const pkgPanel = join(__dirname, 'hooks', 'control-panel.mjs');
+    const panel = existsSync(panelPath) ? panelPath : existsSync(pkgPanel) ? pkgPanel : null;
+    if (panel && process.stdin.isTTY && process.stdout.isTTY && !process.env.CI) {
+      const { status } = spawnSync(process.execPath, [panel], { stdio: 'inherit' });
+      process.exit(status || 0);
+    }
+    cmdStatus();
+    return;
+  }
   if (subcommand === 'mode')    { cmdMode();    return; }
   if (subcommand === 'budget')  { cmdBudget();  return; }
   if (subcommand === 'explain') { cmdExplain(); return; }
