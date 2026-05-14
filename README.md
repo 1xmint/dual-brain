@@ -51,10 +51,35 @@ npx -y dual-brain
 
 **Dual-brain** is recommended automatically for high-risk decisions — hooks detect the risk level and suggest dual-brain analysis, where both providers think on the same problem independently.
 
+## Vibe Coding
+
+Speak naturally. The orchestrator handles the structure.
+
+```bash
+# Decompose a casual request into structured work
+node .claude/hooks/vibe-router.mjs "fix the login bug and also update the nav"
+
+# Generate a Steve-style execution plan
+node .claude/hooks/plan-generator.mjs --utterance "refactor the auth flow" --write
+
+# Switch profiles with natural language
+npx dual-brain mode "go aggressive"
+npx dual-brain mode "be careful"
+npx dual-brain mode "cheap"
+
+# Check persistent preferences and work threads
+node .claude/hooks/vibe-memory.mjs --threads
+```
+
+The vibe-router splits multi-task requests, classifies risk, assigns tiers, and recommends quality gates. The plan-generator produces 3-part plans (dependency-ordered tasks, user stories, questions with suggested answers). Vibe-memory learns your preferences over time.
+
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
+| `hooks/vibe-router.mjs` | Decompose casual language into structured work orders |
+| `hooks/plan-generator.mjs` | Generate Steve-style 3-part execution plans |
+| `hooks/vibe-memory.mjs` | Persistent preferences, work threads, preference inference |
 | `hooks/cost-report.mjs` | Activity & cost estimates by model tier |
 | `hooks/dual-brain-review.mjs` | Send git diff to GPT for independent review |
 | `hooks/dual-brain-think.mjs` | Dual-perspective analysis on architecture decisions |
@@ -63,7 +88,7 @@ npx -y dual-brain
 | `hooks/gpt-work-dispatcher.mjs` | Dispatch execution tasks to GPT via Codex CLI |
 | `hooks/session-report.mjs` | Session-end summary: activity, compliance, quality |
 | `hooks/health-check.mjs` | Verify all hooks and dependencies are working |
-| `hooks/test-orchestrator.mjs` | Self-test harness (39 tests) |
+| `hooks/test-orchestrator.mjs` | Self-test harness (40 tests) |
 | `hooks/setup-wizard.mjs` | Interactive config (optional — for custom plans) |
 | `hooks/install-git-hooks.mjs` | Git pre-commit hook for quality gate |
 
