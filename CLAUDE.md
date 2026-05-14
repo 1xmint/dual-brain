@@ -32,9 +32,22 @@ Before ending a session with code changes:
 
 Gate statuses: `pass` (safe to end), `issues_found` (fix first), `needs_human_review` (GPT unavailable).
 
+## Profiles
+
+Active profile controls routing posture, budgets, and quality gate behavior.
+Profile persists to `.claude/dual-brain.profile.json` (gitignored).
+
+- **balanced** (default): Best model per tier, normal budgets, reviews at medium+ risk
+- **cost-saver**: Prefer cheaper models, lower budgets, skip GPT for non-critical
+- **quality-first**: Dual-brain for medium+ risk, higher budgets, stricter reviews
+
+Switch profiles: `npx dual-brain mode cost-saver`
+Check status: `npx dual-brain status`
+
 ## Available Tools
 
 - `node .claude/hooks/cost-report.mjs` — activity and cost estimates
 - `node .claude/hooks/health-check.mjs` — verify system health
 - `node .claude/hooks/budget-balancer.mjs` — provider balance status
+- `node .claude/hooks/decision-ledger.mjs` — routing outcome insights
 - `node .claude/hooks/test-orchestrator.mjs` — run self-tests

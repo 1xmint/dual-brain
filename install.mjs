@@ -8,13 +8,19 @@
  *   npx dual-brain --dry-run        # detect only, don't install
  *   npx dual-brain --help
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')).version;
+
+// ─── Replit Detection ──────────────────────────────────────────────────────
+
+const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
+
+function cmd(s) { return IS_REPLIT ? `! ${s}` : s; }
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -23,6 +29,8 @@ const flag = (f) => argv.includes(f);
 const force = flag('--force');
 const dryRun = flag('--dry-run');
 const jsonOut = flag('--json');
+const positional = argv.filter(a => !a.startsWith('-'));
+const subcommand = positional[0] || null;
 
 if (flag('--version') || flag('-v')) {
   console.log(`dual-brain v${VERSION}`);
@@ -33,22 +41,41 @@ if (flag('--help') || flag('-h')) {
   console.log(`
   dual-brain v${VERSION} — Dual-provider orchestrator for Claude Code
 
-  Usage:  npx -y dual-brain [options]
+  Usage:  npx -y dual-brain [command] [options]
+
+  Commands:
+    (none)       Auto-detect and install/update orchestrator
+    status       Live view of mode, spend, pressure, profile
+    mode         Show or switch profile (balanced, cost-saver, quality-first)
+    budget       Set session/daily spend limits
+    explain      Show why the last routing decision was made
+    init         Alias for default install (backward compat)
 
   Options:
     --force      Overwrite all existing config (keeps review-rules.md)
     --dry-run    Detect environment only, don't install
     --json       Output detection as JSON (implies --dry-run)
     --help       Show this help
+
+  Profiles:
+    balanced       Standard routing — best model for each tier
+    cost-saver     Minimize spend — prefer cheaper models
+    quality-first  Maximum quality — dual-brain for medium+ risk
+
+  Examples:
+    ${cmd('npx dual-brain')}                  # install or update
+    ${cmd('npx dual-brain status')}           # live dashboard
+    ${cmd('npx dual-brain mode cost-saver')}  # switch profile
+    ${cmd('npx dual-brain budget 8 25')}      # $8 session / $25 daily
+    ${cmd('npx dual-brain explain')}          # last routing decision
   `);
   process.exit(0);
 }
 
-// Silently accept 'init' for backward compat
-const positional = argv.filter(a => !a.startsWith('-'));
-if (positional.length > 0 && positional[0] !== 'init') {
-  console.error(`  Unknown command: ${positional[0]}`);
-  console.error('  Run: npx dual-brain --help');
+const SUBCOMMANDS = ['init', 'status', 'mode', 'budget', 'explain'];
+if (subcommand && !SUBCOMMANDS.includes(subcommand)) {
+  console.error(`  Unknown command: ${subcommand}`);
+  console.error(`  Run: ${cmd('npx dual-brain --help')}`);
   process.exit(1);
 }
 
@@ -283,6 +310,9 @@ function generateGitignoreEntries(workspace) {
     '.claude/reviews/',
     '.claude/hooks/.drift-warned',
     '.claude/hooks/.budget-alerted',
+    '.claude/dual-brain.profile.json',
+    '.claude/hooks/usage-summary-*.json',
+    '.claude/hooks/decision-ledger.jsonl',
   ];
   let existing = '';
   try { existing = readFileSync(join(workspace, '.gitignore'), 'utf8'); } catch {}
@@ -303,7 +333,8 @@ function install(workspace, env, mode) {
     'dual-brain-review.mjs', 'dual-brain-think.mjs', 'quality-gate.mjs',
     'test-orchestrator.mjs', 'setup-wizard.mjs', 'health-check.mjs',
     'install-git-hooks.mjs', 'session-report.mjs', 'budget-balancer.mjs',
-    'gpt-work-dispatcher.mjs',
+    'gpt-work-dispatcher.mjs', 'profiles.mjs',
+    'summary-checkpoint.mjs', 'decision-ledger.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
   actions.push(`✓ ${HOOKS.length} hook scripts`);
@@ -425,7 +456,19 @@ function printReport(env, mode, actions) {
       console.log('  Both Claude and GPT are available as work providers.');
     }
     console.log('');
-    console.log('  Try these in your next Claude Code session:');
+    if (IS_REPLIT) {
+      console.log('  Try these in your Replit shell (paste with ! prefix):');
+      console.log(`    ${cmd('npx dual-brain status')}              # live dashboard`);
+      console.log(`    ${cmd('npx dual-brain mode cost-saver')}     # switch profile`);
+      console.log(`    ${cmd('npx dual-brain budget 8 25')}         # set limits`);
+    } else {
+      console.log('  Try these in your next Claude Code session:');
+      console.log('    npx dual-brain status              # live dashboard');
+      console.log('    npx dual-brain mode cost-saver     # switch profile');
+      console.log('    npx dual-brain budget 8 25         # set limits');
+    }
+    console.log('');
+    console.log('  In-session tools (ask Claude to run these):');
     console.log('    node .claude/hooks/health-check.mjs     # verify setup');
     console.log('    node .claude/hooks/cost-report.mjs      # see activity');
     console.log('    node .claude/hooks/budget-balancer.mjs   # provider balance');
@@ -440,9 +483,324 @@ function printReport(env, mode, actions) {
   }
 }
 
+// ─── Profile System ────────────────────────────────────────────────────────
+
+const PROFILE_FILE_REL = '.claude/dual-brain.profile.json';
+
+function profilePath(workspace) {
+  return join(workspace || process.cwd(), PROFILE_FILE_REL);
+}
+
+const PROFILES = {
+  balanced: {
+    description: 'Standard routing — best model for each tier, normal budgets',
+    routing: { prefer_provider: 'auto', think_threshold: 'normal', gpt_dispatch_bias: 0 },
+    budgets: { session_warn_usd: 5, session_limit_usd: 10, daily_warn_usd: 20, daily_limit_usd: 50 },
+    quality_gate: { sensitivity_floor: 'medium', dual_brain_minimum: 'high' },
+  },
+  'cost-saver': {
+    description: 'Minimize spend — prefer cheaper models, skip GPT for low risk',
+    routing: { prefer_provider: 'cheapest', think_threshold: 'strict', gpt_dispatch_bias: -20 },
+    budgets: { session_warn_usd: 2, session_limit_usd: 5, daily_warn_usd: 8, daily_limit_usd: 20 },
+    quality_gate: { sensitivity_floor: 'high', dual_brain_minimum: 'critical' },
+  },
+  'quality-first': {
+    description: 'Maximum quality — dual-brain for medium+, stricter reviews',
+    routing: { prefer_provider: 'most-capable', think_threshold: 'relaxed', gpt_dispatch_bias: 10 },
+    budgets: { session_warn_usd: 15, session_limit_usd: 30, daily_warn_usd: 50, daily_limit_usd: 100 },
+    quality_gate: { sensitivity_floor: 'low', dual_brain_minimum: 'medium' },
+  },
+};
+
+function loadProfile(workspace) {
+  try {
+    const data = JSON.parse(readFileSync(profilePath(workspace), 'utf8'));
+    const name = data.active && PROFILES[data.active] ? data.active : 'balanced';
+    const profile = PROFILES[name];
+    const custom = data.custom_overrides || {};
+    return {
+      name,
+      ...profile,
+      budgets: { ...profile.budgets, ...custom.budgets },
+      routing: { ...profile.routing, ...custom.routing },
+      switched_at: data.switched_at || null,
+    };
+  } catch {
+    return { name: 'balanced', ...PROFILES.balanced, switched_at: null };
+  }
+}
+
+function saveProfile(workspace, name, customOverrides) {
+  const data = { active: name, switched_at: new Date().toISOString() };
+  if (customOverrides) data.custom_overrides = customOverrides;
+  const target = profilePath(workspace);
+  const tmp = target + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+  renameSync(tmp, target);
+}
+
+// ─── Subcommand: status ────────────────────────────────────────────────────
+
+function cmdStatus() {
+  const workspace = resolve(process.cwd());
+  const env = detectEnvironment();
+  const mode = resolveMode(env);
+  const profile = loadProfile(workspace);
+
+  const lines = [];
+  lines.push(br('╔', '╗'));
+  lines.push(ln(`Dual-Brain Status — v${VERSION}`));
+  lines.push(sep());
+
+  lines.push(ln(`Mode:    ${MODE_LABELS[mode.mode]}`));
+  lines.push(ln(`Profile: ${profile.name}`));
+  lines.push(ln(`  ${PROFILES[profile.name]?.description || ''}`));
+  if (profile.switched_at) {
+    lines.push(ln(`  Set:   ${profile.switched_at.slice(0, 16).replace('T', ' ')}`));
+  }
+
+  lines.push(sep());
+
+  lines.push(ln('Budget Limits'));
+  lines.push(ln(`  Session: warn $${profile.budgets.session_warn_usd} / limit $${profile.budgets.session_limit_usd}`));
+  lines.push(ln(`  Daily:   warn $${profile.budgets.daily_warn_usd} / limit $${profile.budgets.daily_limit_usd}`));
+
+  lines.push(sep());
+
+  lines.push(ln('Providers'));
+  const cAuth = env.claude.authed ? 'authenticated' : 'not authenticated';
+  const xAuth = env.codex.authed ? 'authenticated' : env.codex.installed ? 'not authenticated' : 'not found';
+  lines.push(ln(`  Claude: ${statusIcon(env.claude.authed)} ${cAuth}`));
+  lines.push(ln(`  Codex:  ${statusIcon(env.codex.authed)} ${xAuth}`));
+
+  lines.push(sep());
+
+  lines.push(ln('Quality Gate'));
+  lines.push(ln(`  Reviews from:  ${profile.quality_gate.sensitivity_floor} risk+`));
+  lines.push(ln(`  Dual-brain at: ${profile.quality_gate.dual_brain_minimum} risk+`));
+
+  const balancer = join(workspace, '.claude', 'hooks', 'budget-balancer.mjs');
+  if (existsSync(balancer)) {
+    const proc = run(process.execPath, [balancer]);
+    if (proc.status === 0 && proc.stdout.trim()) {
+      lines.push(sep());
+      lines.push(ln('Provider Pressure (5hr rolling)'));
+      for (const l of proc.stdout.trim().split('\n')) {
+        if (l.includes('█') || l.includes('░') || l.includes('Recommendation')) {
+          const cleaned = l.replace(/[║╔╗╠╣╚╝═]/g, '').trim();
+          if (cleaned) lines.push(ln(`  ${cleaned}`));
+        }
+      }
+    }
+  }
+
+  lines.push(br('╚', '╝'));
+
+  console.log('');
+  for (const l of lines) console.log(`  ${l}`);
+  console.log('');
+
+  if (IS_REPLIT) {
+    console.log('  Quick actions (paste into shell):');
+    console.log(`    ${cmd('npx dual-brain mode cost-saver')}   # switch profile`);
+    console.log(`    ${cmd('npx dual-brain budget 8 25')}       # set limits`);
+    console.log('');
+  }
+}
+
+// ─── Subcommand: mode ──────────────────────────────────────────────────────
+
+function cmdMode() {
+  const workspace = resolve(process.cwd());
+  const modeArg = positional[1] || null;
+
+  if (!modeArg || modeArg === 'list') {
+    const current = loadProfile(workspace);
+    console.log('');
+    console.log('  Available profiles:');
+    console.log('');
+    for (const [name, p] of Object.entries(PROFILES)) {
+      const active = name === current.name ? ' ← active' : '';
+      console.log(`    ${name.padEnd(15)} ${p.description}${active}`);
+    }
+    console.log('');
+    console.log(`  Switch: ${cmd('npx dual-brain mode <profile>')}`);
+    console.log('');
+    return;
+  }
+
+  if (!PROFILES[modeArg]) {
+    console.error(`  Unknown profile: ${modeArg}`);
+    console.error(`  Available: ${Object.keys(PROFILES).join(', ')}`);
+    process.exit(1);
+  }
+
+  const profile = PROFILES[modeArg];
+
+  let customOverrides = null;
+  try {
+    const existing = JSON.parse(readFileSync(profilePath(workspace), 'utf8'));
+    if (existing.custom_overrides?.budgets) {
+      customOverrides = { budgets: existing.custom_overrides.budgets };
+    }
+  } catch {}
+
+  saveProfile(workspace, modeArg, customOverrides);
+
+  console.log('');
+  console.log(`  Profile switched to: ${modeArg}`);
+  console.log(`  ${profile.description}`);
+  console.log('');
+  console.log('  What changed:');
+  console.log(`    Routing:      ${profile.routing.prefer_provider}`);
+  console.log(`    Budget:       $${profile.budgets.session_limit_usd}/session, $${profile.budgets.daily_limit_usd}/day`);
+  console.log(`    Reviews from: ${profile.quality_gate.sensitivity_floor} risk+`);
+  console.log(`    Dual-brain:   ${profile.quality_gate.dual_brain_minimum} risk+`);
+  console.log('');
+  console.log('  Active immediately — no restart needed.');
+  console.log('');
+}
+
+// ─── Subcommand: budget ────────────────────────────────────────────────────
+
+function cmdBudget() {
+  const workspace = resolve(process.cwd());
+  const sessionArg = positional[1] ? parseFloat(positional[1]) : null;
+  const dailyArg = positional[2] ? parseFloat(positional[2]) : null;
+
+  if (sessionArg == null) {
+    const profile = loadProfile(workspace);
+    console.log('');
+    console.log('  Current budget limits:');
+    console.log(`    Session: warn $${profile.budgets.session_warn_usd} / limit $${profile.budgets.session_limit_usd}`);
+    console.log(`    Daily:   warn $${profile.budgets.daily_warn_usd} / limit $${profile.budgets.daily_limit_usd}`);
+    console.log('');
+    console.log(`  Set limits: ${cmd('npx dual-brain budget <session$> [daily$]')}`);
+    console.log(`  Example:    ${cmd('npx dual-brain budget 8 25')}`);
+    console.log('');
+    return;
+  }
+
+  if (isNaN(sessionArg) || sessionArg <= 0) {
+    console.error('  Session limit must be a positive number');
+    process.exit(1);
+  }
+
+  const daily = (dailyArg != null && !isNaN(dailyArg) && dailyArg > 0) ? dailyArg : sessionArg * 3;
+
+  let existing = {};
+  try { existing = JSON.parse(readFileSync(profilePath(workspace), 'utf8')); } catch {}
+
+  const customOverrides = existing.custom_overrides || {};
+  customOverrides.budgets = {
+    session_warn_usd: +(sessionArg * 0.6).toFixed(2),
+    session_limit_usd: sessionArg,
+    daily_warn_usd: +(daily * 0.6).toFixed(2),
+    daily_limit_usd: daily,
+  };
+
+  const data = {
+    active: existing.active || 'balanced',
+    switched_at: existing.switched_at || new Date().toISOString(),
+    custom_overrides: customOverrides,
+  };
+  const budgetTarget = profilePath(workspace);
+  const budgetTmp = budgetTarget + '.tmp.' + process.pid;
+  writeFileSync(budgetTmp, JSON.stringify(data, null, 2) + '\n');
+  renameSync(budgetTmp, budgetTarget);
+
+  console.log('');
+  console.log('  Budget limits updated:');
+  console.log(`    Session: warn $${customOverrides.budgets.session_warn_usd} / limit $${sessionArg}`);
+  console.log(`    Daily:   warn $${customOverrides.budgets.daily_warn_usd} / limit $${daily}`);
+  console.log('');
+  console.log('  Active immediately — no restart needed.');
+  console.log('');
+}
+
+// ─── Subcommand: explain ───────────────────────────────────────────────────
+
+function cmdExplain() {
+  const workspace = resolve(process.cwd());
+  const hooksDir = join(workspace, '.claude', 'hooks');
+  const today = new Date().toISOString().slice(0, 10);
+  const logFile = join(hooksDir, `usage-${today}.jsonl`);
+
+  if (!existsSync(logFile)) {
+    console.log('');
+    console.log('  No routing decisions recorded today.');
+    console.log('  Start a Claude Code session and the tier enforcer will log decisions.');
+    console.log('');
+    return;
+  }
+
+  let lines;
+  try {
+    lines = readFileSync(logFile, 'utf8').split('\n').filter(Boolean);
+  } catch {
+    console.log('  Could not read usage log.');
+    return;
+  }
+
+  let lastRec = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry.type === 'tier_recommendation') { lastRec = entry; break; }
+    } catch {}
+  }
+
+  if (!lastRec) {
+    console.log('');
+    console.log('  No routing decisions found in today\'s log.');
+    console.log('  The tier enforcer logs decisions when Agent tool is used.');
+    console.log('');
+    return;
+  }
+
+  const profile = loadProfile(workspace);
+
+  console.log('');
+  console.log('  Last Routing Decision');
+  console.log('  ' + '─'.repeat(40));
+  console.log(`  Time:        ${lastRec.timestamp?.slice(11, 19) || 'unknown'}`);
+  console.log(`  Detected:    ${lastRec.detected_tier || 'unknown'} tier`);
+  console.log(`  Recommended: ${lastRec.recommended_model || 'unknown'}`);
+  console.log(`  Actual:      ${lastRec.actual_model || 'unknown'}`);
+  console.log(`  Followed:    ${lastRec.followed ? 'yes' : 'no'}`);
+  console.log(`  Profile:     ${profile.name}`);
+  console.log('');
+
+  if (!lastRec.followed) {
+    console.log('  The recommendation was not followed. This may mean:');
+    console.log('  - The task needed a different model (valid override)');
+    console.log('  - The subagent_type forced a specific tier');
+    console.log(`  - Profile "${profile.name}" adjusted the threshold`);
+  } else {
+    console.log('  The recommendation was followed — routing worked as expected.');
+  }
+
+  let total = 0, followed = 0;
+  for (const line of lines) {
+    try {
+      const e = JSON.parse(line);
+      if (e.type === 'tier_recommendation') { total++; if (e.followed) followed++; }
+    } catch {}
+  }
+  const pct = total > 0 ? Math.round((followed / total) * 100) : 0;
+  console.log('');
+  console.log(`  Today: ${followed}/${total} recommendations followed (${pct}%)`);
+  console.log('');
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 function main() {
+  if (subcommand === 'status')  { cmdStatus();  return; }
+  if (subcommand === 'mode')    { cmdMode();    return; }
+  if (subcommand === 'budget')  { cmdBudget();  return; }
+  if (subcommand === 'explain') { cmdExplain(); return; }
+
   const env = detectEnvironment();
   const mode = resolveMode(env);
 
