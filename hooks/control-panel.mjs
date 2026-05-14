@@ -40,9 +40,9 @@ const blue = s => e('1;38;5;33', s);
 // ─── Profiles ──────────────────────────────────────────────────────────────
 
 const PROFILES = {
-  balanced:        { emoji: '⚖️',  uiLabel: 'Default',       desc: 'Auto-routes by complexity, standard alerts' },
-  'cost-saver':    { emoji: '💸', uiLabel: 'Cost-saver',    desc: 'Prefers cheaper models, tighter alerts' },
-  'quality-first': { emoji: '💎', uiLabel: 'Quality-first', desc: 'Uses best models, dual-brain for medium+ risk' },
+  balanced:        { emoji: '⚖️',  uiLabel: 'Default',       desc: 'Auto-routes by complexity, uses both providers evenly' },
+  'cost-saver':    { emoji: '🛡️', uiLabel: 'Conservative',  desc: 'Fewer GPT dispatches, sticks to Claude for most work' },
+  'quality-first': { emoji: '🚀', uiLabel: 'Aggressive',    desc: 'Maximizes both subscriptions, dual-brain for medium+ risk' },
 };
 
 const PROFILE_BUDGETS = {
@@ -245,14 +245,48 @@ function countRunning() {
   return { claude, codex };
 }
 
-// ─── Cost Alert Label ─────────────────────────────────────────────────────
+// ─── Provider Balance ─────────────────────────────────────────────────────
 
-function costAlertLabel(profile) {
-  if (profile.hasCustomBudget) return 'Custom';
-  if (profile.name === 'balanced') return 'Default';
-  if (profile.name === 'cost-saver') return 'Tight';
-  if (profile.name === 'quality-first') return 'Relaxed';
-  return 'Default';
+function loadProviderBalance() {
+  const today = new Date().toISOString().slice(0, 10);
+  const logFile = join(__dirname, `usage-${today}.jsonl`);
+  if (!existsSync(logFile)) return { claude: 0, openai: 0, total: 0, label: 'No activity yet' };
+
+  let claude = 0, openai = 0;
+  try {
+    const lines = readFileSync(logFile, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (e.provider === 'claude') claude++;
+        else if (e.provider === 'openai') openai++;
+      } catch {}
+    }
+  } catch {}
+
+  const total = claude + openai;
+  if (total === 0) return { claude: 0, openai: 0, total: 0, label: 'No activity yet' };
+
+  const claudePct = Math.round((claude / total) * 100);
+  const openaiPct = 100 - claudePct;
+
+  let label;
+  if (openaiPct === 0) label = 'Claude only — GPT subscription unused';
+  else if (claudePct === 0) label = 'GPT only — Claude subscription unused';
+  else if (Math.abs(claudePct - openaiPct) <= 20) label = 'Well balanced';
+  else if (claudePct > openaiPct) label = `Claude-heavy — GPT has capacity`;
+  else label = `GPT-heavy — Claude has capacity`;
+
+  return { claude: claudePct, openai: openaiPct, total, label };
+}
+
+function balanceBar(claudePct, openaiPct, width = 20) {
+  if (claudePct === 0 && openaiPct === 0) return dim('░'.repeat(width) + '  no activity');
+  const cFill = Math.round((claudePct / 100) * width);
+  const oFill = width - cFill;
+  const cBar = noColor ? '█'.repeat(cFill) : `\x1b[38;5;208m${'█'.repeat(cFill)}\x1b[0m`;
+  const oBar = noColor ? '▓'.repeat(oFill) : `\x1b[32m${'▓'.repeat(oFill)}\x1b[0m`;
+  return `${cBar}${oBar}  ${orange(claudePct + '%')} Claude · ${green(openaiPct + '%')} GPT`;
 }
 
 // ─── Menu Renderers ───────────────────────────────────────────────────────
@@ -314,16 +348,21 @@ function renderReturningMenu(providers, sessions) {
   const profile = loadProfile();
   const pf = PROFILES[profile.name];
   const running = countRunning();
+  const balance = loadProviderBalance();
   const lines = [];
 
   lines.push('');
   lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
   lines.push('');
 
-  // Compact provider + mode line
+  // Provider status
   const cStat = providers.claude.authed ? '✅' : '⚠️';
   const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
   lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}  ${pf.emoji}  ${bold(pf.uiLabel)}`);
+
+  // Provider balance bar
+  lines.push(`  ${balanceBar(balance.claude, balance.openai)}`);
+  if (balance.total > 0) lines.push(`  ${dim(balance.label + ' · ' + balance.total + ' calls today')}`);
 
   // Recent sessions
   if (sessions.length > 0) {
@@ -350,7 +389,6 @@ function renderReturningMenu(providers, sessions) {
   if (sessions.length > 0) lines.push(`  ${bold('[1-9]')} Resume numbered above`);
   lines.push(`  ${bold('[n]')} New session`);
   lines.push(`  ${bold('[p]')} Mode: ${dim(pf.uiLabel)}`);
-  lines.push(`  ${bold('[b]')} Cost alerts: ${dim(costAlertLabel(profile))}`);
 
   // Auth if needed
   if (!providers.claude.authed) lines.push(`  ${bold('[j]')} Sign in to Claude`);
@@ -368,8 +406,12 @@ function renderReturningMenu(providers, sessions) {
 function showProfilePicker(rl) {
   return new Promise((resolve) => {
     const current = loadProfile();
+    const balance = loadProviderBalance();
     console.log('');
-    console.log(`  ${bold('Switch mode:')}`);
+    console.log(`  ${bold('Switch routing mode:')}`);
+    if (balance.total > 0) {
+      console.log(`  ${dim('Current balance: Claude ' + balance.claude + '% / GPT ' + balance.openai + '% · ' + balance.label)}`);
+    }
     console.log('');
     for (const [i, [name, pf]] of Object.entries(PROFILES).entries()) {
       const active = name === current.name ? ' ✅' : '';
@@ -396,49 +438,7 @@ function showProfilePicker(rl) {
   });
 }
 
-// ─── Cost Alert Editor ────────────────────────────────────────────────────
-
-function showCostAlertEditor(rl) {
-  return new Promise((resolve) => {
-    const profile = loadProfile();
-    console.log('');
-    console.log(`  ${bold('Cost alerts')}`);
-    console.log(`  ${dim('Dual-brain estimates API costs from session activity.')}`);
-    console.log(`  ${dim('These are alerts, not billing caps.')}`);
-    console.log('');
-    console.log(`  Current: warn at $${profile.budgets.session_warn_usd}/session, $${profile.budgets.daily_warn_usd}/day`);
-    console.log(`           limit at $${profile.budgets.session_limit_usd}/session, $${profile.budgets.daily_limit_usd}/day`);
-    console.log('');
-
-    rl.question('  Session alert limit ($, Enter = keep): ', (sessionStr) => {
-      if (!sessionStr.trim()) return resolve();
-      const session = parseFloat(sessionStr);
-      if (isNaN(session) || session <= 0) { console.log('  Cancelled.'); return resolve(); }
-
-      rl.question('  Daily alert limit ($, Enter = auto): ', (dailyStr) => {
-        const daily = parseFloat(dailyStr);
-        const finalDaily = (isNaN(daily) || daily <= 0) ? session * 3 : daily;
-
-        let existing = {};
-        try { existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8')); } catch {}
-        const custom = existing.custom_overrides || {};
-        custom.budgets = {
-          session_warn_usd: +(session * 0.6).toFixed(2),
-          session_limit_usd: session,
-          daily_warn_usd: +(finalDaily * 0.6).toFixed(2),
-          daily_limit_usd: finalDaily,
-        };
-        const data = { active: existing.active || 'balanced', switched_at: existing.switched_at || new Date().toISOString(), custom_overrides: custom };
-        const tmp = PROFILE_FILE + '.tmp.' + process.pid;
-        writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-        renameSync(tmp, PROFILE_FILE);
-
-        console.log(`  ✅ Cost alerts: $${session}/session · $${finalDaily}/day`);
-        resolve();
-      });
-    });
-  });
-}
+// (Cost alert editor removed — replaced by provider balance + mode switching)
 
 // ─── Session Runner ───────────────────────────────────────────────────────
 
@@ -511,11 +511,6 @@ async function mainLoop() {
 
     if (choice === 'p') {
       await showProfilePicker(rl);
-      continue;
-    }
-
-    if (choice === 'b') {
-      await showCostAlertEditor(rl);
       continue;
     }
 

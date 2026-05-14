@@ -57,10 +57,10 @@ if (flag('--help') || flag('-h')) {
     --json       Output detection as JSON
     --help       Show this help
 
-  🎛️  Profiles:
-    ⚖️  balanced       Standard routing — best model per tier
-    💸 cost-saver     Minimize spend — prefer cheaper models
-    💎 quality-first  Maximum quality — dual-brain for medium+
+  🎛️  Routing modes:
+    ⚖️  Default        Auto-routes, uses both providers evenly
+    🛡️  Conservative   Fewer GPT dispatches, sticks to Claude
+    🚀 Aggressive     Maximizes both subscriptions, dual-brain for medium+
 
   🚀 Examples:
     ${cmd('npx dual-brain')}                  # install or update
@@ -424,19 +424,19 @@ function profilePath(workspace) {
 
 const PROFILES = {
   balanced: {
-    description: 'Standard routing — best model for each tier, normal budgets',
+    description: 'Auto-routes by complexity, uses both providers evenly',
     routing: { prefer_provider: 'auto', think_threshold: 'normal', gpt_dispatch_bias: 0 },
     budgets: { session_warn_usd: 5, session_limit_usd: 10, daily_warn_usd: 20, daily_limit_usd: 50 },
     quality_gate: { sensitivity_floor: 'medium', dual_brain_minimum: 'high' },
   },
   'cost-saver': {
-    description: 'Minimize spend — prefer cheaper models, skip GPT for low risk',
+    description: 'Conservative — fewer GPT dispatches, sticks to Claude',
     routing: { prefer_provider: 'cheapest', think_threshold: 'strict', gpt_dispatch_bias: -20 },
     budgets: { session_warn_usd: 2, session_limit_usd: 5, daily_warn_usd: 8, daily_limit_usd: 20 },
     quality_gate: { sensitivity_floor: 'high', dual_brain_minimum: 'critical' },
   },
   'quality-first': {
-    description: 'Maximum quality — dual-brain for medium+, stricter reviews',
+    description: 'Aggressive — maximizes both subscriptions, dual-brain for medium+',
     routing: { prefer_provider: 'most-capable', think_threshold: 'relaxed', gpt_dispatch_bias: 10 },
     budgets: { session_warn_usd: 15, session_limit_usd: 30, daily_warn_usd: 50, daily_limit_usd: 100 },
     quality_gate: { sensitivity_floor: 'low', dual_brain_minimum: 'medium' },
@@ -490,16 +490,18 @@ function cmdMode() {
 
   if (!modeArg || modeArg === 'list') {
     const current = loadProfile(workspace);
-    const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '💸', 'quality-first': '💎' };
+    const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
+    const UI_NAMES = { balanced: 'Default', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
     console.log('');
-    console.log('  🎛️  Profiles:');
+    console.log('  🎛️  Routing modes:');
     console.log('');
     for (const [name, p] of Object.entries(PROFILES)) {
       const active = name === current.name ? ' ✅ active' : '';
-      console.log(`    ${PEMOJIS[name] || '  '} ${name.padEnd(15)} ${p.description}${active}`);
+      const label = UI_NAMES[name] || name;
+      console.log(`    ${PEMOJIS[name] || '  '} ${label.padEnd(15)} ${p.description}${active}`);
     }
     console.log('');
-    console.log(`  Switch: ${cmd('npx dual-brain mode <profile>')}`);
+    console.log(`  Switch: ${cmd('npx dual-brain mode <name>')}`);
     console.log('');
     return;
   }
@@ -522,9 +524,10 @@ function cmdMode() {
 
   saveProfile(workspace, modeArg, customOverrides);
 
-  const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '💸', 'quality-first': '💎' };
+  const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
+  const UI_NAMES = { balanced: 'Default', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
   console.log('');
-  console.log(`  ✅ Profile switched: ${PEMOJIS[modeArg] || ''} ${modeArg}`);
+  console.log(`  ✅ Mode switched: ${PEMOJIS[modeArg] || ''} ${UI_NAMES[modeArg] || modeArg}`);
   console.log(`  ${profile.description}`);
   console.log('');
   console.log('  🧭 Routing changes:');
@@ -547,12 +550,12 @@ function cmdBudget() {
   if (sessionArg == null) {
     const profile = loadProfile(workspace);
     console.log('');
-    console.log('  💵 Current budget:');
-    console.log(`    Session: ⚠️  $${profile.budgets.session_warn_usd} warn · 🛑 $${profile.budgets.session_limit_usd} limit`);
-    console.log(`    Daily:   ⚠️  $${profile.budgets.daily_warn_usd} warn · 🛑 $${profile.budgets.daily_limit_usd} limit`);
+    console.log('  📊 Usage alert thresholds (estimated, not billing caps):');
+    console.log(`    Session: ⚠️  $${profile.budgets.session_warn_usd} warn · 🛑 $${profile.budgets.session_limit_usd} alert`);
+    console.log(`    Daily:   ⚠️  $${profile.budgets.daily_warn_usd} warn · 🛑 $${profile.budgets.daily_limit_usd} alert`);
     console.log('');
-    console.log(`  Set limits: ${cmd('npx dual-brain budget <session$> [daily$]')}`);
-    console.log(`  Example:    ${cmd('npx dual-brain budget 8 25')}`);
+    console.log(`  Adjust: ${cmd('npx dual-brain budget <session$> [daily$]')}`);
+    console.log(`  Example: ${cmd('npx dual-brain budget 8 25')}`);
     console.log('');
     return;
   }

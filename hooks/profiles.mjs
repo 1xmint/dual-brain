@@ -22,7 +22,7 @@ const CONFIG_FILE = join(__dirname, '..', 'orchestrator.json');
 
 const PROFILES = {
   balanced: {
-    description: 'Standard routing — best model for each tier, normal budgets',
+    description: 'Auto-routes by complexity, uses both providers evenly',
     routing: {
       prefer_provider: 'auto',
       think_threshold: 'normal',
@@ -42,7 +42,7 @@ const PROFILES = {
   },
 
   'cost-saver': {
-    description: 'Minimize spend — prefer cheaper models, skip GPT for low risk',
+    description: 'Conservative — fewer GPT dispatches, sticks to Claude',
     routing: {
       prefer_provider: 'cheapest',
       think_threshold: 'strict',
@@ -65,7 +65,7 @@ const PROFILES = {
   },
 
   'quality-first': {
-    description: 'Maximum quality — dual-brain for medium+, stricter reviews',
+    description: 'Aggressive — maximizes both subscriptions, dual-brain for medium+',
     routing: {
       prefer_provider: 'most-capable',
       think_threshold: 'relaxed',
