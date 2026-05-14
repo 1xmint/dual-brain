@@ -334,6 +334,22 @@ function detectEnvironment() {
   };
 }
 
+// ─── NPM Token Persistence ────────────────────────────────────────────────
+
+const NPM_PERSIST = resolve(process.cwd(), '.replit-tools', '.npm-persistent', '.npmrc');
+const NPMRC_HOME = join(process.env.HOME || '', '.npmrc');
+
+function restoreNpmToken() {
+  if (existsSync(NPMRC_HOME)) return;
+  if (!existsSync(NPM_PERSIST)) return;
+  try {
+    const content = readFileSync(NPM_PERSIST, 'utf8');
+    if (content.includes('_authToken')) {
+      writeFileSync(NPMRC_HOME, content);
+    }
+  } catch {}
+}
+
 // ─── Auth Self-Healing ─────────────────────────────────────────────────────
 
 function healClaudeAuth(env) {
@@ -1274,6 +1290,9 @@ async function main() {
   if (subcommand === 'mode')    { cmdMode();    return; }
   if (subcommand === 'budget')  { cmdBudget();  return; }
   if (subcommand === 'explain') { cmdExplain(); return; }
+
+  // Restore npm token if missing (for publish access)
+  restoreNpmToken();
 
   let env = detectEnvironment();
   const startupUpdateInfo = (subcommand === 'update' || dryRun || jsonOut)
