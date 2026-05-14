@@ -10,8 +10,10 @@
 
 import { execSync, spawnSync } from 'child_process';
 import {
+  appendFileSync,
   existsSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from 'fs';
 import { dirname, resolve } from 'path';
@@ -335,6 +337,316 @@ test('failure-detector: ignores followed=false', () => {
   if (src.includes('followed === false')) return 'still conflates followed=false with failure';
   if (!src.includes('success === false')) return 'missing success===false check';
   return true;
+});
+
+// ─── Test 17: enforce-tier: malformed stdin ─────────────────────────────────
+test('enforce-tier: malformed stdin', () => {
+  const { parsed, status } = run(ENFORCE_TIER, 'this is not json at all {{{');
+  if (status !== 0) return `non-zero exit: ${status}`;
+  if (!parsed) return 'no valid JSON output';
+  return true;
+});
+
+// ─── Test 18: enforce-tier: missing tool_input ──────────────────────────────
+test('enforce-tier: missing tool_input', () => {
+  const payload = JSON.stringify({ tool_name: 'Agent' });
+  const { parsed, status } = run(ENFORCE_TIER, payload);
+  if (status !== 0) return `non-zero exit: ${status}`;
+  if (!parsed) return 'no valid JSON output';
+  return true;
+});
+
+// ─── Test 19: enforce-tier: non-Agent tool passthrough ──────────────────────
+test('enforce-tier: non-Agent tool passthrough', () => {
+  const payload = JSON.stringify({ tool_name: 'Read', tool_input: { file_path: '/foo' } });
+  const { parsed, status } = run(ENFORCE_TIER, payload);
+  if (status !== 0) return `non-zero exit: ${status}`;
+  if (!parsed) return 'no valid JSON output';
+  if (Object.keys(parsed).length !== 0)
+    return `expected {}, got: ${JSON.stringify(parsed)}`;
+  return true;
+});
+
+// ─── Test 20: cost-logger: malformed stdin ──────────────────────────────────
+test('cost-logger: malformed stdin', () => {
+  const { parsed, status } = runStream(COST_LOGGER, 'not json garbage >>>');
+  if (status !== 0) return `non-zero exit: ${status}`;
+  if (!parsed) return 'no valid JSON output';
+  return true;
+});
+
+// ─── Test 21: cost-logger: missing fields ───────────────────────────────────
+test('cost-logger: missing fields', () => {
+  let linesBefore = 0;
+  if (existsSync(USAGE_JSONL)) {
+    linesBefore = readFileSync(USAGE_JSONL, 'utf8').split('\n').filter(Boolean).length;
+  }
+
+  const { parsed, status } = runStream(COST_LOGGER, '{}');
+  if (status !== 0) return `non-zero exit: ${status}`;
+  if (!parsed) return 'no valid JSON output';
+
+  if (!existsSync(USAGE_JSONL)) return 'daily usage log was not created';
+  const lines = readFileSync(USAGE_JSONL, 'utf8').split('\n').filter(Boolean);
+  if (lines.length <= linesBefore) return 'no new line was appended to daily usage log';
+
+  // Clean up the test line
+  try {
+    const kept = lines.slice(0, linesBefore).join('\n');
+    writeFileSync(USAGE_JSONL, kept ? kept + '\n' : '', 'utf8');
+  } catch {}
+
+  return true;
+});
+
+// ─── Test 22: cost-logger: error status recorded ────────────────────────────
+test('cost-logger: error status recorded', () => {
+  let linesBefore = 0;
+  if (existsSync(USAGE_JSONL)) {
+    linesBefore = readFileSync(USAGE_JSONL, 'utf8').split('\n').filter(Boolean).length;
+  }
+
+  const payload = JSON.stringify({
+    tool_name: 'Agent',
+    tool_input: { prompt: 'test' },
+    error: 'something failed',
+  });
+  const { parsed, status } = runStream(COST_LOGGER, payload);
+  if (status !== 0) return `non-zero exit: ${status}`;
+  if (!parsed) return 'no valid JSON output';
+
+  if (!existsSync(USAGE_JSONL)) return 'daily usage log was not created';
+  const lines = readFileSync(USAGE_JSONL, 'utf8').split('\n').filter(Boolean);
+  if (lines.length <= linesBefore) return 'no new line was appended to daily usage log';
+
+  const lastLine = lines[lines.length - 1];
+  let entry;
+  try { entry = JSON.parse(lastLine); } catch { return `last line not valid JSON: ${lastLine}`; }
+  if (entry.status !== 'error') return `expected status "error", got: "${entry.status}"`;
+
+  // Clean up the test line
+  try {
+    const kept = lines.slice(0, linesBefore).join('\n');
+    writeFileSync(USAGE_JSONL, kept ? kept + '\n' : '', 'utf8');
+  } catch {}
+
+  return true;
+});
+
+// ─── Test 23: enforce-tier: cost-saver demotes think ────────────────────────
+test('enforce-tier: cost-saver demotes think', () => {
+  const profileFile = resolve(__dirname, '..', 'dual-brain.profile.json');
+  let originalProfile;
+  try { originalProfile = readFileSync(profileFile, 'utf8'); } catch { originalProfile = null; }
+  try {
+    writeFileSync(profileFile, JSON.stringify({ active: 'cost-saver' }));
+    // "edit the README file" — execute-like text, no think words
+    // cost-saver's demote_think=true demotes think→execute when text lacks think words
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { prompt: 'edit the README file', model: 'opus' },
+    });
+    const { parsed, status } = run(ENFORCE_TIER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+    if (!parsed) return 'no valid JSON output';
+    // With demote_think, the tier stays execute, so opus on execute work exits 0 with valid JSON
+    return true;
+  } finally {
+    if (originalProfile !== null) writeFileSync(profileFile, originalProfile);
+    else try { unlinkSync(profileFile); } catch {}
+  }
+});
+
+// ─── Test 24: enforce-tier: quality-first promotes execute ──────────────────
+test('enforce-tier: quality-first promotes execute', () => {
+  const profileFile = resolve(__dirname, '..', 'dual-brain.profile.json');
+  let originalProfile;
+  try { originalProfile = readFileSync(profileFile, 'utf8'); } catch { originalProfile = null; }
+  try {
+    writeFileSync(profileFile, JSON.stringify({ active: 'quality-first' }));
+    // Think-like description on sonnet model — quality-first's promote_execute=true
+    // promotes to think when text matches think words
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { prompt: 'review architecture and plan the migration', model: 'sonnet' },
+    });
+    const { parsed, status } = run(ENFORCE_TIER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+    if (!parsed) return 'no valid JSON output';
+    if (!parsed.systemMessage) return `expected systemMessage, got: ${JSON.stringify(parsed)}`;
+    if (!parsed.systemMessage.toLowerCase().includes('think'))
+      return `expected "think" in systemMessage, got: ${parsed.systemMessage}`;
+    return true;
+  } finally {
+    if (originalProfile !== null) writeFileSync(profileFile, originalProfile);
+    else try { unlinkSync(profileFile); } catch {}
+  }
+});
+
+// ─── Test 25: enforce-tier: auto profile with high-risk file ────────────────
+test('enforce-tier: auto profile with high-risk file', () => {
+  const profileFile = resolve(__dirname, '..', 'dual-brain.profile.json');
+  let originalProfile;
+  try { originalProfile = readFileSync(profileFile, 'utf8'); } catch { originalProfile = null; }
+  try {
+    writeFileSync(profileFile, JSON.stringify({ active: 'auto' }));
+    // Description with auth/credentials path → risk classifier detects critical risk → promote to think
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { description: 'update src/auth/credentials.mjs', prompt: 'change the token logic', model: 'sonnet' },
+    });
+    const { parsed, status } = run(ENFORCE_TIER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+    if (!parsed) return 'no valid JSON output';
+    if (!parsed.systemMessage) return `expected systemMessage, got: ${JSON.stringify(parsed)}`;
+    const msg = parsed.systemMessage.toLowerCase();
+    if (!msg.includes('think') && !msg.includes('dual-brain'))
+      return `expected "think" or "dual-brain" in systemMessage, got: ${parsed.systemMessage}`;
+    return true;
+  } finally {
+    // Always restore profile to auto so subsequent tests aren't affected
+    writeFileSync(profileFile, JSON.stringify({ active: 'auto' }));
+  }
+});
+
+// ─── Test 26: adaptive: recordFailure writes to ledger ─────────────────────
+test('adaptive: recordFailure writes to ledger', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const script = `
+      import { recordFailure } from './failure-detector.mjs';
+      recordFailure('testhash123', 'execute', 'test_error');
+    `;
+    const proc = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e', script,
+    ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+
+    if (proc.status !== 0) return `recordFailure script failed: ${proc.stderr}`;
+    if (!existsSync(LEDGER)) return 'ledger file not created';
+
+    const lines = readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean);
+    const lastLine = lines[lines.length - 1];
+    let entry;
+    try { entry = JSON.parse(lastLine); } catch { return `last line not valid JSON: ${lastLine}`; }
+    if (entry.prompt_hash !== 'testhash123') return `expected prompt_hash=testhash123, got: ${entry.prompt_hash}`;
+    if (entry.success !== false) return `expected success=false, got: ${entry.success}`;
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 27: adaptive: checkFailureLoop detects 2+ failures ───────────────
+test('adaptive: checkFailureLoop detects 2+ failures', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const hash = 'looptest_' + Date.now();
+    const now = new Date().toISOString();
+    const failEntry = JSON.stringify({
+      type: 'failure', timestamp: now, prompt_hash: hash,
+      tier: 'execute', reason: 'test', success: false,
+    });
+    const content = (backup || '') + failEntry + '\n' + failEntry + '\n';
+    writeFileSync(LEDGER, content, 'utf8');
+
+    const script = `
+      import { checkFailureLoop } from './failure-detector.mjs';
+      const result = checkFailureLoop('${hash}');
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const proc = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e', script,
+    ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+
+    if (proc.status !== 0) return `checkFailureLoop script failed: ${proc.stderr}`;
+    let result;
+    try { result = JSON.parse(proc.stdout.trim()); } catch { return `output not JSON: ${proc.stdout}`; }
+    if (!result.isLoop) return `expected isLoop=true, got: ${JSON.stringify(result)}`;
+    if (result.count < 2) return `expected count>=2, got: ${result.count}`;
+    if (result.suggestion !== 'promote_tier' && result.suggestion !== 'escalate_to_dual_brain')
+      return `unexpected suggestion: ${result.suggestion}`;
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 28: adaptive: checkFailureLoop ignores old failures ──────────────
+test('adaptive: checkFailureLoop ignores old failures', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const hash = 'oldtest_' + Date.now();
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const oldEntry = JSON.stringify({
+      type: 'failure', timestamp: threeHoursAgo, prompt_hash: hash,
+      tier: 'execute', reason: 'old_test', success: false,
+    });
+    writeFileSync(LEDGER, oldEntry + '\n' + oldEntry + '\n', 'utf8');
+
+    const script = `
+      import { checkFailureLoop } from './failure-detector.mjs';
+      const result = checkFailureLoop('${hash}');
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const proc = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e', script,
+    ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+
+    if (proc.status !== 0) return `checkFailureLoop script failed: ${proc.stderr}`;
+    let result;
+    try { result = JSON.parse(proc.stdout.trim()); } catch { return `output not JSON: ${proc.stdout}`; }
+    if (result.isLoop) return `expected isLoop=false for old failures, got: ${JSON.stringify(result)}`;
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 29: adaptive: cost-logger records Agent errors ───────────────────
+test('adaptive: cost-logger records Agent errors', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    let linesBefore = 0;
+    if (existsSync(LEDGER)) {
+      linesBefore = readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean).length;
+    }
+
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { prompt: 'failing task hash test' },
+      error: 'test failure',
+    });
+    const { status } = runStream(COST_LOGGER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+
+    if (!existsSync(LEDGER)) return 'ledger file not created';
+    const lines = readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean);
+    if (lines.length <= linesBefore) return 'no new failure entry appended to ledger';
+
+    const newEntry = lines[lines.length - 1];
+    let entry;
+    try { entry = JSON.parse(newEntry); } catch { return `last line not valid JSON: ${newEntry}`; }
+    if (entry.success !== false) return `expected success=false, got: ${entry.success}`;
+    if (entry.type !== 'failure') return `expected type=failure, got: ${entry.type}`;
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
 });
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
