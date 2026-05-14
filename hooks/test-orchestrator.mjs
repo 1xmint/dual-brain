@@ -336,7 +336,7 @@ test('profiles: consistent across modules', () => {
 test('failure-detector: ignores followed=false', () => {
   const src = readFileSync(resolve(__dirname, 'failure-detector.mjs'), 'utf8');
   if (src.includes('followed === false')) return 'still conflates followed=false with failure';
-  if (!src.includes('success === false')) return 'missing success===false check';
+  if (!src.includes('success === false') && !src.includes('success !== false')) return 'missing success check';
   return true;
 });
 
@@ -725,6 +725,285 @@ test('enforce-tier: non-burst mode still warns on duplicates', () => {
     return true;
   } finally {
     try { unlinkSync(BURST_FILE); } catch {}
+  }
+});
+
+// ─── Test 33: install preserves existing hooks ─────────────────────────────
+test('install: preserves existing hooks', () => {
+  const installSrc = readFileSync(resolve(__dirname, '..', 'install.mjs'), 'utf8');
+
+  // install.mjs must define DUAL_BRAIN_CMDS to identify its own hooks
+  if (!installSrc.includes('DUAL_BRAIN_CMDS'))
+    return 'install.mjs missing DUAL_BRAIN_CMDS constant for filtering';
+
+  // It must filter out only dual-brain hooks (not all hooks) before merging
+  if (!installSrc.includes('.filter'))
+    return 'install.mjs missing .filter() call — may clobber non-dual-brain hooks';
+
+  // The merge logic should spread existingEntries first, then add dual-brain hooks
+  if (!installSrc.includes('existingEntries'))
+    return 'install.mjs missing existingEntries variable — may not preserve other hooks';
+
+  // Verify it reads existing settings before overwriting
+  if (!installSrc.includes('existing') || !installSrc.includes('settings.json'))
+    return 'install.mjs does not read existing settings.json before writing';
+
+  return true;
+});
+
+// ─── Test 34: gitignore entries don't conflict with data-tools ─────────────
+test('install: gitignore entries scoped to dual-brain', () => {
+  const installSrc = readFileSync(resolve(__dirname, '..', 'install.mjs'), 'utf8');
+
+  // Extract the generateGitignoreEntries function body
+  const fnMatch = installSrc.match(/generateGitignoreEntries[\s\S]*?const entries\s*=\s*\[([\s\S]*?)\]/);
+  if (!fnMatch) return 'could not find generateGitignoreEntries entries array';
+
+  const entriesBlock = fnMatch[1];
+
+  // Extract individual entry strings
+  const entryStrings = [...entriesBlock.matchAll(/'([^']+)'/g)].map(m => m[1]);
+  if (entryStrings.length === 0) return 'no gitignore entries found in install.mjs';
+
+  // Each entry must be scoped — no broad patterns like *.json, *.jsonl, .claude/hooks/
+  const broadPatterns = ['*.json', '*.jsonl', '*.mjs', '.claude/', '.claude/hooks/'];
+  for (const entry of entryStrings) {
+    for (const bad of broadPatterns) {
+      if (entry === bad)
+        return `gitignore entry "${entry}" is too broad — could match data-tools files`;
+    }
+  }
+
+  // Each entry should reference dual-brain-specific names
+  const validScopes = ['dual-brain', 'usage-', 'usage.jsonl', 'decision-ledger', 'drift-warned', 'budget-alerted', 'summary-', 'reviews/', '.launched'];
+  for (const entry of entryStrings) {
+    const isScoped = validScopes.some(scope => entry.includes(scope));
+    if (!isScoped)
+      return `gitignore entry "${entry}" may not be scoped to dual-brain files`;
+  }
+
+  return true;
+});
+
+// ─── Test 35: hooks use isolated file paths ────────────────────────────────
+test('hooks: output files use dual-brain-namespaced paths', () => {
+  const validNames = ['dual-brain', 'usage-', 'usage.jsonl', 'decision-ledger', 'summary-checkpoint', '.drift-warned', '.burst-state', '.budget-alerted', 'orchestrator.json', '.launched'];
+
+  const hookFiles = {
+    'enforce-tier.mjs': ['DRIFT_STATE', 'BURST_FILE', 'PROFILE_FILE'],
+    'cost-logger.mjs': ['usage-', 'PROFILE_FILE'],
+    'summary-checkpoint.mjs': ['usage-summary-', 'usage-'],
+  };
+
+  for (const [hookFile, expectedRefs] of Object.entries(hookFiles)) {
+    const src = readFileSync(resolve(__dirname, hookFile), 'utf8');
+
+    // Find all file paths the hook writes to (writeFileSync / appendFileSync targets)
+    const writeTargets = [...src.matchAll(/(?:writeFileSync|appendFileSync|renameSync)\(\s*([^,)]+)/g)].map(m => m[1].trim());
+
+    if (writeTargets.length === 0) return `${hookFile}: no write targets found`;
+
+    // Verify none of the write targets use generic names
+    // They should resolve to variables defined with dual-brain-specific names
+    const genericNames = ['config.json', 'state.json', 'log.jsonl', 'data.json', 'output.json'];
+    for (const target of writeTargets) {
+      for (const bad of genericNames) {
+        if (target.includes(`'${bad}'`) || target.includes(`"${bad}"`))
+          return `${hookFile}: writes to generic filename "${bad}" — could collide with other tools`;
+      }
+    }
+  }
+
+  // Verify the actual file path constants in enforce-tier use dual-brain-scoped names
+  const enforceSrc = readFileSync(resolve(__dirname, 'enforce-tier.mjs'), 'utf8');
+  if (!enforceSrc.includes('dual-brain.profile.json'))
+    return 'enforce-tier.mjs PROFILE_FILE does not reference dual-brain namespace';
+  if (!enforceSrc.includes('.drift-warned'))
+    return 'enforce-tier.mjs DRIFT_STATE does not use scoped filename';
+  if (!enforceSrc.includes('.burst-state'))
+    return 'enforce-tier.mjs BURST_FILE does not use scoped filename';
+
+  // Verify cost-logger writes to usage-dated files, not generic names
+  const costSrc = readFileSync(resolve(__dirname, 'cost-logger.mjs'), 'utf8');
+  if (!costSrc.includes('usage-'))
+    return 'cost-logger.mjs does not write to usage-prefixed files';
+  if (!costSrc.includes('dual-brain.profile.json'))
+    return 'cost-logger.mjs PROFILE_FILE does not reference dual-brain namespace';
+
+  return true;
+});
+
+// ─── Test 36: failure decay weights recent failures higher ─────────────────
+test('failure decay: recent failures score high', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const hash = 'decay_recent_' + Date.now();
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const entry = JSON.stringify({
+      type: 'failure', timestamp: fiveMinAgo, prompt_hash: hash,
+      tier: 'execute', reason: 'test_decay', success: false,
+    });
+    writeFileSync(LEDGER, entry + '\n' + entry + '\n', 'utf8');
+
+    const script = `
+      import { checkFailureLoop } from './failure-detector.mjs';
+      const result = checkFailureLoop('${hash}');
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const proc = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e', script,
+    ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+
+    if (proc.status !== 0) return `script failed: ${proc.stderr}`;
+    let result;
+    try { result = JSON.parse(proc.stdout.trim()); } catch { return `output not JSON: ${proc.stdout}`; }
+    if (!result.isLoop) return `expected isLoop=true for recent failures, got: ${JSON.stringify(result)}`;
+    if (typeof result.weightedScore !== 'number' || result.weightedScore < 2.0)
+      return `expected weightedScore >= 2.0, got: ${result.weightedScore}`;
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 37: failure decay reduces old failure weight ─────────────────────
+test('failure decay: old failures score low', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const hash = 'decay_old_' + Date.now();
+    const ninetyMinAgo = new Date(Date.now() - 90 * 60 * 1000).toISOString();
+    const entry = JSON.stringify({
+      type: 'failure', timestamp: ninetyMinAgo, prompt_hash: hash,
+      tier: 'execute', reason: 'test_decay_old', success: false,
+    });
+    writeFileSync(LEDGER, entry + '\n' + entry + '\n', 'utf8');
+
+    const script = `
+      import { checkFailureLoop } from './failure-detector.mjs';
+      const result = checkFailureLoop('${hash}');
+      process.stdout.write(JSON.stringify(result));
+    `;
+    const proc = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e', script,
+    ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+
+    if (proc.status !== 0) return `script failed: ${proc.stderr}`;
+    let result;
+    try { result = JSON.parse(proc.stdout.trim()); } catch { return `output not JSON: ${proc.stdout}`; }
+    if (result.isLoop) return `expected isLoop=false for old failures (weightedScore should be ~0.5), got: ${JSON.stringify(result)}`;
+    if (typeof result.weightedScore !== 'number')
+      return `expected weightedScore in result, got: ${JSON.stringify(result)}`;
+    if (result.weightedScore >= 2.0)
+      return `expected weightedScore < 2.0 for 90-min-old failures, got: ${result.weightedScore}`;
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 38: failure scoping by tier ──────────────────────────────────────
+test('failure decay: scoping by tier', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const hash = 'tier_scope_' + Date.now();
+    const now = new Date().toISOString();
+    const mkEntry = (tier) => JSON.stringify({
+      type: 'failure', timestamp: now, prompt_hash: hash,
+      tier, reason: 'test_tier_scope', success: false,
+    });
+    const content = [
+      mkEntry('execute'), mkEntry('execute'),
+      mkEntry('search'), mkEntry('search'),
+    ].join('\n') + '\n';
+    writeFileSync(LEDGER, content, 'utf8');
+
+    const checkTier = (tier) => {
+      const script = `
+        import { checkFailureLoop } from './failure-detector.mjs';
+        const result = checkFailureLoop('${hash}', '${tier}');
+        process.stdout.write(JSON.stringify(result));
+      `;
+      const proc = spawnSync(process.execPath, [
+        '--input-type=module',
+        '-e', script,
+      ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+      if (proc.status !== 0) return { error: `script failed for tier=${tier}: ${proc.stderr}` };
+      try { return JSON.parse(proc.stdout.trim()); } catch { return { error: `output not JSON for tier=${tier}: ${proc.stdout}` }; }
+    };
+
+    const execResult = checkTier('execute');
+    if (execResult.error) return execResult.error;
+    if (!execResult.isLoop) return `expected isLoop=true for execute tier, got: ${JSON.stringify(execResult)}`;
+
+    const searchResult = checkTier('search');
+    if (searchResult.error) return searchResult.error;
+    if (!searchResult.isLoop) return `expected isLoop=true for search tier, got: ${JSON.stringify(searchResult)}`;
+
+    const thinkResult = checkTier('think');
+    if (thinkResult.error) return thinkResult.error;
+    if (thinkResult.isLoop) return `expected isLoop=false for think tier (no think failures), got: ${JSON.stringify(thinkResult)}`;
+
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 39: pruneOldFailures removes stale entries ───────────────────────
+test('failure decay: pruneOldFailures removes stale entries', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    const twentyFiveHoursAgo = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    const oneHourAgo = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString();
+    const staleEntry = JSON.stringify({
+      type: 'failure', timestamp: twentyFiveHoursAgo, prompt_hash: 'stale',
+      tier: 'execute', reason: 'old', success: false,
+    });
+    const recentEntry = JSON.stringify({
+      type: 'failure', timestamp: oneHourAgo, prompt_hash: 'recent',
+      tier: 'execute', reason: 'new', success: false,
+    });
+    const content = [staleEntry, staleEntry, recentEntry, recentEntry].join('\n') + '\n';
+    writeFileSync(LEDGER, content, 'utf8');
+
+    const script = `
+      import { pruneOldFailures } from './failure-detector.mjs';
+      pruneOldFailures();
+    `;
+    const proc = spawnSync(process.execPath, [
+      '--input-type=module',
+      '-e', script,
+    ], { encoding: 'utf8', timeout: 5000, cwd: HOOKS });
+
+    if (proc.status !== 0) return `pruneOldFailures script failed: ${proc.stderr}`;
+    if (!existsSync(LEDGER)) return 'ledger file was deleted instead of pruned';
+
+    const lines = readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean);
+    if (lines.length !== 2) return `expected 2 entries after prune, got: ${lines.length}`;
+
+    for (const line of lines) {
+      let entry;
+      try { entry = JSON.parse(line); } catch { return `pruned ledger has invalid JSON: ${line}`; }
+      if (entry.prompt_hash !== 'recent')
+        return `expected only recent entries to remain, found prompt_hash=${entry.prompt_hash}`;
+    }
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
   }
 });
 

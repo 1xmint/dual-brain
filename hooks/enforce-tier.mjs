@@ -316,7 +316,7 @@ try {
   }
 
   // Failure loop detection
-  const failureCheck = checkFailureLoop(promptHash);
+  const failureCheck = checkFailureLoop(promptHash, tier);
   let failureMessage = null;
   if (failureCheck.isLoop) {
     if (failureCheck.suggestion === 'promote_tier' && tier === 'execute') {
