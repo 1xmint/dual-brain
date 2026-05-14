@@ -1,0 +1,1 @@
+{"mailEventId":"mail-evt-YYYYMMDD-example-001","timestamp":"YYYY-MM-DDTHH:MM:SSZ","from":"agent-1-example","to":"manager-1-example","workstreamId":"example-workstream","mailType":"completion","status":"unread","checkpoint":"checkpoints/example.md","summary":"Replace this starter mail event with real runtime evidence."}

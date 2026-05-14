@@ -1,0 +1,24 @@
+{
+  "lastUpdated": "YYYY-MM-DDTHH:MM:SSZ",
+  "updatedBy": "unknown",
+  "cells": [
+    {
+      "workstreamId": "example-workstream",
+      "upstreams": [
+        "example-upstream"
+      ],
+      "downstreams": [
+        "example-downstream"
+      ],
+      "siblings": [
+        "example-sibling"
+      ],
+      "sharedContracts": [
+        "shared-auth-contract"
+      ],
+      "latestRelevantChangeEvent": "impact-YYYYMMDD-example-001",
+      "conflictRisk": "yellow",
+      "notes": "Replace this starter neighbor digest with real relationship truth."
+    }
+  ]
+}

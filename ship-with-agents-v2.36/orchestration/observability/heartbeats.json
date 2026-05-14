@@ -1,0 +1,18 @@
+{
+  "lastUpdated": "YYYY-MM-DDTHH:MM:SSZ",
+  "updatedBy": "unknown",
+  "lanes": [
+    {
+      "routingId": "example-lane",
+      "displayName": "Role - Product / Mission",
+      "stableLane": "role-1-example",
+      "workstreamId": "example-workstream",
+      "lastMeaningfulTurnAt": "YYYY-MM-DDTHH:MM:SSZ",
+      "lastInboxReadAt": "YYYY-MM-DDTHH:MM:SSZ",
+      "lastStateSyncAt": "YYYY-MM-DDTHH:MM:SSZ",
+      "lastVerifiedBy": "doctor",
+      "heartbeatStatus": "unknown",
+      "notes": "Replace with real lane heartbeat truth."
+    }
+  ]
+}
