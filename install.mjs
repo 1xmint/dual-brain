@@ -832,6 +832,7 @@ function generateGitignoreEntries(workspace) {
     '.claude/dual-brain.memory.json',
     '.claude/dual-brain.version.json',
     '.claude/dual-brain.update-check.json',
+    '.claude/dual-brain.permissions.json',
   ];
   let existing = '';
   try { existing = readFileSync(join(workspace, '.gitignore'), 'utf8'); } catch {}

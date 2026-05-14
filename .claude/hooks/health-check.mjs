@@ -196,8 +196,12 @@ function checkHookRegistration() {
   const expectedPre = "node .claude/hooks/enforce-tier.mjs";
   const expectedPost = "node .claude/hooks/cost-logger.mjs";
 
-  const hasPre = preToolUse.includes(expectedPre);
-  const hasPost = postToolUse.includes(expectedPost);
+  const hasCommand = (entries, cmd) => entries.some(e =>
+    e === cmd || e?.command === cmd || e?.hooks?.some(h => h.command === cmd)
+  );
+
+  const hasPre = hasCommand(preToolUse, expectedPre);
+  const hasPost = hasCommand(postToolUse, expectedPost);
 
   if (hasPre && hasPost) {
     return check("hook_registration", STATUS.pass, "required hooks registered");
