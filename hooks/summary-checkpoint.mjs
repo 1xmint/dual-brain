@@ -57,6 +57,14 @@ function emptySummary() {
     token_averages: {},
 
     codex_latencies: [],
+
+    session_insights: {
+      gpt_latency_status: 'normal',
+      provider_override_count: 0,
+      failure_domains: [],
+      dual_brain_useful: false,
+      balance_posture: 'no activity yet',
+    },
   };
 }
 
@@ -199,6 +207,16 @@ function getTokenAverages(date) {
   return summary.token_averages;
 }
 
+function updateSessionInsight(key, value, date) {
+  const validKeys = ['gpt_latency_status', 'provider_override_count', 'failure_domains', 'dual_brain_useful', 'balance_posture'];
+  if (!validKeys.includes(key)) return;
+  const summary = readSummary(date);
+  if (!summary.session_insights) summary.session_insights = {};
+  summary.session_insights[key] = value;
+  summary.updated_at = new Date().toISOString();
+  atomicWrite(summaryPath(date), summary);
+}
+
 function getAdaptiveCodexThreshold(date) {
   const summary = readSummary(date);
   const latencies = summary.codex_latencies || [];
@@ -227,5 +245,6 @@ export {
   getPressureBuckets,
   getTokenAverages,
   getAdaptiveCodexThreshold,
+  updateSessionInsight,
   atomicWrite,
 };

@@ -3,6 +3,8 @@ import { readFileSync, writeFileSync, appendFileSync, renameSync } from 'fs';
 import { createHash } from 'crypto';
 import { dirname, resolve, join } from 'path';
 import { fileURLToPath } from 'url';
+import { classifyRisk, extractPaths } from './risk-classifier.mjs';
+import { checkFailureLoop } from './failure-detector.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = resolve(__dirname, '..', 'orchestrator.json');
@@ -12,11 +14,12 @@ const DRIFT_STATE = resolve(__dirname, '.drift-warned');
 function loadProfile() {
   try {
     const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
-    return data.active || 'balanced';
-  } catch { return 'balanced'; }
+    return data.active || 'auto';
+  } catch { return 'auto'; }
 }
 
 const PROFILE_SETTINGS = {
+  auto:            { demote_think: false, promote_execute: false, bias: 0 },
   balanced:        { demote_think: false, promote_execute: false, bias: 0 },
   'cost-saver':    { demote_think: true,  promote_execute: false, bias: -20 },
   'quality-first': { demote_think: false, promote_execute: true,  bias: 10 },
@@ -231,9 +234,9 @@ try {
   // Balance hint — populated after tier is fully resolved
   let balanceHint = null;
 
-  // Helper to prepend optional warnings (duplicate + drift + balance) before a message
+  // Helper to prepend optional warnings (duplicate + drift + balance + auto) before a message
   const prependWarnings = (msg) => {
-    const parts = [duplicateWarning, driftWarning, msg, balanceHint].filter(Boolean);
+    const parts = [duplicateWarning, driftWarning, failureMessage, msg, autoStatus, balanceHint].filter(Boolean);
     return parts.join('\n\n');
   };
 
@@ -277,6 +280,32 @@ try {
     else tier = 'execute';
   }
 
+  // Risk classification from file paths in description
+  const filePaths = extractPaths(ti.description || '');
+  const riskResult = classifyRisk(filePaths);
+  let autoStatus = null;
+
+  // Bias high/critical risk toward think tier
+  if ((riskResult.level === 'critical' || riskResult.level === 'high') && tier !== 'think') {
+    tier = 'think';
+    autoStatus = riskResult.level === 'critical'
+      ? `Dual-brain: dual-brain review recommended — ${riskResult.reason.split(':')[0]} detected`
+      : `Dual-brain: promoting to think tier — ${riskResult.reason.split(':')[0]}`;
+  }
+
+  // Failure loop detection
+  const failureCheck = checkFailureLoop(promptHash);
+  let failureMessage = null;
+  if (failureCheck.isLoop) {
+    if (failureCheck.suggestion === 'promote_tier' && tier === 'execute') {
+      tier = 'think';
+      autoStatus = 'Dual-brain: escalating to think tier — previous attempt failed';
+    } else if (failureCheck.suggestion === 'escalate_to_dual_brain') {
+      autoStatus = 'Dual-brain: dual-brain review recommended — repeated failures detected';
+    }
+    failureMessage = `**[Failure Loop]** ${failureCheck.count} failed attempts in 2hrs. Consider: \`node .claude/hooks/dual-brain-think.mjs --question "why is this failing?"\``;
+  }
+
   // Apply profile-driven tier adjustments
   if (profileSettings.demote_think && tier === 'think' && !THINK_WORDS.test(text)) {
     tier = 'execute';
@@ -312,7 +341,7 @@ try {
         followed: true,
         profile: profileName,
       });
-      const onlyWarnings = [duplicateWarning, driftWarning, balanceHint].filter(Boolean).join('\n\n');
+      const onlyWarnings = [duplicateWarning, driftWarning, failureMessage, autoStatus, balanceHint].filter(Boolean).join('\n\n');
       if (onlyWarnings) {
         process.stdout.write(JSON.stringify({ systemMessage: onlyWarnings }));
       } else {
@@ -344,7 +373,7 @@ try {
         followed: true,
         profile: profileName,
       });
-      const onlyWarnings = [duplicateWarning, driftWarning, balanceHint].filter(Boolean).join('\n\n');
+      const onlyWarnings = [duplicateWarning, driftWarning, failureMessage, autoStatus, balanceHint].filter(Boolean).join('\n\n');
       if (onlyWarnings) {
         process.stdout.write(JSON.stringify({ systemMessage: onlyWarnings }));
       } else {

@@ -40,12 +40,14 @@ const blue = s => e('1;38;5;33', s);
 // ─── Profiles ──────────────────────────────────────────────────────────────
 
 const PROFILES = {
-  balanced:        { emoji: '⚖️',  uiLabel: 'Default',       desc: 'Auto-routes by complexity, uses both providers evenly' },
+  auto:            { emoji: '🤖', uiLabel: 'Auto',          desc: 'Adapts routing based on task risk, provider health, and outcomes' },
+  balanced:        { emoji: '⚖️',  uiLabel: 'Balanced',      desc: 'Routes by complexity, uses both providers evenly' },
   'cost-saver':    { emoji: '🛡️', uiLabel: 'Conservative',  desc: 'Fewer GPT dispatches, sticks to Claude for most work' },
   'quality-first': { emoji: '🚀', uiLabel: 'Aggressive',    desc: 'Maximizes both subscriptions, dual-brain for medium+ risk' },
 };
 
 const PROFILE_BUDGETS = {
+  auto:            { session_warn_usd: 5, session_limit_usd: 10, daily_warn_usd: 20, daily_limit_usd: 50 },
   balanced:        { session_warn_usd: 5, session_limit_usd: 10, daily_warn_usd: 20, daily_limit_usd: 50 },
   'cost-saver':    { session_warn_usd: 2, session_limit_usd: 5, daily_warn_usd: 8, daily_limit_usd: 20 },
   'quality-first': { session_warn_usd: 15, session_limit_usd: 30, daily_warn_usd: 50, daily_limit_usd: 100 },
@@ -54,11 +56,11 @@ const PROFILE_BUDGETS = {
 function loadProfile() {
   try {
     const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
-    const name = data.active && PROFILES[data.active] ? data.active : 'balanced';
+    const name = data.active && PROFILES[data.active] ? data.active : 'auto';
     const custom = data.custom_overrides || {};
     return { name, budgets: { ...PROFILE_BUDGETS[name], ...custom.budgets }, hasCustomBudget: !!custom.budgets };
   } catch {
-    return { name: 'balanced', budgets: PROFILE_BUDGETS.balanced, hasCustomBudget: false };
+    return { name: 'auto', budgets: PROFILE_BUDGETS.auto, hasCustomBudget: false };
   }
 }
 
@@ -358,7 +360,19 @@ function renderReturningMenu(providers, sessions) {
   // Provider status
   const cStat = providers.claude.authed ? '✅' : '⚠️';
   const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
-  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}  ${pf.emoji}  ${bold(pf.uiLabel)}`);
+  let modeStatus = pf.uiLabel;
+  if (profile.name === 'auto') {
+    if (balance.total === 0) {
+      modeStatus = 'Auto · learning your workflow';
+    } else if (balance.openai > balance.claude + 20) {
+      modeStatus = 'Auto · routing GPT for isolated work';
+    } else if (balance.claude > balance.openai + 20) {
+      modeStatus = 'Auto · Claude-primary, GPT available';
+    } else {
+      modeStatus = 'Auto · balanced routing active';
+    }
+  }
+  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}  ${pf.emoji}  ${bold(modeStatus)}`);
 
   // Provider balance bar
   lines.push(`  ${balanceBar(balance.claude, balance.openai)}`);
@@ -415,7 +429,8 @@ function showProfilePicker(rl) {
     console.log('');
     for (const [i, [name, pf]] of Object.entries(PROFILES).entries()) {
       const active = name === current.name ? ' ✅' : '';
-      console.log(`  ${bold('[' + (i + 1) + ']')} ${pf.emoji}  ${pf.uiLabel.padEnd(15)} ${dim(pf.desc)}${active}`);
+      const recommended = name === 'auto' && current.name !== 'auto' ? dim(' (recommended)') : '';
+      console.log(`  ${bold('[' + (i + 1) + ']')} ${pf.emoji}  ${pf.uiLabel.padEnd(15)} ${dim(pf.desc)}${active}${recommended}`);
     }
     console.log(`  ${bold('[q]')} Cancel`);
     console.log('');

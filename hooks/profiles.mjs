@@ -21,6 +21,26 @@ const PROFILE_FILE = join(__dirname, '..', 'dual-brain.profile.json');
 const CONFIG_FILE = join(__dirname, '..', 'orchestrator.json');
 
 const PROFILES = {
+  auto: {
+    description: 'Adapts routing based on task risk, provider health, and outcomes',
+    routing: {
+      prefer_provider: 'auto',
+      think_threshold: 'adaptive',
+      gpt_dispatch_bias: 0,
+    },
+    budgets: {
+      session_warn_usd: 5.00,
+      session_limit_usd: 10.00,
+      daily_warn_usd: 20.00,
+      daily_limit_usd: 50.00,
+    },
+    quality_gate: {
+      sensitivity_floor: 'medium',
+      dual_brain_minimum: 'high',
+    },
+    tier_overrides: null,
+  },
+
   balanced: {
     description: 'Auto-routes by complexity, uses both providers evenly',
     routing: {
@@ -106,12 +126,12 @@ function loadConfig() {
 
 function getActiveProfile() {
   const saved = loadProfileFile();
-  const name = saved?.active || 'balanced';
-  const profile = PROFILES[name] || PROFILES.balanced;
+  const name = saved?.active || 'auto';
+  const profile = PROFILES[name] || PROFILES.auto;
   const customOverrides = saved?.custom_overrides || {};
 
   return {
-    name: PROFILES[name] ? name : 'balanced',
+    name: PROFILES[name] ? name : 'auto',
     ...profile,
     budgets: { ...profile.budgets, ...customOverrides.budgets },
     routing: { ...profile.routing, ...customOverrides.routing },

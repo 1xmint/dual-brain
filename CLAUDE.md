@@ -56,12 +56,21 @@ Gate statuses: `pass` (safe to end), `issues_found` (fix first), `needs_human_re
 Active profile controls routing posture, budgets, and quality gate behavior.
 Profile persists to `.claude/dual-brain.profile.json` (gitignored).
 
-- **balanced** (default): Best model per tier, normal budgets, reviews at medium+ risk
+- **auto** (default): Adapts routing based on task risk, provider health, and outcomes. Uses file-path risk classification and failure-loop detection to auto-escalate when needed.
+- **balanced**: Best model per tier, normal budgets, reviews at medium+ risk
 - **cost-saver**: Prefer cheaper models, lower budgets, skip GPT for non-critical
 - **quality-first**: Dual-brain for medium+ risk, higher budgets, stricter reviews
 
 Switch profiles: `npx dual-brain mode cost-saver`
 Check status: `npx dual-brain status`
+
+## Adaptive Routing (Auto Mode)
+
+Auto mode classifies risk from file paths and adjusts routing in real-time:
+
+- **Risk classification**: auth/secrets→critical, billing/migrations→high, tests/utils→medium, docs→low
+- **Failure detection**: 2+ failures on same prompt in 2 hours → auto-escalate tier or trigger dual-brain
+- **Provider balance**: Routes to underused provider when one subscription is hot
 
 ## Available Tools
 

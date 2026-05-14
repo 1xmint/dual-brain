@@ -336,6 +336,7 @@ function install(workspace, env, mode) {
     'install-git-hooks.mjs', 'session-report.mjs', 'budget-balancer.mjs',
     'gpt-work-dispatcher.mjs', 'profiles.mjs',
     'summary-checkpoint.mjs', 'decision-ledger.mjs', 'control-panel.mjs',
+    'risk-classifier.mjs', 'failure-detector.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
   actions.push(`✓ ${HOOKS.length} hook scripts`);
