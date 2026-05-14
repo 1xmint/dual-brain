@@ -9,7 +9,7 @@
  *   npx dual-brain --dry-run        # detect only, don't install
  *   npx dual-brain --help
  */
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs';
 import { createInterface } from 'readline';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -34,6 +34,7 @@ const flag = (f) => argv.includes(f);
 const force = flag('--force');
 const dryRun = flag('--dry-run');
 const jsonOut = flag('--json');
+const restoreNpmFlag = flag('--restore-npm');
 const positional = argv.filter(a => !a.startsWith('-'));
 const subcommand = positional[0] || null;
 
@@ -64,6 +65,7 @@ if (flag('--help') || flag('-h')) {
     --force      Overwrite all existing config
     --dry-run    Detect environment only
     --json       Output detection as JSON
+    --restore-npm Restore persisted npm token before auth flows
     --help       Show this help
 
   🎛️  Routing modes:
@@ -467,9 +469,26 @@ async function authGuidance(env) {
 const CODEX_HOME = join(process.env.HOME || '', '.codex');
 const CODEX_PERSIST = resolve(process.cwd(), '.replit-tools', '.codex-persistent');
 
+function isGitignored(path) {
+  const result = run('git', ['check-ignore', '-q', path], { cwd: process.cwd() });
+  return result.status === 0;
+}
+
+function hasStrictFilePermissions(path) {
+  try {
+    return (statSync(path).mode & 0o777) === 0o600;
+  } catch {
+    return false;
+  }
+}
+
 function saveCodexCredentials() {
   const authFile = join(CODEX_HOME, 'auth.json');
   if (!existsSync(authFile)) return false;
+  if (!isGitignored('.replit-tools')) {
+    console.warn('WARNING: .replit-tools is not gitignored. Skipping credential persistence to avoid leaking secrets.');
+    return false;
+  }
   try {
     const auth = readFileSync(authFile, 'utf8');
     if (!auth.trim() || auth.trim() === '{}') return false;
@@ -477,6 +496,9 @@ function saveCodexCredentials() {
     const persisted = join(CODEX_PERSIST, 'auth.json');
     writeFileSync(persisted, auth, { mode: 0o600 });
     try { chmodSync(persisted, 0o600); } catch {}
+    if (!hasStrictFilePermissions(persisted)) {
+      console.warn(`WARNING: ${relPath(persisted)} permissions are not 0600.`);
+    }
     return true;
   } catch { return false; }
 }
@@ -486,6 +508,10 @@ function restoreCodexCredentials() {
   const targetAuth = join(CODEX_HOME, 'auth.json');
   if (existsSync(targetAuth)) return false;
   if (!existsSync(persistedAuth)) return false;
+  if (!hasStrictFilePermissions(persistedAuth)) {
+    console.warn(`WARNING: ${relPath(persistedAuth)} permissions are not 0600. Skipping restore.`);
+    return false;
+  }
   try {
     const auth = readFileSync(persistedAuth, 'utf8');
     if (!auth.trim() || auth.trim() === '{}') return false;
@@ -757,6 +783,41 @@ function generateClaudeMd(mode) {
   return md;
 }
 
+const CLAUDE_MD_MANAGED_START = '<!-- dual-brain:start -->';
+const CLAUDE_MD_MANAGED_END = '<!-- dual-brain:end -->';
+
+function renderManagedClaudeSection(content) {
+  return `${CLAUDE_MD_MANAGED_START}\n${content.replace(/\s+$/, '')}\n${CLAUDE_MD_MANAGED_END}\n`;
+}
+
+function mergeClaudeMd(existingContent, managedContent) {
+  const managedSection = renderManagedClaudeSection(managedContent);
+  const startIndex = existingContent.indexOf(CLAUDE_MD_MANAGED_START);
+  const endIndex = existingContent.indexOf(CLAUDE_MD_MANAGED_END);
+
+  if (startIndex !== -1 && endIndex !== -1 && endIndex >= startIndex) {
+    const before = existingContent.slice(0, startIndex);
+    const after = existingContent.slice(endIndex + CLAUDE_MD_MANAGED_END.length);
+    const prefix = before.replace(/\s*$/, '');
+    const suffix = after.replace(/^\s*/, '');
+    return `${prefix}${prefix ? '\n\n' : ''}${managedSection}${suffix ? `\n${suffix}` : ''}`.replace(/\s+$/, '') + '\n';
+  }
+
+  const trimmed = existingContent.replace(/\s+$/, '');
+  return `${trimmed}${trimmed ? '\n\n' : ''}${managedSection}`;
+}
+
+function writeClaudeMd(targetPath, content) {
+  const managedContent = content.replace(/\s+$/, '');
+  if (force || !existsSync(targetPath)) {
+    writeFileSync(targetPath, renderManagedClaudeSection(managedContent));
+    return;
+  }
+
+  const existing = readFileSync(targetPath, 'utf8');
+  writeFileSync(targetPath, mergeClaudeMd(existing, managedContent));
+}
+
 function generateGitignoreEntries(workspace) {
   const entries = [
     '.claude/hooks/usage-*.jsonl',
@@ -816,7 +877,7 @@ function install(workspace, env, mode) {
   actions.push('✓ settings.json (hooks registered)');
 
   const claudeMd = generateClaudeMd(mode);
-  writeFileSync(join(target, 'CLAUDE.md'), claudeMd);
+  writeClaudeMd(join(target, 'CLAUDE.md'), claudeMd);
   actions.push('✓ CLAUDE.md (session instructions)');
 
   const rulesTarget = join(target, 'review-rules.md');
@@ -1284,6 +1345,10 @@ function cmdExplain() {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
+  if (subcommand === 'auth' || restoreNpmFlag) {
+    restoreNpmToken();
+  }
+
   if (subcommand === 'status') {
     launchPanel();
     return;
@@ -1292,9 +1357,6 @@ async function main() {
   if (subcommand === 'mode')    { cmdMode();    return; }
   if (subcommand === 'budget')  { cmdBudget();  return; }
   if (subcommand === 'explain') { cmdExplain(); return; }
-
-  // Restore npm token if missing (for publish access)
-  restoreNpmToken();
 
   let env = detectEnvironment();
   const startupUpdateInfo = (subcommand === 'update' || dryRun || jsonOut)
