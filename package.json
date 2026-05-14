@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "Dual-provider orchestration for Claude Code — tiered routing, budget balancing, and GPT dual-brain review across Claude + OpenAI subscriptions",
   "type": "module",
   "bin": {

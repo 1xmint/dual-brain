@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * control-panel.mjs — Session manager + control panel for Dual-Brain.
+ * control-panel.mjs — Session launcher for Dual-Brain.
  *
- * Data-tools-style interactive menu: recent sessions, continue/resume/new,
- * profile switching, budget editing. Loops until user exits to shell.
+ * Progressive disclosure: first-run shows minimal menu (new/shell + auth).
+ * Returning users see recent sessions, profile mode, cost alert settings.
+ * Loops until user exits to shell.
  */
 
 import readline from 'readline';
@@ -14,6 +15,7 @@ import { spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROFILE_FILE = join(__dirname, '..', 'dual-brain.profile.json');
+const LAUNCHED_MARKER = join(__dirname, '..', '.launched');
 const VERSION = (() => {
   try { return JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version; } catch {}
   return '?';
@@ -32,16 +34,15 @@ const dim = s => e('2', s);
 const cyan = s => e('36', s);
 const green = s => e('32', s);
 const yellow = s => e('33', s);
-const magenta = s => e('95', s);
 const orange = s => e('1;38;5;208', s);
 const blue = s => e('1;38;5;33', s);
 
 // ─── Profiles ──────────────────────────────────────────────────────────────
 
 const PROFILES = {
-  balanced:        { emoji: '⚖️',  label: 'Balanced',      desc: 'Best model per tier, normal budgets' },
-  'cost-saver':    { emoji: '💸', label: 'Cost-saver',    desc: 'Prefer cheaper models, lower budgets' },
-  'quality-first': { emoji: '💎', label: 'Quality-first', desc: 'Dual-brain for medium+, strict reviews' },
+  balanced:        { emoji: '⚖️',  uiLabel: 'Default',       desc: 'Auto-routes by complexity, standard alerts' },
+  'cost-saver':    { emoji: '💸', uiLabel: 'Cost-saver',    desc: 'Prefers cheaper models, tighter alerts' },
+  'quality-first': { emoji: '💎', uiLabel: 'Quality-first', desc: 'Uses best models, dual-brain for medium+ risk' },
 };
 
 const PROFILE_BUDGETS = {
@@ -55,9 +56,9 @@ function loadProfile() {
     const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
     const name = data.active && PROFILES[data.active] ? data.active : 'balanced';
     const custom = data.custom_overrides || {};
-    return { name, budgets: { ...PROFILE_BUDGETS[name], ...custom.budgets } };
+    return { name, budgets: { ...PROFILE_BUDGETS[name], ...custom.budgets }, hasCustomBudget: !!custom.budgets };
   } catch {
-    return { name: 'balanced', budgets: PROFILE_BUDGETS.balanced };
+    return { name: 'balanced', budgets: PROFILE_BUDGETS.balanced, hasCustomBudget: false };
   }
 }
 
@@ -67,6 +68,25 @@ function saveProfile(name, customOverrides) {
   const tmp = PROFILE_FILE + '.tmp.' + process.pid;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
   renameSync(tmp, PROFILE_FILE);
+}
+
+// ─── First-Run Detection ──────────────────────────────────────────────────
+
+function isFirstRun() {
+  if (existsSync(LAUNCHED_MARKER)) return false;
+  // Also check Claude history for any session in this workspace
+  const historyFile = join(HOME, '.claude', 'history.jsonl');
+  if (existsSync(historyFile)) {
+    try {
+      const content = readFileSync(historyFile, 'utf8');
+      if (content.includes('"sessionId"')) return false;
+    } catch {}
+  }
+  return true;
+}
+
+function markLaunched() {
+  try { writeFileSync(LAUNCHED_MARKER, new Date().toISOString() + '\n'); } catch {}
 }
 
 // ─── Provider Detection ───────────────────────────────────────────────────
@@ -122,17 +142,13 @@ function getRecentSessions() {
     return true;
   };
 
-  // Claude sessions
   const historyFile = join(HOME, '.claude', 'history.jsonl');
   if (existsSync(historyFile)) {
     try {
       const lines = readFileSync(historyFile, 'utf8').trim().split('\n');
       const entries = [];
       for (const line of lines) {
-        try {
-          const j = JSON.parse(line);
-          if (j.sessionId && j.timestamp) entries.push(j);
-        } catch {}
+        try { const j = JSON.parse(line); if (j.sessionId && j.timestamp) entries.push(j); } catch {}
       }
       entries.sort((a, b) => a.timestamp - b.timestamp);
       for (const j of entries) {
@@ -151,7 +167,6 @@ function getRecentSessions() {
     } catch {}
   }
 
-  // Codex sessions
   const codexDir = join(HOME, '.codex', 'sessions');
   if (existsSync(codexDir)) {
     const walk = (dir) => {
@@ -230,67 +245,85 @@ function countRunning() {
   return { claude, codex };
 }
 
-// ─── Replit-Tools Check ───────────────────────────────────────────────────
+// ─── Cost Alert Label ─────────────────────────────────────────────────────
 
-function checkReplitTools() {
-  if (!IS_REPLIT) return true;
-  return existsSync(join(CWD, '.replit-tools'));
+function costAlertLabel(profile) {
+  if (profile.hasCustomBudget) return 'Custom';
+  if (profile.name === 'balanced') return 'Default';
+  if (profile.name === 'cost-saver') return 'Tight';
+  if (profile.name === 'quality-first') return 'Relaxed';
+  return 'Default';
 }
 
-// ─── Menu Renderer ────────────────────────────────────────────────────────
+// ─── Menu Renderers ───────────────────────────────────────────────────────
 
-function renderMenu() {
-  const providers = detectProviders();
-  const profile = loadProfile();
-  const sessions = getRecentSessions();
-  const running = countRunning();
-  const pf = PROFILES[profile.name];
-  const hasReplitTools = checkReplitTools();
-
+function renderFirstRunMenu(providers) {
   const lines = [];
 
   lines.push('');
   lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
   lines.push('');
 
-  // Quick reference box
-  lines.push('  ┌─────────────────────────────┐');
-  if (IS_REPLIT) {
-    lines.push(`  │ ${magenta('At')} ${blue('~/workspace')}${magenta('$ prompt:')}     │`);
-    lines.push(`  │ ${cyan('! npx dual-brain')} = this menu│`);
-  } else {
-    lines.push(`  │ ${magenta('At shell prompt:')}             │`);
-    lines.push(`  │ ${cyan('npx dual-brain')} = this menu   │`);
-  }
-  lines.push(`  │ ${cyan('j')}  = login to Claude        │`);
-  lines.push(`  │ ${cyan('k')}  = login to Codex         │`);
-  lines.push('  ├─────────────────────────────┤');
-  lines.push(`  │ ${orange('In Claude session:')}           │`);
-  lines.push(`  │ ${green('Ctrl+C x2')} = back to menu    │`);
-  lines.push(`  │ ${green('Ctrl+C x3')} = exit to shell   │`);
-  lines.push('  └─────────────────────────────┘');
-  lines.push('');
-
-  // Provider status line
+  // Provider status
   const cStat = providers.claude.authed ? '✅' : providers.claude.installed ? '⚠️' : '❌';
   const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
-  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}  ${pf.emoji}  ${bold(pf.label)}  ${dim('$' + profile.budgets.session_limit_usd + '/session')}`);
+  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}`);
 
-  // Missing provider nudge
+  if (providers.claude.authed && providers.codex.authed) {
+    lines.push(`  ${green('Both providers ready — full dual-brain mode')}`);
+  } else if (providers.claude.authed) {
+    lines.push(`  ${dim('Claude ready. Add Codex for dual-brain features.')}`);
+  } else if (!providers.claude.installed) {
+    lines.push(`  ${yellow('Claude not found — needed to start.')}`);
+  } else {
+    lines.push(`  ${yellow('Claude needs login to start.')}`);
+  }
+
+  lines.push('');
+
+  // Auth actions if needed
   if (!providers.claude.authed || !providers.codex.authed) {
+    if (!providers.claude.installed) {
+      lines.push(`  ${dim('Install Claude:')} ${cyan('curl -fsSL https://claude.ai/install.sh | sh')}`);
+    }
+    if (!providers.claude.authed && providers.claude.installed) {
+      lines.push(`  ${bold('[j]')} Sign in to Claude`);
+    }
+    if (!providers.codex.installed) {
+      lines.push(`  ${dim('Install Codex:')} ${cyan('npm i -g @openai/codex')}`);
+    } else if (!providers.codex.authed) {
+      lines.push(`  ${bold('[k]')} Sign in to Codex ${dim('(optional — enables GPT collaboration)')}`);
+    }
     lines.push('');
-    if (!providers.claude.installed) lines.push(`  ${dim('└')} Install Claude: ${cyan('curl -fsSL https://claude.ai/install.sh | sh')}`);
-    else if (!providers.claude.authed) lines.push(`  ${dim('└')} Auth Claude: press ${bold('j')} below`);
-    if (!providers.codex.installed) lines.push(`  ${dim('└')} Install Codex: ${cyan('npm i -g @openai/codex')}`);
-    else if (!providers.codex.authed) lines.push(`  ${dim('└')} Auth Codex: press ${bold('k')} below`);
   }
 
   // Replit-tools check
-  if (IS_REPLIT && !hasReplitTools) {
-    lines.push('');
-    lines.push(`  ⚠️  ${yellow('replit-tools not found')} — recommended for Replit environments`);
-    lines.push(`  ${dim('└')} Press ${bold('t')} to install replit-tools`);
+  if (IS_REPLIT && !existsSync(join(CWD, '.replit-tools'))) {
+    lines.push(`  ${bold('[t]')} Install replit-tools ${dim('(recommended for Replit)')}`);
   }
+
+  // Primary actions
+  lines.push(`  ${bold('[n]')} Start new session`);
+  lines.push(`  ${bold('[s]')} Skip — just shell`);
+  lines.push('');
+
+  return lines;
+}
+
+function renderReturningMenu(providers, sessions) {
+  const profile = loadProfile();
+  const pf = PROFILES[profile.name];
+  const running = countRunning();
+  const lines = [];
+
+  lines.push('');
+  lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
+  lines.push('');
+
+  // Compact provider + mode line
+  const cStat = providers.claude.authed ? '✅' : '⚠️';
+  const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
+  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}  ${pf.emoji}  ${bold(pf.uiLabel)}`);
 
   // Recent sessions
   if (sessions.length > 0) {
@@ -305,31 +338,29 @@ function renderMenu() {
     }
   }
 
-  // Session manager box
   lines.push('');
-  lines.push('  ┌─────────────────────────────┐');
-  lines.push('  │  🧠 Dual-Brain Session Mgr   │');
-  lines.push('  └─────────────────────────────┘');
 
   const runParts = [];
   if (running.claude > 0) runParts.push(`${running.claude} claude`);
   if (running.codex > 0) runParts.push(`${running.codex} codex`);
   if (runParts.length > 0) lines.push(`  ${dim('(' + runParts.join(', ') + ' running)')}`);
-  lines.push('');
 
   // Menu options
   lines.push(`  ${bold('[c]')} Continue last session`);
   if (sessions.length > 0) lines.push(`  ${bold('[1-9]')} Resume numbered above`);
   lines.push(`  ${bold('[n]')} New session`);
-  lines.push(`  ${bold('[p]')} Profile ${dim('(' + pf.emoji + ' ' + profile.name + ')')}`);
-  lines.push(`  ${bold('[b]')} Budget ${dim('($' + profile.budgets.session_limit_usd + ' session / $' + profile.budgets.daily_limit_usd + ' daily)')}`);
-  lines.push(`  ${bold('[j]')} Login to Claude`);
-  lines.push(`  ${bold('[k]')} Login to Codex`);
-  if (IS_REPLIT && !hasReplitTools) lines.push(`  ${bold('[t]')} Install replit-tools`);
-  lines.push(`  ${bold('[s]')} Skip — just shell`);
+  lines.push(`  ${bold('[p]')} Mode: ${dim(pf.uiLabel)}`);
+  lines.push(`  ${bold('[b]')} Cost alerts: ${dim(costAlertLabel(profile))}`);
+
+  // Auth if needed
+  if (!providers.claude.authed) lines.push(`  ${bold('[j]')} Sign in to Claude`);
+  if (providers.codex.installed && !providers.codex.authed) lines.push(`  ${bold('[k]')} Sign in to Codex`);
+  if (IS_REPLIT && !existsSync(join(CWD, '.replit-tools'))) lines.push(`  ${bold('[t]')} Install replit-tools`);
+
+  lines.push(`  ${bold('[s]')} Shell`);
   lines.push('');
 
-  return { lines, sessions, providers };
+  return lines;
 }
 
 // ─── Profile Picker ───────────────────────────────────────────────────────
@@ -338,11 +369,11 @@ function showProfilePicker(rl) {
   return new Promise((resolve) => {
     const current = loadProfile();
     console.log('');
-    console.log(`  ${bold('🎛️  Switch Profile:')}`);
+    console.log(`  ${bold('Switch mode:')}`);
     console.log('');
     for (const [i, [name, pf]] of Object.entries(PROFILES).entries()) {
       const active = name === current.name ? ' ✅' : '';
-      console.log(`  ${bold('[' + (i + 1) + ']')} ${pf.emoji}  ${name.padEnd(15)} ${dim(pf.desc)}${active}`);
+      console.log(`  ${bold('[' + (i + 1) + ']')} ${pf.emoji}  ${pf.uiLabel.padEnd(15)} ${dim(pf.desc)}${active}`);
     }
     console.log(`  ${bold('[q]')} Cancel`);
     console.log('');
@@ -358,30 +389,33 @@ function showProfilePicker(rl) {
         } catch {}
         saveProfile(names[idx], customOverrides);
         const pf = PROFILES[names[idx]];
-        console.log(`  ✅ Switched to ${pf.emoji}  ${pf.label}`);
+        console.log(`  ✅ Switched to ${pf.emoji}  ${pf.uiLabel}`);
       }
       resolve();
     });
   });
 }
 
-// ─── Budget Editor ────────────────────────────────────────────────────────
+// ─── Cost Alert Editor ────────────────────────────────────────────────────
 
-function showBudgetEditor(rl) {
+function showCostAlertEditor(rl) {
   return new Promise((resolve) => {
     const profile = loadProfile();
     console.log('');
-    console.log(`  ${bold('💵 Edit Budget')}`);
-    console.log(`  ${dim('Current: $' + profile.budgets.session_limit_usd + ' session / $' + profile.budgets.daily_limit_usd + ' daily')}`);
+    console.log(`  ${bold('Cost alerts')}`);
+    console.log(`  ${dim('Dual-brain estimates API costs from session activity.')}`);
+    console.log(`  ${dim('These are alerts, not billing caps.')}`);
+    console.log('');
+    console.log(`  Current: warn at $${profile.budgets.session_warn_usd}/session, $${profile.budgets.daily_warn_usd}/day`);
+    console.log(`           limit at $${profile.budgets.session_limit_usd}/session, $${profile.budgets.daily_limit_usd}/day`);
     console.log('');
 
-    rl.question('  Session limit ($): ', (sessionStr) => {
+    rl.question('  Session alert limit ($, Enter = keep): ', (sessionStr) => {
+      if (!sessionStr.trim()) return resolve();
       const session = parseFloat(sessionStr);
-      if (isNaN(session) || session <= 0) {
-        console.log('  Cancelled.');
-        return resolve();
-      }
-      rl.question('  Daily limit ($, Enter = auto): ', (dailyStr) => {
+      if (isNaN(session) || session <= 0) { console.log('  Cancelled.'); return resolve(); }
+
+      rl.question('  Daily alert limit ($, Enter = auto): ', (dailyStr) => {
         const daily = parseFloat(dailyStr);
         const finalDaily = (isNaN(daily) || daily <= 0) ? session * 3 : daily;
 
@@ -399,7 +433,7 @@ function showBudgetEditor(rl) {
         writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
         renameSync(tmp, PROFILE_FILE);
 
-        console.log(`  ✅ Budget: $${session}/session · $${finalDaily}/daily`);
+        console.log(`  ✅ Cost alerts: $${session}/session · $${finalDaily}/day`);
         resolve();
       });
     });
@@ -410,11 +444,13 @@ function showBudgetEditor(rl) {
 
 function runSession(cmd, args, label) {
   console.log('');
-  console.log(`  ${label}...`);
+  console.log(`  ${label}`);
+  console.log(`  ${dim('Inside Claude: press Ctrl+C twice to return here.')}`);
   console.log('');
+  markLaunched();
   const result = spawnSync(cmd, args, { stdio: 'inherit' });
   console.log('');
-  console.log('  Exited. Returning to menu...');
+  console.log('  Returned to Dual-Brain.');
   return result.status || 0;
 }
 
@@ -422,11 +458,17 @@ function runSession(cmd, args, label) {
 
 async function mainLoop() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
   const ask = () => new Promise(resolve => rl.question('  Choice: ', resolve));
 
   while (true) {
-    const { lines, sessions } = renderMenu();
+    const firstRun = isFirstRun();
+    const providers = detectProviders();
+    const sessions = firstRun ? [] : getRecentSessions();
+
+    const lines = firstRun
+      ? renderFirstRunMenu(providers)
+      : renderReturningMenu(providers, sessions);
+
     for (const l of lines) console.log(l);
 
     const choice = (await ask()).trim().toLowerCase();
@@ -438,16 +480,15 @@ async function mainLoop() {
     }
 
     if (choice === 'c' || choice === '') {
-      // Continue most recent session
       if (sessions.length > 0) {
         const s = sessions[0];
         if (s.tool === 'codex') {
-          runSession('codex', ['--dangerously-bypass-approvals-and-sandbox', 'resume', s.id], `Resuming codex session ${s.id.slice(0, 8)}`);
+          runSession('codex', ['--dangerously-bypass-approvals-and-sandbox', 'resume', s.id], `Resuming codex ${s.id.slice(0, 8)}...`);
         } else {
-          runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}`);
+          runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}...`);
         }
       } else {
-        runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session');
+        runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session...');
       }
       continue;
     }
@@ -456,15 +497,15 @@ async function mainLoop() {
     if (num >= 1 && num <= 9 && sessions[num - 1]) {
       const s = sessions[num - 1];
       if (s.tool === 'codex') {
-        runSession('codex', ['--dangerously-bypass-approvals-and-sandbox', 'resume', s.id], `Resuming codex session ${s.id.slice(0, 8)}`);
+        runSession('codex', ['--dangerously-bypass-approvals-and-sandbox', 'resume', s.id], `Resuming codex ${s.id.slice(0, 8)}...`);
       } else {
-        runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}`);
+        runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}...`);
       }
       continue;
     }
 
     if (choice === 'n') {
-      runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session');
+      runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session...');
       continue;
     }
 
@@ -474,7 +515,7 @@ async function mainLoop() {
     }
 
     if (choice === 'b') {
-      await showBudgetEditor(rl);
+      await showCostAlertEditor(rl);
       continue;
     }
 
@@ -508,7 +549,7 @@ async function mainLoop() {
       console.log('');
       spawnSync('npx', ['-y', 'data-tools'], { stdio: 'inherit', cwd: CWD });
       console.log('');
-      console.log('  ✅ replit-tools installed. You may need to restart your shell.');
+      console.log('  ✅ replit-tools installed.');
       console.log('');
       await ask();
       continue;
@@ -521,7 +562,11 @@ async function mainLoop() {
 // ─── Non-Interactive Fallback ─────────────────────────────────────────────
 
 function renderStatic() {
-  const { lines } = renderMenu();
+  const providers = detectProviders();
+  const sessions = getRecentSessions();
+  const lines = sessions.length > 0
+    ? renderReturningMenu(providers, sessions)
+    : renderFirstRunMenu(providers);
   for (const l of lines) console.log(l);
 }
 

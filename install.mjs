@@ -313,6 +313,7 @@ function generateGitignoreEntries(workspace) {
     '.claude/dual-brain.profile.json',
     '.claude/hooks/usage-summary-*.json',
     '.claude/hooks/decision-ledger.jsonl',
+    '.claude/.launched',
   ];
   let existing = '';
   try { existing = readFileSync(join(workspace, '.gitignore'), 'utf8'); } catch {}
