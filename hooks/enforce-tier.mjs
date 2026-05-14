@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync, appendFileSync, renameSync } from 'fs';
-import { createHash } from 'crypto';
 import { dirname, resolve, join } from 'path';
 import { fileURLToPath } from 'url';
 import { classifyRisk, extractPaths } from './risk-classifier.mjs';
-import { checkFailureLoop, recordFailure } from './failure-detector.mjs';
+import { computePromptHash, checkFailureLoop, recordFailure } from './failure-detector.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = resolve(__dirname, '..', 'orchestrator.json');
@@ -214,7 +213,7 @@ try {
   const currentModel = (ti.model || '').toLowerCase();
 
   // Compute prompt hash early for duplicate detection and logging
-  const promptHash = createHash('sha256').update(text).digest('hex').slice(0, 12);
+  const promptHash = computePromptHash(ti);
 
   // Burst detection — suppress noise during wave launches (3+ agents in 90s)
   const burstMode = detectBurst();
@@ -316,7 +315,7 @@ try {
   }
 
   // Failure loop detection
-  const failureCheck = checkFailureLoop(promptHash, tier);
+  const failureCheck = checkFailureLoop(promptHash);
   let failureMessage = null;
   if (failureCheck.isLoop) {
     if (failureCheck.suggestion === 'promote_tier' && tier === 'execute') {

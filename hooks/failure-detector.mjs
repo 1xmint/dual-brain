@@ -8,6 +8,7 @@
  *   pruneOldFailures() → { pruned, remaining }
  */
 
+import { createHash } from 'crypto';
 import { readFileSync, appendFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -15,6 +16,19 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LEDGER_FILE = join(__dirname, 'decision-ledger.jsonl');
+
+/**
+ * Canonical prompt hash used by all hooks for failure-loop correlation.
+ * Both enforce-tier (PreToolUse) and cost-logger (PostToolUse) must use this
+ * same function so that recorded failures can be matched during escalation.
+ *
+ * @param {object} toolInput — the raw tool_input from the hook payload
+ * @returns {string} 12-char hex hash
+ */
+function computePromptHash(toolInput) {
+  const text = (toolInput?.description || '') + (toolInput?.prompt || '');
+  return createHash('sha256').update(text).digest('hex').slice(0, 12);
+}
 
 /**
  * Compute a decay weight based on failure age.
@@ -121,4 +135,4 @@ function pruneOldFailures() {
   return { pruned, remaining };
 }
 
-export { checkFailureLoop, recordFailure, pruneOldFailures };
+export { computePromptHash, checkFailureLoop, recordFailure, pruneOldFailures };

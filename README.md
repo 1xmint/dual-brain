@@ -63,7 +63,7 @@ npx -y dual-brain
 | `hooks/gpt-work-dispatcher.mjs` | Dispatch execution tasks to GPT via Codex CLI |
 | `hooks/session-report.mjs` | Session-end summary: activity, compliance, quality |
 | `hooks/health-check.mjs` | Verify all hooks and dependencies are working |
-| `hooks/test-orchestrator.mjs` | Self-test harness (29 tests) |
+| `hooks/test-orchestrator.mjs` | Self-test harness (39 tests) |
 | `hooks/setup-wizard.mjs` | Interactive config (optional — for custom plans) |
 | `hooks/install-git-hooks.mjs` | Git pre-commit hook for quality gate |
 

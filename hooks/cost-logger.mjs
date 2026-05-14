@@ -8,7 +8,6 @@
  * Output contract: must print "{}" to stdout and exit 0 within ~100 ms.
  */
 
-import { createHash } from "crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -265,8 +264,8 @@ async function main() {
   // Record failures for adaptive routing (failure-loop detection)
   if (status === 'error' && toolName === 'Agent') {
     try {
-      const { recordFailure, pruneOldFailures } = await import('./failure-detector.mjs');
-      const promptHash = createHash('md5').update(JSON.stringify(toolInput)).digest('hex').slice(0, 12);
+      const { computePromptHash, recordFailure, pruneOldFailures } = await import('./failure-detector.mjs');
+      const promptHash = computePromptHash(toolInput);
       recordFailure(promptHash, tier, payload?.error || 'agent_error');
       // Best-effort cleanup of stale failure entries (>24h old)
       try { pruneOldFailures(); } catch {}

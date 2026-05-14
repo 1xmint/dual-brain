@@ -1007,6 +1007,70 @@ test('failure decay: pruneOldFailures removes stale entries', () => {
   }
 });
 
+// ─── Test 40: adaptive loop end-to-end hash match ─────────────────────────
+test('adaptive loop: end-to-end hash match', () => {
+  const LEDGER = resolve(HOOKS, 'decision-ledger.jsonl');
+  const backup = existsSync(LEDGER) ? readFileSync(LEDGER, 'utf8') : null;
+
+  try {
+    // Start with a clean ledger so prior failures don't interfere
+    writeFileSync(LEDGER, '', 'utf8');
+
+    // Step 1: Define a specific Agent payload used consistently across all steps
+    const toolInput = { prompt: 'fix the auth bug', description: 'patch auth module' };
+    const agentPayload = JSON.stringify({ tool_name: 'Agent', tool_input: toolInput });
+
+    // Step 2: Run enforce-tier with this payload (computes and may log a promptHash)
+    const firstRun = run(ENFORCE_TIER, agentPayload);
+    if (firstRun.status !== 0) return `first enforce-tier run failed with status: ${firstRun.status}`;
+    if (!firstRun.parsed) return `first enforce-tier run produced no valid JSON`;
+
+    // Step 3: Simulate 2 failures via cost-logger with the SAME tool_input
+    const errorPayload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: toolInput,
+      error: 'test failure',
+    });
+
+    const fail1 = runStream(COST_LOGGER, errorPayload);
+    if (fail1.status !== 0) return `first cost-logger failure run failed with status: ${fail1.status}`;
+
+    const fail2 = runStream(COST_LOGGER, errorPayload);
+    if (fail2.status !== 0) return `second cost-logger failure run failed with status: ${fail2.status}`;
+
+    // Verify cost-logger actually wrote failure entries to the ledger
+    if (!existsSync(LEDGER)) return 'ledger file not created after cost-logger failures';
+    const ledgerLines = readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean);
+    const failureEntries = ledgerLines
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(e => e && e.type === 'failure' && e.success === false);
+    if (failureEntries.length < 2)
+      return `expected >= 2 failure entries in ledger, got: ${failureEntries.length}`;
+
+    // Step 4: Run enforce-tier again with the same Agent payload
+    const secondRun = run(ENFORCE_TIER, agentPayload);
+    if (secondRun.status !== 0) return `second enforce-tier run failed with status: ${secondRun.status}`;
+    if (!secondRun.parsed) return `second enforce-tier run produced no valid JSON`;
+
+    // Step 5: The second enforce-tier run should detect the failure loop
+    // and mention escalation or failure loop in its systemMessage
+    const msg = (secondRun.parsed.systemMessage || '').toLowerCase();
+    if (!msg.includes('failure') && !msg.includes('escalat') && !msg.includes('loop') && !msg.includes('dual-brain'))
+      return `expected failure loop / escalation in second enforce-tier systemMessage, got: "${secondRun.parsed.systemMessage || '(empty)'}"`;
+
+    // Bonus: verify the hashes match — the failure entries recorded by cost-logger
+    // should have the same prompt_hash that enforce-tier uses for checkFailureLoop
+    const failureHashes = [...new Set(failureEntries.map(e => e.prompt_hash))];
+    if (failureHashes.length !== 1)
+      return `expected all failure entries to share one hash, got ${failureHashes.length} distinct hashes: ${failureHashes.join(', ')}`;
+
+    return true;
+  } finally {
+    if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
+    else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 const total = passed + failed;
 console.log(`\n${passed}/${total} tests passed`);

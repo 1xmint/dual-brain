@@ -20,6 +20,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROFILE_FILE = join(__dirname, '..', 'dual-brain.profile.json');
 const CONFIG_FILE = join(__dirname, '..', 'orchestrator.json');
 
+const ALIASES = {
+  // auto
+  'auto': 'auto', 'adaptive': 'auto', 'smart': 'auto', 'default': 'auto', 'normal': 'auto',
+  // balanced
+  'balanced': 'balanced', 'even': 'balanced', 'equal': 'balanced',
+  // cost-saver
+  'cost-saver': 'cost-saver', 'cheap': 'cost-saver', 'save': 'cost-saver', 'conservative': 'cost-saver', 'frugal': 'cost-saver', 'budget': 'cost-saver',
+  // quality-first
+  'quality-first': 'quality-first', 'aggressive': 'quality-first', 'quality': 'quality-first', 'max': 'quality-first', 'full': 'quality-first', 'both': 'quality-first',
+};
+
+function resolveProfileName(input) {
+  if (!input) return null;
+  const cleaned = input.toLowerCase().trim()
+    .replace(/^(go|be|use|switch to|set|mode)\s+/i, '')
+    .replace(/\s+mode$/i, '');
+  return ALIASES[cleaned] || null;
+}
+
 const PROFILES = {
   auto: {
     description: 'Adapts routing based on task risk, provider health, and outcomes',
@@ -140,12 +159,22 @@ function getActiveProfile() {
 }
 
 function setActiveProfile(name, customOverrides = null) {
-  if (!PROFILES[name]) {
-    return { ok: false, error: `Unknown profile: ${name}. Available: ${Object.keys(PROFILES).join(', ')}` };
+  let resolved = name;
+  if (!PROFILES[resolved]) {
+    const alias = resolveProfileName(name);
+    if (alias) {
+      resolved = alias;
+    } else {
+      const aliasHint = Object.entries(ALIASES)
+        .filter(([k, v]) => k !== v)
+        .map(([k, v]) => `${k} → ${v}`)
+        .join(', ');
+      return { ok: false, error: `Unknown profile: ${name}. Available: ${Object.keys(PROFILES).join(', ')}. Aliases: ${aliasHint}` };
+    }
   }
 
   const data = {
-    active: name,
+    active: resolved,
     switched_at: new Date().toISOString(),
   };
   if (customOverrides) data.custom_overrides = customOverrides;
@@ -154,7 +183,7 @@ function setActiveProfile(name, customOverrides = null) {
     const tmp = PROFILE_FILE + '.tmp.' + process.pid;
     writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
     renameSync(tmp, PROFILE_FILE);
-    return { ok: true, profile: PROFILES[name] };
+    return { ok: true, profile: PROFILES[resolved], resolvedName: resolved };
   } catch (err) {
     return { ok: false, error: `Failed to write profile: ${err.message}` };
   }
@@ -216,6 +245,8 @@ function getProfileOverrides(system) {
 
 export {
   PROFILES,
+  ALIASES,
+  resolveProfileName,
   getActiveProfile,
   setActiveProfile,
   setBudgetOverrides,

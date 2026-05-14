@@ -437,16 +437,40 @@ function showProfilePicker(rl) {
 
     rl.question('  Choice: ', (answer) => {
       const names = Object.keys(PROFILES);
-      const idx = parseInt(answer, 10) - 1;
+      const trimmed = answer.trim();
+      let selectedName = null;
+
+      // Try numeric selection first
+      const idx = parseInt(trimmed, 10) - 1;
       if (idx >= 0 && idx < names.length) {
+        selectedName = names[idx];
+      }
+
+      // Try natural language alias resolution
+      if (!selectedName && trimmed && trimmed !== 'q') {
+        const PANEL_ALIASES = {
+          'auto': 'auto', 'adaptive': 'auto', 'smart': 'auto', 'default': 'auto', 'normal': 'auto',
+          'balanced': 'balanced', 'even': 'balanced', 'equal': 'balanced',
+          'cost-saver': 'cost-saver', 'cheap': 'cost-saver', 'save': 'cost-saver', 'conservative': 'cost-saver', 'frugal': 'cost-saver', 'budget': 'cost-saver',
+          'quality-first': 'quality-first', 'aggressive': 'quality-first', 'quality': 'quality-first', 'max': 'quality-first', 'full': 'quality-first', 'both': 'quality-first',
+        };
+        const cleaned = trimmed.toLowerCase()
+          .replace(/^(go|be|use|switch to|set|mode)\s+/i, '')
+          .replace(/\s+mode$/i, '');
+        selectedName = PANEL_ALIASES[cleaned] || null;
+      }
+
+      if (selectedName) {
         let customOverrides = null;
         try {
           const existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
           if (existing.custom_overrides?.budgets) customOverrides = { budgets: existing.custom_overrides.budgets };
         } catch {}
-        saveProfile(names[idx], customOverrides);
-        const pf = PROFILES[names[idx]];
+        saveProfile(selectedName, customOverrides);
+        const pf = PROFILES[selectedName];
         console.log(`  ✅ Switched to ${pf.emoji}  ${pf.uiLabel}`);
+      } else if (trimmed && trimmed !== 'q') {
+        console.log(`  Unknown profile: ${trimmed}. Try: cheap, aggressive, quality, balanced, auto`);
       }
       resolve();
     });

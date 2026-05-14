@@ -58,7 +58,8 @@ if (flag('--help') || flag('-h')) {
     --help       Show this help
 
   🎛️  Routing modes:
-    ⚖️  Default        Auto-routes, uses both providers evenly
+    🤖 Auto (default) Adapts routing based on risk, health, outcomes
+    ⚖️  Balanced       Auto-routes, uses both providers evenly
     🛡️  Conservative   Fewer GPT dispatches, sticks to Claude
     🚀 Aggressive     Maximizes both subscriptions, dual-brain for medium+
 
@@ -453,7 +454,7 @@ const PROFILES = {
 function loadProfile(workspace) {
   try {
     const data = JSON.parse(readFileSync(profilePath(workspace), 'utf8'));
-    const name = data.active && PROFILES[data.active] ? data.active : 'balanced';
+    const name = data.active && PROFILES[data.active] ? data.active : 'auto';
     const profile = PROFILES[name];
     const custom = data.custom_overrides || {};
     return {
@@ -464,7 +465,7 @@ function loadProfile(workspace) {
       switched_at: data.switched_at || null,
     };
   } catch {
-    return { name: 'balanced', ...PROFILES.balanced, switched_at: null };
+    return { name: 'auto', ...PROFILES.auto, switched_at: null };
   }
 }
 
@@ -497,8 +498,8 @@ function cmdMode() {
 
   if (!modeArg || modeArg === 'list') {
     const current = loadProfile(workspace);
-    const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
-    const UI_NAMES = { balanced: 'Default', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
+    const PEMOJIS = { auto: '🤖', balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
+    const UI_NAMES = { auto: 'Auto (default)', balanced: 'Balanced', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
     console.log('');
     console.log('  🎛️  Routing modes:');
     console.log('');
@@ -513,13 +514,28 @@ function cmdMode() {
     return;
   }
 
-  if (!PROFILES[modeArg]) {
-    console.error(`  Unknown profile: ${modeArg}`);
-    console.error(`  Available: ${Object.keys(PROFILES).join(', ')}`);
-    process.exit(1);
+  let resolvedMode = modeArg;
+  if (!PROFILES[resolvedMode]) {
+    // Try natural language alias resolution
+    const cleaned = resolvedMode.toLowerCase().trim()
+      .replace(/^(go|be|use|switch to|set|mode)\s+/i, '')
+      .replace(/\s+mode$/i, '');
+    const MODE_ALIASES = {
+      'auto': 'auto', 'adaptive': 'auto', 'smart': 'auto', 'default': 'auto', 'normal': 'auto',
+      'balanced': 'balanced', 'even': 'balanced', 'equal': 'balanced',
+      'cost-saver': 'cost-saver', 'cheap': 'cost-saver', 'save': 'cost-saver', 'conservative': 'cost-saver', 'frugal': 'cost-saver', 'budget': 'cost-saver',
+      'quality-first': 'quality-first', 'aggressive': 'quality-first', 'quality': 'quality-first', 'max': 'quality-first', 'full': 'quality-first', 'both': 'quality-first',
+    };
+    resolvedMode = MODE_ALIASES[cleaned] || null;
+    if (!resolvedMode) {
+      console.error(`  Unknown profile: ${modeArg}`);
+      console.error(`  Available: ${Object.keys(PROFILES).join(', ')}`);
+      console.error(`  Aliases: cheap, aggressive, quality, budget, frugal, smart, adaptive, ...`);
+      process.exit(1);
+    }
   }
 
-  const profile = PROFILES[modeArg];
+  const profile = PROFILES[resolvedMode];
 
   let customOverrides = null;
   try {
@@ -529,12 +545,12 @@ function cmdMode() {
     }
   } catch {}
 
-  saveProfile(workspace, modeArg, customOverrides);
+  saveProfile(workspace, resolvedMode, customOverrides);
 
-  const PEMOJIS = { balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
-  const UI_NAMES = { balanced: 'Default', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
+  const PEMOJIS = { auto: '🤖', balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
+  const UI_NAMES = { auto: 'Auto (default)', balanced: 'Balanced', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
   console.log('');
-  console.log(`  ✅ Mode switched: ${PEMOJIS[modeArg] || ''} ${UI_NAMES[modeArg] || modeArg}`);
+  console.log(`  ✅ Mode switched: ${PEMOJIS[resolvedMode] || ''} ${UI_NAMES[resolvedMode] || resolvedMode}`);
   console.log(`  ${profile.description}`);
   console.log('');
   console.log('  🧭 Routing changes:');
@@ -586,7 +602,7 @@ function cmdBudget() {
   };
 
   const data = {
-    active: existing.active || 'balanced',
+    active: existing.active || 'auto',
     switched_at: existing.switched_at || new Date().toISOString(),
     custom_overrides: customOverrides,
   };
