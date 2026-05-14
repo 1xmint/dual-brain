@@ -1,48 +1,47 @@
 #!/usr/bin/env node
 /**
- * control-panel.mjs — Interactive TUI control panel for Dual-Brain Orchestrator.
+ * control-panel.mjs — Session manager + control panel for Dual-Brain.
  *
- * Keyboard-driven dashboard with live-updating pressure, profile switching,
- * inline budget editing, and routing decision viewer.
- *
- * Falls back to static emoji output when not in a TTY.
+ * Data-tools-style interactive menu: recent sessions, continue/resume/new,
+ * profile switching, budget editing. Loops until user exits to shell.
  */
 
 import readline from 'readline';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, statSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONFIG_FILE = join(__dirname, '..', 'orchestrator.json');
 const PROFILE_FILE = join(__dirname, '..', 'dual-brain.profile.json');
 const VERSION = (() => {
-  try { return JSON.parse(readFileSync(join(__dirname, '..', '..', 'dual-brain', 'package.json'), 'utf8')).version; } catch {}
   try { return JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version; } catch {}
   return '?';
 })();
 
+const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
+const HOME = process.env.HOME || process.env.USERPROFILE || '';
+const CWD = process.cwd();
+
 // ─── ANSI ──────────────────────────────────────────────────────────────────
 
-const color = !process.env.NO_COLOR;
-const A = {
-  altOn: '\x1b[?1049h', altOff: '\x1b[?1049l',
-  clear: '\x1b[2J', home: '\x1b[H',
-  hide: '\x1b[?25l', show: '\x1b[?25h',
-  reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
-  red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
-  blue: '\x1b[34m', cyan: '\x1b[36m', gray: '\x1b[90m',
-  white: '\x1b[37m',
-};
-const c = (code, s) => color ? `${code}${s}${A.reset}` : s;
+const noColor = !!process.env.NO_COLOR;
+const e = (code, s) => noColor ? s : `\x1b[${code}m${s}\x1b[0m`;
+const bold = s => e('1', s);
+const dim = s => e('2', s);
+const cyan = s => e('36', s);
+const green = s => e('32', s);
+const yellow = s => e('33', s);
+const magenta = s => e('95', s);
+const orange = s => e('1;38;5;208', s);
+const blue = s => e('1;38;5;33', s);
 
 // ─── Profiles ──────────────────────────────────────────────────────────────
 
 const PROFILES = {
-  balanced:        { emoji: '⚖️',  label: 'Balanced',      desc: 'Standard routing — best model per tier' },
-  'cost-saver':    { emoji: '💸', label: 'Cost-saver',    desc: 'Minimize spend — prefer cheaper models' },
-  'quality-first': { emoji: '💎', label: 'Quality-first', desc: 'Maximum quality — dual-brain for medium+' },
+  balanced:        { emoji: '⚖️',  label: 'Balanced',      desc: 'Best model per tier, normal budgets' },
+  'cost-saver':    { emoji: '💸', label: 'Cost-saver',    desc: 'Prefer cheaper models, lower budgets' },
+  'quality-first': { emoji: '💎', label: 'Quality-first', desc: 'Dual-brain for medium+, strict reviews' },
 };
 
 const PROFILE_BUDGETS = {
@@ -51,31 +50,14 @@ const PROFILE_BUDGETS = {
   'quality-first': { session_warn_usd: 15, session_limit_usd: 30, daily_warn_usd: 50, daily_limit_usd: 100 },
 };
 
-const PROFILE_GATE = {
-  balanced:        { sensitivity_floor: 'medium', dual_brain_minimum: 'high' },
-  'cost-saver':    { sensitivity_floor: 'high', dual_brain_minimum: 'critical' },
-  'quality-first': { sensitivity_floor: 'low', dual_brain_minimum: 'medium' },
-};
-
-// ─── Data Loaders ──────────────────────────────────────────────────────────
-
-function loadConfig() {
-  try { return JSON.parse(readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
-}
-
 function loadProfile() {
   try {
     const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
     const name = data.active && PROFILES[data.active] ? data.active : 'balanced';
     const custom = data.custom_overrides || {};
-    return {
-      name,
-      budgets: { ...PROFILE_BUDGETS[name], ...custom.budgets },
-      gate: PROFILE_GATE[name],
-      switched_at: data.switched_at || null,
-    };
+    return { name, budgets: { ...PROFILE_BUDGETS[name], ...custom.budgets } };
   } catch {
-    return { name: 'balanced', budgets: PROFILE_BUDGETS.balanced, gate: PROFILE_GATE.balanced, switched_at: null };
+    return { name: 'balanced', budgets: PROFILE_BUDGETS.balanced };
   }
 }
 
@@ -87,29 +69,19 @@ function saveProfile(name, customOverrides) {
   renameSync(tmp, PROFILE_FILE);
 }
 
-function saveBudget(sessionLimit, dailyLimit) {
-  let existing = {};
-  try { existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8')); } catch {}
-  const custom = existing.custom_overrides || {};
-  custom.budgets = {
-    session_warn_usd: +(sessionLimit * 0.6).toFixed(2),
-    session_limit_usd: sessionLimit,
-    daily_warn_usd: +(dailyLimit * 0.6).toFixed(2),
-    daily_limit_usd: dailyLimit,
-  };
-  const data = { active: existing.active || 'balanced', switched_at: existing.switched_at || new Date().toISOString(), custom_overrides: custom };
-  const tmp = PROFILE_FILE + '.tmp.' + process.pid;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-  renameSync(tmp, PROFILE_FILE);
-}
+// ─── Provider Detection ───────────────────────────────────────────────────
 
 function detectProviders() {
-  const claude = { authed: false, models: 'opus / sonnet / haiku' };
-  const codex = { authed: false, installed: false, models: 'gpt-5.5 / gpt-5.4 / gpt-4.1-mini' };
+  const claude = { installed: false, authed: false };
+  const codex = { installed: false, authed: false };
+
+  const claudeCheck = spawnSync('which', ['claude'], { encoding: 'utf8', stdio: 'pipe', timeout: 3000 });
+  claude.installed = claudeCheck.status === 0 && !!claudeCheck.stdout.trim();
 
   const credPaths = [
-    join(process.env.HOME || '', '.claude', '.credentials.json'),
-    join(process.env.HOME || '', '.claude', 'credentials.json'),
+    join(HOME, '.claude', '.credentials.json'),
+    join(HOME, '.claude', 'credentials.json'),
+    join(CWD, '.replit-tools', '.claude-persistent', '.credentials.json'),
   ];
   for (const p of credPaths) {
     try {
@@ -117,16 +89,16 @@ function detectProviders() {
       if (cred.claudeAiOauth || cred.apiKey || cred.oauth_token) { claude.authed = true; break; }
     } catch {}
   }
-  if (!claude.authed) {
+  if (!claude.authed && claude.installed) {
     const r = spawnSync('claude', ['auth', 'status'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
     const out = ((r.stdout || '') + (r.stderr || '')).toLowerCase();
     if (out.includes('logged in') || out.includes('authenticated')) claude.authed = true;
   }
 
-  const which = spawnSync('which', ['codex'], { encoding: 'utf8', stdio: 'pipe', timeout: 3000 });
-  if (which.status === 0 && which.stdout.trim()) {
+  const codexCheck = spawnSync('which', ['codex'], { encoding: 'utf8', stdio: 'pipe', timeout: 3000 });
+  if (codexCheck.status === 0 && codexCheck.stdout.trim()) {
     codex.installed = true;
-    const login = spawnSync(which.stdout.trim(), ['login', 'status'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
+    const login = spawnSync(codexCheck.stdout.trim(), ['login', 'status'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 });
     const out = ((login.stdout || '') + (login.stderr || '')).toLowerCase();
     if (login.status === 0 || out.includes('logged in') || out.includes('authenticated')) codex.authed = true;
   }
@@ -134,356 +106,429 @@ function detectProviders() {
   return { claude, codex };
 }
 
-function loadPressure() {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const summaryPath = join(__dirname, `usage-summary-${today}.json`);
-    const summary = JSON.parse(readFileSync(summaryPath, 'utf8'));
-    const cutoff = Date.now() - 5 * 60 * 60 * 1000;
-    const result = {};
-    for (const provider of ['claude', 'openai']) {
-      result[provider] = {};
-      for (const tier of ['think', 'execute', 'search']) {
-        const ts = (summary.pressure?.[provider]?.[tier] || []).filter(t => Date.parse(t) >= cutoff);
-        const BUDGETS = { think: 45, execute: 364, search: 2000 };
-        const calls = ts.length;
-        const pressure = Math.min(1, calls / (BUDGETS[tier] || 364));
-        result[provider][tier] = { calls, pressure };
+// ─── Session Discovery ────────────────────────────────────────────────────
+
+function getRecentSessions() {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const sessions = new Map();
+
+  const isRealPrompt = (txt) => {
+    if (!txt) return false;
+    const t = txt.trim();
+    if (!t) return false;
+    if (/^[✅❌📦🔗⚠️🚀🎉🔧📝]/.test(t)) return false;
+    if (/Claude (history|binary|versions) symlink/.test(t)) return false;
+    if (t.startsWith('# AGENTS.md')) return false;
+    return true;
+  };
+
+  // Claude sessions
+  const historyFile = join(HOME, '.claude', 'history.jsonl');
+  if (existsSync(historyFile)) {
+    try {
+      const lines = readFileSync(historyFile, 'utf8').trim().split('\n');
+      const entries = [];
+      for (const line of lines) {
+        try {
+          const j = JSON.parse(line);
+          if (j.sessionId && j.timestamp) entries.push(j);
+        } catch {}
       }
-    }
-    return result;
-  } catch {
-    return {
-      claude: { think: { calls: 0, pressure: 0 }, execute: { calls: 0, pressure: 0 }, search: { calls: 0, pressure: 0 } },
-      openai: { think: { calls: 0, pressure: 0 }, execute: { calls: 0, pressure: 0 }, search: { calls: 0, pressure: 0 } },
-    };
+      entries.sort((a, b) => a.timestamp - b.timestamp);
+      for (const j of entries) {
+        const key = 'claude:' + j.sessionId;
+        if (!sessions.has(key)) {
+          sessions.set(key, { tool: 'claude', id: j.sessionId, firstSeen: j.timestamp, lastSeen: j.timestamp, firstPrompt: '' });
+        }
+        const s = sessions.get(key);
+        if (j.timestamp < s.firstSeen) s.firstSeen = j.timestamp;
+        if (j.timestamp > s.lastSeen) s.lastSeen = j.timestamp;
+        if (!s.firstPrompt && isRealPrompt(j.display)) s.firstPrompt = j.display;
+      }
+      for (const [key, s] of sessions) {
+        if (s.tool === 'claude' && !s.firstPrompt) sessions.delete(key);
+      }
+    } catch {}
   }
-}
 
-function loadTodayCost() {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const summary = JSON.parse(readFileSync(join(__dirname, `usage-summary-${today}.json`), 'utf8'));
-    return summary.totals?.cost_estimate || 0;
-  } catch { return 0; }
-}
-
-function loadLastDecision() {
-  const today = new Date().toISOString().slice(0, 10);
-  const logFile = join(__dirname, `usage-${today}.jsonl`);
-  if (!existsSync(logFile)) return null;
-  try {
-    const lines = readFileSync(logFile, 'utf8').split('\n').filter(Boolean);
-    for (let i = lines.length - 1; i >= 0; i--) {
+  // Codex sessions
+  const codexDir = join(HOME, '.codex', 'sessions');
+  if (existsSync(codexDir)) {
+    const walk = (dir) => {
+      let results = [];
       try {
-        const e = JSON.parse(lines[i]);
-        if (e.type === 'tier_recommendation') return e;
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) results = results.concat(walk(full));
+          else if (entry.isFile() && entry.name.endsWith('.jsonl')) results.push(full);
+        }
+      } catch {}
+      return results;
+    };
+    for (const f of walk(codexDir)) {
+      try {
+        const stat = statSync(f);
+        if (stat.mtimeMs < cutoff) continue;
+        const content = readFileSync(f, 'utf8');
+        const lns = content.trim().split('\n');
+        if (!lns.length) continue;
+        const meta = JSON.parse(lns[0]);
+        if (meta.type !== 'session_meta' || !meta.payload) continue;
+        if (meta.payload.cwd !== CWD) continue;
+        const id = meta.payload.id;
+        const firstTs = Date.parse(meta.payload.timestamp || meta.timestamp);
+        let lastTs = firstTs;
+        let firstPrompt = '';
+        let realMsgCount = 0;
+        for (const ln of lns) {
+          try {
+            const j = JSON.parse(ln);
+            if (j.timestamp) lastTs = Math.max(lastTs, Date.parse(j.timestamp));
+            if (j.type === 'event_msg' && j.payload?.type === 'user_message') {
+              const text = (j.payload.message || '').trim();
+              if (text) { if (!firstPrompt) firstPrompt = text; realMsgCount++; }
+            }
+          } catch {}
+        }
+        if (realMsgCount === 0 || !firstPrompt) continue;
+        if (/^(you are |you're |\*\*role\*\*|<role>|## role)/i.test(firstPrompt)) continue;
+        if (realMsgCount === 1 && firstPrompt.length > 500) continue;
+        sessions.set('codex:' + id, { tool: 'codex', id, firstSeen: firstTs, lastSeen: lastTs, firstPrompt });
       } catch {}
     }
+  }
+
+  return Array.from(sessions.values())
+    .filter(s => (s.lastSeen || 0) >= cutoff)
+    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))
+    .slice(0, 9);
+}
+
+function timeAgo(ts) {
+  const mins = Math.round((Date.now() - ts) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const h = Math.round(mins / 60);
+  return h + 'h ago';
+}
+
+function snippet(s, n = 15) {
+  const clean = (s || '').replace(/\s+/g, ' ').trim();
+  return clean.length > n ? clean.slice(0, n - 1) + '…' : clean;
+}
+
+function countRunning() {
+  let claude = 0, codex = 0;
+  try {
+    const r = spawnSync('pgrep', ['-x', 'claude'], { encoding: 'utf8', stdio: 'pipe', timeout: 2000 });
+    claude = (r.stdout || '').trim().split('\n').filter(Boolean).length;
   } catch {}
-  return null;
+  try {
+    const r = spawnSync('pgrep', ['-x', 'codex'], { encoding: 'utf8', stdio: 'pipe', timeout: 2000 });
+    codex = (r.stdout || '').trim().split('\n').filter(Boolean).length;
+  } catch {}
+  return { claude, codex };
 }
 
-// ─── Rendering ─────────────────────────────────────────────────────────────
+// ─── Replit-Tools Check ───────────────────────────────────────────────────
 
-function pressureBar(p, w = 10) {
-  const filled = Math.min(w, Math.round(p * w));
-  const bar = '▓'.repeat(filled) + '░'.repeat(w - filled);
-  const pct = String(Math.round(p * 100)).padStart(3) + '%';
-  let stateEmoji, stateLabel;
-  if (p >= 0.95)      { stateEmoji = '🛑'; stateLabel = c(A.red + A.bold, 'throttled'); }
-  else if (p >= 0.82) { stateEmoji = '🔥'; stateLabel = c(A.red, 'hot'); }
-  else if (p >= 0.65) { stateEmoji = '🟡'; stateLabel = c(A.yellow, 'warm'); }
-  else                { stateEmoji = '🟢'; stateLabel = c(A.green, 'healthy'); }
-  const barColored = p >= 0.82 ? c(A.red, bar) : p >= 0.65 ? c(A.yellow, bar) : c(A.green, bar);
-  return `${barColored}  ${pct}  ${stateEmoji} ${stateLabel}`;
+function checkReplitTools() {
+  if (!IS_REPLIT) return true;
+  return existsSync(join(CWD, '.replit-tools'));
 }
 
-function renderDashboard(state) {
-  const { profile, providers, pressure, cost, flash } = state;
+// ─── Menu Renderer ────────────────────────────────────────────────────────
+
+function renderMenu() {
+  const providers = detectProviders();
+  const profile = loadProfile();
+  const sessions = getRecentSessions();
+  const running = countRunning();
   const pf = PROFILES[profile.name];
-  const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-  const mode = (providers.claude.authed && providers.codex.authed) ? '🧠 Dual brain active' :
-               providers.claude.authed ? '🟠 Claude only' :
-               providers.codex.authed ? '🟢 OpenAI only' : '🔎 No providers';
+  const hasReplitTools = checkReplitTools();
 
   const lines = [];
+
   lines.push('');
-  lines.push(c(A.bold, `  🧠 Dual-Brain Control Panel v${VERSION}`) + `                   ${c(A.green, '🟢 Live')}  ${c(A.dim, time)}`);
-  lines.push('');
-  lines.push(`  ${mode}`);
-  lines.push(`  🎛️  Profile     ${pf.emoji}  ${c(A.bold, pf.label)}       ${c(A.dim, pf.desc)}`);
-  lines.push(`  💵 Budget      Session $${cost.toFixed(2)} / $${profile.budgets.session_limit_usd}   Daily / $${profile.budgets.daily_limit_usd}`);
-  lines.push(`  🛡️  Gate        Reviews ${profile.gate.sensitivity_floor}+         Dual-brain ${profile.gate.dual_brain_minimum}+`);
+  lines.push(`  🧠 ${bold(`Dual-Brain v${VERSION}`)}`);
   lines.push('');
 
-  lines.push(`  🔌 ${c(A.bold, 'Providers')}`);
-  const cStatus = providers.claude.authed ? '✅ authenticated' : '⚠️  not authenticated';
-  const xStatus = providers.codex.authed ? '✅ authenticated' : providers.codex.installed ? '⚠️  login needed' : '❌ not found';
-  lines.push(`    🟠 Claude     ${cStatus}     ${c(A.dim, providers.claude.models)}`);
-  lines.push(`    🟢 Codex      ${xStatus}     ${c(A.dim, providers.codex.models)}`);
-  lines.push('');
-
-  lines.push(`  🌡️  ${c(A.bold, 'Pressure')} ${c(A.dim, '— rolling 5h')}`);
-  for (const [label, emoji, key] of [['Claude', '🟠', 'claude'], ['OpenAI', '🟢', 'openai']]) {
-    lines.push(`    ${emoji} ${label}`);
-    for (const tier of ['think', 'execute', 'search']) {
-      const p = pressure[key]?.[tier] || { pressure: 0 };
-      const tierLabel = (tier.charAt(0).toUpperCase() + tier.slice(1)).padEnd(8);
-      lines.push(`       ${c(A.dim, tierLabel)}  ${pressureBar(p.pressure)}`);
-    }
-    if (key === 'claude') lines.push('');
-  }
-  lines.push('');
-
-  if (flash) {
-    lines.push(`  ${flash}`);
-    lines.push('');
-  }
-
-  lines.push(c(A.dim, '  ─'.repeat(30)));
-  lines.push(`  ⌨️   ${c(A.bold, '1')} Balanced  ${c(A.bold, '2')} Cost-saver  ${c(A.bold, '3')} Quality-first  ${c(A.bold, 'b')} Budget  ${c(A.bold, 'e')} Explain  ${c(A.bold, 'q')} Quit`);
-  lines.push('');
-
-  return lines.join('\n');
-}
-
-function renderExplain(decision, profile) {
-  const lines = [];
-  lines.push('');
-  lines.push(c(A.bold, '  🧭 Last Routing Decision'));
-  lines.push(c(A.dim, '  ' + '─'.repeat(40)));
-
-  if (!decision) {
-    lines.push('  💤 No routing decisions recorded today.');
-    lines.push('');
-    lines.push(c(A.dim, '  Press any key to go back'));
-    return lines.join('\n');
-  }
-
-  const time = decision.timestamp?.slice(11, 19) || '??:??:??';
-  const followed = decision.followed;
-  lines.push(`  🕐 Time         ${time}`);
-  lines.push(`  🔎 Detected     ${decision.detected_tier || 'unknown'} tier`);
-  lines.push(`  🧠 Recommended  ${decision.recommended_model || 'unknown'}`);
-  lines.push(`  🎯 Actual       ${decision.actual_model || 'unknown'}`);
-  lines.push(`  ${followed ? '✅' : '⚠️'}  Followed     ${followed ? 'yes' : 'no'}`);
-  lines.push(`  🎛️  Profile      ${profile.name}`);
-  lines.push('');
-
-  if (followed) {
-    lines.push('  ✅ Routing matched the recommendation.');
+  // Quick reference box
+  lines.push('  ┌─────────────────────────────┐');
+  if (IS_REPLIT) {
+    lines.push(`  │ ${magenta('At')} ${blue('~/workspace')}${magenta('$ prompt:')}     │`);
+    lines.push(`  │ ${cyan('! npx dual-brain')} = this menu│`);
   } else {
-    lines.push('  ⚠️  Recommendation was overridden.');
+    lines.push(`  │ ${magenta('At shell prompt:')}             │`);
+    lines.push(`  │ ${cyan('npx dual-brain')} = this menu   │`);
   }
-
-  lines.push('');
-  lines.push(c(A.dim, '  Press any key to go back'));
-  return lines.join('\n');
-}
-
-function renderBudgetEditor(sessionVal, dailyVal, field, flash) {
-  const lines = [];
-  lines.push('');
-  lines.push(c(A.bold, '  💵 Edit Budget'));
-  lines.push(c(A.dim, '  ' + '─'.repeat(40)));
+  lines.push(`  │ ${cyan('j')}  = login to Claude        │`);
+  lines.push(`  │ ${cyan('k')}  = login to Codex         │`);
+  lines.push('  ├─────────────────────────────┤');
+  lines.push(`  │ ${orange('In Claude session:')}           │`);
+  lines.push(`  │ ${green('Ctrl+C x2')} = back to menu    │`);
+  lines.push(`  │ ${green('Ctrl+C x3')} = exit to shell   │`);
+  lines.push('  └─────────────────────────────┘');
   lines.push('');
 
-  const sCursor = field === 'session' ? '_' : '';
-  const dCursor = field === 'daily' ? '_' : '';
-  lines.push(`  Session limit:  $${sessionVal}${sCursor}${field === 'session' ? c(A.dim, ' ← editing') : ''}`);
-  lines.push(`  Daily limit:    $${dailyVal}${dCursor}${field === 'daily' ? c(A.dim, ' ← editing') : ''}`);
-  lines.push('');
+  // Provider status line
+  const cStat = providers.claude.authed ? '✅' : providers.claude.installed ? '⚠️' : '❌';
+  const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
+  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}  ${pf.emoji}  ${bold(pf.label)}  ${dim('$' + profile.budgets.session_limit_usd + '/session')}`);
 
-  if (flash) {
-    lines.push(`  ${flash}`);
+  // Missing provider nudge
+  if (!providers.claude.authed || !providers.codex.authed) {
     lines.push('');
+    if (!providers.claude.installed) lines.push(`  ${dim('└')} Install Claude: ${cyan('curl -fsSL https://claude.ai/install.sh | sh')}`);
+    else if (!providers.claude.authed) lines.push(`  ${dim('└')} Auth Claude: press ${bold('j')} below`);
+    if (!providers.codex.installed) lines.push(`  ${dim('└')} Install Codex: ${cyan('npm i -g @openai/codex')}`);
+    else if (!providers.codex.authed) lines.push(`  ${dim('└')} Auth Codex: press ${bold('k')} below`);
   }
 
-  lines.push(c(A.dim, '  Type numbers · Tab next · Enter save · Esc cancel'));
-  return lines.join('\n');
+  // Replit-tools check
+  if (IS_REPLIT && !hasReplitTools) {
+    lines.push('');
+    lines.push(`  ⚠️  ${yellow('replit-tools not found')} — recommended for Replit environments`);
+    lines.push(`  ${dim('└')} Press ${bold('t')} to install replit-tools`);
+  }
+
+  // Recent sessions
+  if (sessions.length > 0) {
+    lines.push('');
+    lines.push(`  ${bold('Recent (last 24h):')}`);
+    for (let i = 0; i < sessions.length; i++) {
+      const s = sessions[i];
+      const num = String(i + 1);
+      const toolLabel = s.tool === 'codex' ? orange('cdx') : blue('cld');
+      const ago = timeAgo(s.lastSeen).padEnd(9);
+      lines.push(`  ${bold('[' + num + ']')} ${toolLabel}  ${dim(ago)} ${snippet(s.firstPrompt)}`);
+    }
+  }
+
+  // Session manager box
+  lines.push('');
+  lines.push('  ┌─────────────────────────────┐');
+  lines.push('  │  🧠 Dual-Brain Session Mgr   │');
+  lines.push('  └─────────────────────────────┘');
+
+  const runParts = [];
+  if (running.claude > 0) runParts.push(`${running.claude} claude`);
+  if (running.codex > 0) runParts.push(`${running.codex} codex`);
+  if (runParts.length > 0) lines.push(`  ${dim('(' + runParts.join(', ') + ' running)')}`);
+  lines.push('');
+
+  // Menu options
+  lines.push(`  ${bold('[c]')} Continue last session`);
+  if (sessions.length > 0) lines.push(`  ${bold('[1-9]')} Resume numbered above`);
+  lines.push(`  ${bold('[n]')} New session`);
+  lines.push(`  ${bold('[p]')} Profile ${dim('(' + pf.emoji + ' ' + profile.name + ')')}`);
+  lines.push(`  ${bold('[b]')} Budget ${dim('($' + profile.budgets.session_limit_usd + ' session / $' + profile.budgets.daily_limit_usd + ' daily)')}`);
+  lines.push(`  ${bold('[j]')} Login to Claude`);
+  lines.push(`  ${bold('[k]')} Login to Codex`);
+  if (IS_REPLIT && !hasReplitTools) lines.push(`  ${bold('[t]')} Install replit-tools`);
+  lines.push(`  ${bold('[s]')} Skip — just shell`);
+  lines.push('');
+
+  return { lines, sessions, providers };
 }
 
-// ─── Static (non-TTY) Output ───────────────────────────────────────────────
+// ─── Profile Picker ───────────────────────────────────────────────────────
+
+function showProfilePicker(rl) {
+  return new Promise((resolve) => {
+    const current = loadProfile();
+    console.log('');
+    console.log(`  ${bold('🎛️  Switch Profile:')}`);
+    console.log('');
+    for (const [i, [name, pf]] of Object.entries(PROFILES).entries()) {
+      const active = name === current.name ? ' ✅' : '';
+      console.log(`  ${bold('[' + (i + 1) + ']')} ${pf.emoji}  ${name.padEnd(15)} ${dim(pf.desc)}${active}`);
+    }
+    console.log(`  ${bold('[q]')} Cancel`);
+    console.log('');
+
+    rl.question('  Choice: ', (answer) => {
+      const names = Object.keys(PROFILES);
+      const idx = parseInt(answer, 10) - 1;
+      if (idx >= 0 && idx < names.length) {
+        let customOverrides = null;
+        try {
+          const existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
+          if (existing.custom_overrides?.budgets) customOverrides = { budgets: existing.custom_overrides.budgets };
+        } catch {}
+        saveProfile(names[idx], customOverrides);
+        const pf = PROFILES[names[idx]];
+        console.log(`  ✅ Switched to ${pf.emoji}  ${pf.label}`);
+      }
+      resolve();
+    });
+  });
+}
+
+// ─── Budget Editor ────────────────────────────────────────────────────────
+
+function showBudgetEditor(rl) {
+  return new Promise((resolve) => {
+    const profile = loadProfile();
+    console.log('');
+    console.log(`  ${bold('💵 Edit Budget')}`);
+    console.log(`  ${dim('Current: $' + profile.budgets.session_limit_usd + ' session / $' + profile.budgets.daily_limit_usd + ' daily')}`);
+    console.log('');
+
+    rl.question('  Session limit ($): ', (sessionStr) => {
+      const session = parseFloat(sessionStr);
+      if (isNaN(session) || session <= 0) {
+        console.log('  Cancelled.');
+        return resolve();
+      }
+      rl.question('  Daily limit ($, Enter = auto): ', (dailyStr) => {
+        const daily = parseFloat(dailyStr);
+        const finalDaily = (isNaN(daily) || daily <= 0) ? session * 3 : daily;
+
+        let existing = {};
+        try { existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8')); } catch {}
+        const custom = existing.custom_overrides || {};
+        custom.budgets = {
+          session_warn_usd: +(session * 0.6).toFixed(2),
+          session_limit_usd: session,
+          daily_warn_usd: +(finalDaily * 0.6).toFixed(2),
+          daily_limit_usd: finalDaily,
+        };
+        const data = { active: existing.active || 'balanced', switched_at: existing.switched_at || new Date().toISOString(), custom_overrides: custom };
+        const tmp = PROFILE_FILE + '.tmp.' + process.pid;
+        writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+        renameSync(tmp, PROFILE_FILE);
+
+        console.log(`  ✅ Budget: $${session}/session · $${finalDaily}/daily`);
+        resolve();
+      });
+    });
+  });
+}
+
+// ─── Session Runner ───────────────────────────────────────────────────────
+
+function runSession(cmd, args, label) {
+  console.log('');
+  console.log(`  ${label}...`);
+  console.log('');
+  const result = spawnSync(cmd, args, { stdio: 'inherit' });
+  console.log('');
+  console.log('  Exited. Returning to menu...');
+  return result.status || 0;
+}
+
+// ─── Main Loop ────────────────────────────────────────────────────────────
+
+async function mainLoop() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const ask = () => new Promise(resolve => rl.question('  Choice: ', resolve));
+
+  while (true) {
+    const { lines, sessions } = renderMenu();
+    for (const l of lines) console.log(l);
+
+    const choice = (await ask()).trim().toLowerCase();
+
+    if (choice === 's' || choice === 'q') {
+      console.log('');
+      rl.close();
+      return;
+    }
+
+    if (choice === 'c' || choice === '') {
+      // Continue most recent session
+      if (sessions.length > 0) {
+        const s = sessions[0];
+        if (s.tool === 'codex') {
+          runSession('codex', ['--dangerously-bypass-approvals-and-sandbox', 'resume', s.id], `Resuming codex session ${s.id.slice(0, 8)}`);
+        } else {
+          runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}`);
+        }
+      } else {
+        runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session');
+      }
+      continue;
+    }
+
+    const num = parseInt(choice, 10);
+    if (num >= 1 && num <= 9 && sessions[num - 1]) {
+      const s = sessions[num - 1];
+      if (s.tool === 'codex') {
+        runSession('codex', ['--dangerously-bypass-approvals-and-sandbox', 'resume', s.id], `Resuming codex session ${s.id.slice(0, 8)}`);
+      } else {
+        runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}`);
+      }
+      continue;
+    }
+
+    if (choice === 'n') {
+      runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session');
+      continue;
+    }
+
+    if (choice === 'p') {
+      await showProfilePicker(rl);
+      continue;
+    }
+
+    if (choice === 'b') {
+      await showBudgetEditor(rl);
+      continue;
+    }
+
+    if (choice === 'j') {
+      console.log('');
+      console.log('  Starting Claude login...');
+      console.log('');
+      spawnSync('claude', ['login'], { stdio: 'inherit' });
+      continue;
+    }
+
+    if (choice === 'k') {
+      const codexPath = spawnSync('which', ['codex'], { encoding: 'utf8', stdio: 'pipe', timeout: 3000 });
+      if (codexPath.status !== 0) {
+        console.log('');
+        console.log(`  Codex not installed. Run: ${cyan('npm i -g @openai/codex')}`);
+        console.log('');
+        await ask();
+        continue;
+      }
+      console.log('');
+      console.log('  Starting Codex login...');
+      console.log('');
+      spawnSync(codexPath.stdout.trim(), ['login'], { stdio: 'inherit' });
+      continue;
+    }
+
+    if (choice === 't' && IS_REPLIT) {
+      console.log('');
+      console.log('  Installing replit-tools...');
+      console.log('');
+      spawnSync('npx', ['-y', 'data-tools'], { stdio: 'inherit', cwd: CWD });
+      console.log('');
+      console.log('  ✅ replit-tools installed. You may need to restart your shell.');
+      console.log('');
+      await ask();
+      continue;
+    }
+
+    console.log(`  Unknown option: ${choice}`);
+  }
+}
+
+// ─── Non-Interactive Fallback ─────────────────────────────────────────────
 
 function renderStatic() {
-  const profile = loadProfile();
-  const providers = detectProviders();
-  const pressure = loadPressure();
-  const cost = loadTodayCost();
-  const state = { profile, providers, pressure, cost, flash: null };
-  console.log(renderDashboard(state));
+  const { lines } = renderMenu();
+  for (const l of lines) console.log(l);
 }
 
-// ─── Interactive TUI ───────────────────────────────────────────────────────
+// ─── Entry ────────────────────────────────────────────────────────────────
 
-function startTUI() {
-  let view = 'dashboard';
-  let flash = null;
-  let flashTimeout = null;
-  let refreshTimer = null;
-
-  // Budget editor state
-  let budgetSession = '';
-  let budgetDaily = '';
-  let budgetField = 'session';
-
-  function setFlash(msg, ms = 3000) {
-    flash = msg;
-    clearTimeout(flashTimeout);
-    flashTimeout = setTimeout(() => { flash = null; render(); }, ms);
-  }
-
-  function loadState() {
-    return {
-      profile: loadProfile(),
-      providers: detectProviders(),
-      pressure: loadPressure(),
-      cost: loadTodayCost(),
-      flash,
-    };
-  }
-
-  function render() {
-    let screen;
-    if (view === 'dashboard') {
-      screen = renderDashboard(loadState());
-    } else if (view === 'explain') {
-      const decision = loadLastDecision();
-      const profile = loadProfile();
-      screen = renderExplain(decision, profile);
-    } else if (view === 'budget') {
-      screen = renderBudgetEditor(budgetSession, budgetDaily, budgetField, flash);
-    }
-    process.stdout.write(A.home + A.clear + screen);
-  }
-
-  function startRefresh() {
-    stopRefresh();
-    refreshTimer = setInterval(render, 2000);
-  }
-
-  function stopRefresh() {
-    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
-  }
-
-  function cleanup() {
-    stopRefresh();
-    clearTimeout(flashTimeout);
-    process.stdin.setRawMode(false);
-    process.stdout.write(A.reset + A.show + A.altOff);
-    process.exit(0);
-  }
-
-  function switchProfile(name) {
-    let customOverrides = null;
-    try {
-      const existing = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
-      if (existing.custom_overrides?.budgets) customOverrides = { budgets: existing.custom_overrides.budgets };
-    } catch {}
-    saveProfile(name, customOverrides);
-    const pf = PROFILES[name];
-    setFlash(`✅ Profile switched: ${pf.emoji}  ${pf.label}`);
-    render();
-  }
-
-  // Setup
-  process.stdout.write(A.altOn + A.hide);
-  readline.emitKeypressEvents(process.stdin);
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-
-  process.on('SIGINT', cleanup);
-  process.on('SIGTERM', cleanup);
-  process.on('uncaughtException', (err) => {
-    cleanup();
-    console.error(err);
-  });
-
-  render();
-  startRefresh();
-
-  process.stdin.on('keypress', (str, key) => {
-    if (key?.ctrl && key?.name === 'c') return cleanup();
-
-    if (view === 'budget') {
-      if (key?.name === 'escape') {
-        view = 'dashboard';
-        startRefresh();
-        render();
-        return;
-      }
-      if (key?.name === 'tab') {
-        budgetField = budgetField === 'session' ? 'daily' : 'session';
-        render();
-        return;
-      }
-      if (key?.name === 'return') {
-        const s = parseFloat(budgetSession);
-        const d = parseFloat(budgetDaily);
-        if (isNaN(s) || s <= 0) { setFlash('❌ Invalid session limit'); render(); return; }
-        const daily = (isNaN(d) || d <= 0) ? s * 3 : d;
-        saveBudget(s, daily);
-        view = 'dashboard';
-        startRefresh();
-        setFlash(`✅ Budget updated: Session $${s} · Daily $${daily}`);
-        render();
-        return;
-      }
-      if (key?.name === 'backspace') {
-        if (budgetField === 'session') budgetSession = budgetSession.slice(0, -1);
-        else budgetDaily = budgetDaily.slice(0, -1);
-        render();
-        return;
-      }
-      if (str && /[0-9.]/.test(str)) {
-        if (budgetField === 'session') budgetSession += str;
-        else budgetDaily += str;
-        render();
-        return;
-      }
-      return;
-    }
-
-    if (view === 'explain') {
-      view = 'dashboard';
-      startRefresh();
-      render();
-      return;
-    }
-
-    // Dashboard keys
-    if (key?.name === 'q' || key?.name === 'escape') return cleanup();
-    if (str === '1') return switchProfile('balanced');
-    if (str === '2') return switchProfile('cost-saver');
-    if (str === '3') return switchProfile('quality-first');
-    if (str === 'r') { render(); return; }
-    if (str === 'e') {
-      view = 'explain';
-      stopRefresh();
-      render();
-      return;
-    }
-    if (str === 'b') {
-      view = 'budget';
-      stopRefresh();
-      const profile = loadProfile();
-      budgetSession = String(profile.budgets.session_limit_usd);
-      budgetDaily = String(profile.budgets.daily_limit_usd);
-      budgetField = 'session';
-      flash = null;
-      render();
-      return;
-    }
-  });
-}
-
-// ─── Entry ─────────────────────────────────────────────────────────────────
-
-const interactive = process.stdin.isTTY && process.stdout.isTTY && !process.env.CI;
-
-if (interactive) {
-  startTUI();
+if (process.stdin.isTTY && process.stdout.isTTY && !process.env.CI) {
+  mainLoop().catch(err => { console.error(err); process.exit(1); });
 } else {
   renderStatic();
 }

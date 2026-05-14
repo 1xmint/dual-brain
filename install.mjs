@@ -334,7 +334,7 @@ function install(workspace, env, mode) {
     'test-orchestrator.mjs', 'setup-wizard.mjs', 'health-check.mjs',
     'install-git-hooks.mjs', 'session-report.mjs', 'budget-balancer.mjs',
     'gpt-work-dispatcher.mjs', 'profiles.mjs',
-    'summary-checkpoint.mjs', 'decision-ledger.mjs',
+    'summary-checkpoint.mjs', 'decision-ledger.mjs', 'control-panel.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
   actions.push(`✓ ${HOOKS.length} hook scripts`);
@@ -381,104 +381,36 @@ function install(workspace, env, mode) {
 
 // ─── Status Report ──────────────────────────────────────────────────────────
 
-function statusIcon(val) { return val ? '✅' : '❌'; }
-
-const MODE_EMOJIS = {
-  'dual':        '🧠',
-  'claude-only': '🟠',
-  'openai-only': '🟢',
-  'detect-only': '🔎',
-};
-
-function printReport(env, mode, actions) {
+function printReport(env, mode, actions, isDryRun) {
   const lines = [];
 
   lines.push(br('╔', '╗'));
-  lines.push(ln(`🧠 Dual-Brain Orchestrator v${VERSION}`));
+  lines.push(ln(`🧠 Dual-Brain v${VERSION}`));
   lines.push(sep());
 
-  lines.push(ln('🌎 Environment'));
+  const cAuth = env.claude.authed ? '✅' : env.claude.installed ? '⚠️' : '❌';
+  const xAuth = env.codex.authed ? '✅' : env.codex.installed ? '⚠️' : '❌';
+  lines.push(ln(`  🟠 Claude ${cAuth}   🟢 Codex ${xAuth}`));
+
   if (env.isReplit) {
-    lines.push(ln(`  🌀 Platform:  Replit${env.hasReplitTools ? ' + replit-tools' : ''}`));
-  } else {
-    lines.push(ln('  Platform:    standalone'));
+    lines.push(ln(`  🌀 Replit${env.hasReplitTools ? ' + replit-tools' : ''}`));
   }
-
-  const cVer = env.claude.version ? ` ${env.claude.version}` : '';
-  const cAuth = env.claude.authed ? '✅ authenticated' : env.claude.installed ? '⚠️  login needed' : '❌ not found';
-  lines.push(ln(`  🟠 Claude:   ${cAuth}${cVer}`));
-
-  const xVer = env.codex.version ? ` ${env.codex.version}` : '';
-  const xAuth = env.codex.authed ? '✅ authenticated' : env.codex.installed ? '⚠️  login needed' : '❌ not found';
-  lines.push(ln(`  🟢 Codex:    ${xAuth}${xVer}`));
-
-  lines.push(sep());
-  lines.push(ln(`${MODE_EMOJIS[mode.mode] || '🧠'} Mode: ${MODE_LABELS[mode.mode]}`));
 
   if (actions) {
     lines.push(sep());
-    lines.push(ln('📝 Installed'));
     for (const a of actions) lines.push(ln(`  ${a}`));
-  }
-
-  const needsAction = !env.claude.authed || !env.codex.authed;
-  if (needsAction && mode.mode !== 'dual') {
     lines.push(sep());
-    lines.push(ln('🔓 Unlock full power:'));
-    if (!env.claude.installed) {
-      lines.push(ln('  curl -fsSL https://claude.ai/install.sh | sh'));
-    }
-    if (!env.claude.authed) {
-      lines.push(ln('  claude login'));
-    }
-    if (!env.codex.installed) {
-      lines.push(ln('  npm i -g @openai/codex'));
-    }
-    if (!env.codex.authed && env.codex.installed) {
-      lines.push(ln('  codex login'));
-    }
-    lines.push(ln('  Then run: npx dual-brain'));
-  }
-
-  lines.push(sep());
-  if (actions) {
-    lines.push(ln(mode.mode === 'dual'
-      ? '✅ Ready: both providers active, no restart needed'
-      : '✅ Ready: hooks active, run commands above for full power'));
-  } else {
+    lines.push(ln('✅ Installed — launching session manager...'));
+  } else if (isDryRun) {
+    lines.push(sep());
     lines.push(ln('Dry run — no files written'));
   }
+
   lines.push(br('╚', '╝'));
 
   console.log('');
   for (const l of lines) console.log(`  ${l}`);
   console.log('');
-
-  if (actions) {
-    console.log('  🧭 What changed:');
-    console.log('  Every Claude Code session now auto-routes agent work by');
-    console.log('  complexity — cheap models for search, mid-tier for execution,');
-    console.log('  best models for thinking. Cost is tracked automatically.');
-    if (mode.mode === 'dual') {
-      console.log('  🧠 Both Claude and GPT are available as work providers.');
-    }
-    console.log('');
-    console.log('  ⌨️  Open the control panel:');
-    console.log(`    ${cmd('npx dual-brain status')}`);
-    console.log('');
-    console.log('  🩺 In-session tools (ask Claude to run):');
-    console.log('    node .claude/hooks/health-check.mjs     # verify setup');
-    console.log('    node .claude/hooks/cost-report.mjs      # see activity');
-    console.log('    node .claude/hooks/decision-ledger.mjs  # routing insights');
-    if (mode.openaiEnabled) {
-      console.log('    node .claude/hooks/dual-brain-review.mjs # GPT code review');
-    }
-    console.log('');
-    console.log('  ⚙️  Customize:');
-    console.log('    .claude/review-rules.md     # your project\'s review rules');
-    console.log('    .claude/orchestrator.json   # routing, budgets, tiers');
-    console.log('');
-  }
 }
 
 // ─── Profile System ────────────────────────────────────────────────────────
@@ -539,70 +471,13 @@ function saveProfile(workspace, name, customOverrides) {
 
 // ─── Subcommand: status ────────────────────────────────────────────────────
 
-function cmdStatus() {
-  const workspace = resolve(process.cwd());
-  const env = detectEnvironment();
-  const mode = resolveMode(env);
-  const profile = loadProfile(workspace);
-
-  const lines = [];
-  lines.push(br('╔', '╗'));
-  lines.push(ln(`Dual-Brain Status — v${VERSION}`));
-  lines.push(sep());
-
-  lines.push(ln(`Mode:    ${MODE_LABELS[mode.mode]}`));
-  lines.push(ln(`Profile: ${profile.name}`));
-  lines.push(ln(`  ${PROFILES[profile.name]?.description || ''}`));
-  if (profile.switched_at) {
-    lines.push(ln(`  Set:   ${profile.switched_at.slice(0, 16).replace('T', ' ')}`));
-  }
-
-  lines.push(sep());
-
-  lines.push(ln('Budget Limits'));
-  lines.push(ln(`  Session: warn $${profile.budgets.session_warn_usd} / limit $${profile.budgets.session_limit_usd}`));
-  lines.push(ln(`  Daily:   warn $${profile.budgets.daily_warn_usd} / limit $${profile.budgets.daily_limit_usd}`));
-
-  lines.push(sep());
-
-  lines.push(ln('Providers'));
-  const cAuth = env.claude.authed ? 'authenticated' : 'not authenticated';
-  const xAuth = env.codex.authed ? 'authenticated' : env.codex.installed ? 'not authenticated' : 'not found';
-  lines.push(ln(`  Claude: ${statusIcon(env.claude.authed)} ${cAuth}`));
-  lines.push(ln(`  Codex:  ${statusIcon(env.codex.authed)} ${xAuth}`));
-
-  lines.push(sep());
-
-  lines.push(ln('Quality Gate'));
-  lines.push(ln(`  Reviews from:  ${profile.quality_gate.sensitivity_floor} risk+`));
-  lines.push(ln(`  Dual-brain at: ${profile.quality_gate.dual_brain_minimum} risk+`));
-
-  const balancer = join(workspace, '.claude', 'hooks', 'budget-balancer.mjs');
-  if (existsSync(balancer)) {
-    const proc = run(process.execPath, [balancer]);
-    if (proc.status === 0 && proc.stdout.trim()) {
-      lines.push(sep());
-      lines.push(ln('Provider Pressure (5hr rolling)'));
-      for (const l of proc.stdout.trim().split('\n')) {
-        if (l.includes('█') || l.includes('░') || l.includes('Recommendation')) {
-          const cleaned = l.replace(/[║╔╗╠╣╚╝═]/g, '').trim();
-          if (cleaned) lines.push(ln(`  ${cleaned}`));
-        }
-      }
-    }
-  }
-
-  lines.push(br('╚', '╝'));
-
-  console.log('');
-  for (const l of lines) console.log(`  ${l}`);
-  console.log('');
-
-  if (IS_REPLIT) {
-    console.log('  Quick actions (paste into shell):');
-    console.log(`    ${cmd('npx dual-brain mode cost-saver')}   # switch profile`);
-    console.log(`    ${cmd('npx dual-brain budget 8 25')}       # set limits`);
-    console.log('');
+function launchPanel() {
+  const panelPath = join(resolve(process.cwd()), '.claude', 'hooks', 'control-panel.mjs');
+  const pkgPanel = join(__dirname, 'hooks', 'control-panel.mjs');
+  const panel = existsSync(panelPath) ? panelPath : existsSync(pkgPanel) ? pkgPanel : null;
+  if (panel) {
+    const { status } = spawnSync(process.execPath, [panel], { stdio: 'inherit' });
+    process.exit(status || 0);
   }
 }
 
@@ -797,15 +672,7 @@ function cmdExplain() {
 
 function main() {
   if (subcommand === 'status') {
-    // Launch interactive TUI if available and TTY
-    const panelPath = join(resolve(process.cwd()), '.claude', 'hooks', 'control-panel.mjs');
-    const pkgPanel = join(__dirname, 'hooks', 'control-panel.mjs');
-    const panel = existsSync(panelPath) ? panelPath : existsSync(pkgPanel) ? pkgPanel : null;
-    if (panel && process.stdin.isTTY && process.stdout.isTTY && !process.env.CI) {
-      const { status } = spawnSync(process.execPath, [panel], { stdio: 'inherit' });
-      process.exit(status || 0);
-    }
-    cmdStatus();
+    launchPanel();
     return;
   }
   if (subcommand === 'mode')    { cmdMode();    return; }
@@ -819,13 +686,29 @@ function main() {
     if (jsonOut) {
       console.log(JSON.stringify({ version: VERSION, env, mode }, null, 2));
     } else {
-      printReport(env, mode, null);
+      printReport(env, mode, null, true);
     }
     process.exit(0);
   }
 
+  // Check for replit-tools on Replit
+  if (env.isReplit && !env.hasReplitTools) {
+    console.log('');
+    console.log('  ⚠️  replit-tools not found — recommended for Replit environments.');
+    console.log('  Dual-brain works best alongside replit-tools for persistent auth,');
+    console.log('  session management, and shell integration.');
+    console.log('');
+    console.log(`  Install: ${cmd('npx -y data-tools')}`);
+    console.log('');
+  }
+
   const actions = install(env.workspace, env, mode);
   printReport(env, mode, actions);
+
+  // After install, launch the session manager (interactive TTY only)
+  if (process.stdin.isTTY && process.stdout.isTTY && !process.env.CI) {
+    launchPanel();
+  }
 }
 
 main();
