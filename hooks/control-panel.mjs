@@ -649,6 +649,60 @@ async function showToolsMenu(rl) {
   }
 }
 
+// ─── Submenu: Vibe Workflow ───────────────────────────────────────────────
+
+async function showVibeWorkflow(rl) {
+  console.log('');
+  console.log(`  ${bold('Vibe Workflow')} ${dim('— describe what you want, we orchestrate it')}`);
+  console.log('');
+  console.log(`  Tell us what to build, fix, or change in plain English.`);
+  console.log(`  The wave orchestrator will plan, dispatch agents, test, and review.`);
+  console.log('');
+
+  const utterance = await new Promise(resolve => {
+    rl.question(`  ${bold('What do you want?')} `, resolve);
+  });
+
+  const trimmed = utterance.trim();
+  if (!trimmed || trimmed === 'q') return;
+
+  // Ask dry-run or execute
+  console.log('');
+  const mode = await new Promise(resolve => {
+    rl.question(`  ${bold('[d]')} Dry run (plan only)  ${bold('[g]')} Go (execute)  ${bold('[q]')} Cancel: `, resolve);
+  });
+
+  const modeChoice = mode.trim().toLowerCase();
+  if (modeChoice === 'q' || !modeChoice) return;
+
+  const isDryRun = modeChoice === 'd';
+  const args = isDryRun
+    ? ['hooks/wave-orchestrator.mjs', '--dry-run', trimmed]
+    : ['hooks/wave-orchestrator.mjs', trimmed];
+
+  console.log('');
+  console.log(`  ${isDryRun ? 'Planning' : 'Orchestrating'}...`);
+  console.log('');
+
+  const result = spawnSync('node', args, {
+    cwd: join(__dirname, '..'),
+    stdio: 'inherit',
+    encoding: 'utf8',
+    timeout: 600_000,
+  });
+
+  if (result.status !== 0) {
+    console.log('');
+    console.log(`  ${noColor ? '[!]' : '⚠️'}  Wave orchestrator exited with code ${result.status}`);
+    if (result.error) console.log(`  ${dim(result.error.message)}`);
+  }
+
+  console.log('');
+  const next = await new Promise(resolve => {
+    rl.question(`  Press Enter to return to menu...`, resolve);
+  });
+}
+
 // ─── Menu Renderers ───────────────────────────────────────────────────────
 
 function renderFirstRunMenu(providers) {
@@ -703,6 +757,7 @@ function renderFirstRunMenu(providers) {
 
   // Primary actions
   lines.push(`  ${bold('[n]')} Start new session`);
+  lines.push(`  ${bold('[w]')} Vibe workflow ${dim('(natural language → orchestrated work)')}`);
   lines.push(`  ${bold('[a]')} Auth management`);
   lines.push(`  ${bold('[d]')} Dashboard & diagnostics`);
   lines.push(`  ${bold('[s]')} Skip — just shell`);
@@ -774,6 +829,7 @@ function renderReturningMenu(providers, sessions) {
   lines.push(`  ${bold('[c]')} Continue last session`);
   if (sessions.length > 0) lines.push(`  ${bold('[1-9]')} Resume numbered above`);
   lines.push(`  ${bold('[n]')} New session`);
+  lines.push(`  ${bold('[w]')} Vibe workflow ${dim('(say what you want, we handle the rest)')}`);
 
   // ── Settings
   lines.push('');
@@ -961,6 +1017,11 @@ async function mainLoop() {
       } else {
         runSession('claude', ['-r', s.id], `Resuming session ${s.id.slice(0, 8)}...`);
       }
+      continue;
+    }
+
+    if (choice === 'w') {
+      await showVibeWorkflow(rl);
       continue;
     }
 

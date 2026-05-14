@@ -98,6 +98,19 @@ Auto mode classifies risk from file paths and adjusts routing in real-time:
 
 Casual natural language → structured work. The vibe coding system translates informal requests into properly routed, risk-classified, quality-gated work.
 
+**Wave Orchestrator** — the primary way to run multi-step work:
+```bash
+node .claude/hooks/wave-orchestrator.mjs "fix the login bug and update the nav"
+node .claude/hooks/wave-orchestrator.mjs --dry-run "refactor auth module"
+node .claude/hooks/wave-orchestrator.mjs --resume <manifestId>
+node .claude/hooks/wave-orchestrator.mjs --show <manifestId>
+```
+The wave orchestrator decomposes intent, plans dependency-aware waves, assigns file ownership to prevent conflicts, dispatches agents with transparent routing tables, checkpoints between waves, and supports resume on failure. Every dispatch shows: provider, model, tier, effort, agent type, and routing reason.
+
+Manifests persist to `.dualbrain/manifests/`, checkpoints to `.dualbrain/checkpoints/`.
+
+Also available via the control panel: `[w]` Vibe workflow.
+
 **Intent compiler** — decompose multi-task requests:
 ```bash
 node .claude/hooks/vibe-router.mjs "fix the login bug and also update the nav"
@@ -119,13 +132,31 @@ node .claude/hooks/vibe-memory.mjs --infer                      # preference sug
 ```
 Tracks preferred profile, risk tolerance, active threads, and learns from usage patterns.
 
+## Budget Balancer (Token-Based)
+
+The budget balancer tracks real token usage against actual subscription limits.
+
+**Subscription tiers** (configured in `orchestrator.json` → `subscriptions.*.plan`):
+- Claude: Pro $20, Max x5 $100, Max x20 $200
+- ChatGPT: Plus $20, Pro $100, Pro $200
+
+**Two rolling windows**: 5-hour and 7-day weekly. The higher pressure is the binding constraint.
+
+**Token tracking**: Uses actual `input_tokens + output_tokens` from usage logs when available, falls back to conservative estimates only when logs lack token data.
+
+```bash
+node .claude/hooks/budget-balancer.mjs
+```
+Shows per-provider per-tier pressure with real token counts (e.g., `136.0K/350.0K`), weekly pressure when binding, and routing recommendation with reason.
+
 ## Available Tools
 
+- `node .claude/hooks/wave-orchestrator.mjs "..."` — auto-wave orchestrator (plan, dispatch, test, review)
 - `node .claude/hooks/vibe-router.mjs "..."` — decompose casual requests into structured work
 - `node .claude/hooks/plan-generator.mjs --utterance "..."` — generate execution plans
 - `node .claude/hooks/vibe-memory.mjs` — persistent preferences and work threads
 - `node .claude/hooks/cost-report.mjs` — activity and cost estimates
 - `node .claude/hooks/health-check.mjs` — verify system health
-- `node .claude/hooks/budget-balancer.mjs` — provider balance status
+- `node .claude/hooks/budget-balancer.mjs` — provider balance (token-based, real limits)
 - `node .claude/hooks/decision-ledger.mjs` — routing outcome insights
 - `node .claude/hooks/test-orchestrator.mjs` — run self-tests (40 tests)
