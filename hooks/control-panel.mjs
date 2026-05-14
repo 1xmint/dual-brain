@@ -468,8 +468,14 @@ async function showAuthMenu(rl, providers) {
 
     if (choice === 'j') {
       console.log('');
-      spawnSync('claude', ['login'], { stdio: 'inherit' });
-      providers.claude.authed = true;
+      const r = spawnSync('claude', ['login'], { stdio: 'inherit' });
+      const fresh = detectProviders();
+      providers.claude = fresh.claude;
+      if (providers.claude.authed) {
+        console.log(`  ${green('Claude authenticated.')}`);
+      } else {
+        console.log(`  ${yellow('Claude login did not complete.')} Try again or check your subscription.`);
+      }
       continue;
     }
     if (choice === 'k' && providers.codex.installed) {
@@ -479,7 +485,13 @@ async function showAuthMenu(rl, providers) {
         console.log(`  Open: ${cyan('https://auth.openai.com/codex/device')}`);
         console.log('');
         spawnSync(codexPath.stdout.trim(), ['login', '--device-auth'], { stdio: 'inherit' });
-        providers.codex.authed = true;
+        const fresh = detectProviders();
+        providers.codex = fresh.codex;
+        if (providers.codex.authed) {
+          console.log(`  ${green('Codex authenticated.')}`);
+        } else {
+          console.log(`  ${yellow('Codex login did not complete.')} Try again.`);
+        }
       }
       continue;
     }
@@ -623,9 +635,9 @@ function renderFirstRunMenu(providers) {
   lines.push('');
 
   // Provider status
-  const cStat = providers.claude.authed ? '✅' : providers.claude.installed ? '⚠️' : '❌';
-  const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
-  lines.push(`  🟠 Claude ${cStat}  🟢 Codex ${xStat}`);
+  const cStat = providers.claude.authed ? (noColor ? '[OK]' : '✅') : providers.claude.installed ? (noColor ? '[!]' : '⚠️') : (noColor ? '[X]' : '❌');
+  const xStat = providers.codex.authed ? (noColor ? '[OK]' : '✅') : providers.codex.installed ? (noColor ? '[!]' : '⚠️') : (noColor ? '[X]' : '❌');
+  lines.push(`  ${noColor ? '' : '🟠 '}Claude ${cStat}  ${noColor ? '' : '🟢 '}Codex ${xStat}`);
 
   if (providers.claude.authed && providers.codex.authed) {
     lines.push(`  ${green('Both providers ready — full dual-brain mode')}`);
@@ -667,7 +679,8 @@ function renderFirstRunMenu(providers) {
   lines.push(`  ${bold('[a]')} Auth management`);
   lines.push(`  ${bold('[d]')} Dashboard & diagnostics`);
   lines.push(`  ${bold('[s]')} Skip — just shell`);
-  lines.push(`  ${bold('[?]')} What is Dual Brain?`);
+  lines.push(`  ${dim('Enter = new session · [?] help')}`);
+
   lines.push('');
 
   return lines;
@@ -688,8 +701,8 @@ function renderReturningMenu(providers, sessions) {
   lines.push('');
 
   // Provider status
-  const cStat = providers.claude.authed ? '✅' : '⚠️';
-  const xStat = providers.codex.authed ? '✅' : providers.codex.installed ? '⚠️' : '❌';
+  const cStat = providers.claude.authed ? (noColor ? '[OK]' : '✅') : (noColor ? '[!]' : '⚠️');
+  const xStat = providers.codex.authed ? (noColor ? '[OK]' : '✅') : providers.codex.installed ? (noColor ? '[!]' : '⚠️') : (noColor ? '[X]' : '❌');
   let modeStatus = pf.uiLabel;
   if (profile.name === 'auto') {
     if (balance.total === 0) {
@@ -762,7 +775,12 @@ function renderReturningMenu(providers, sessions) {
   }
 
   lines.push('');
-  lines.push(`  ${bold('[s]')} Exit to shell  ${dim('[?] help')}`);
+  lines.push(`  ${bold('[s]')} Exit to shell`);
+  if (sessions.length > 0) {
+    lines.push(`  ${dim('Enter = continue last · [?] help')}`);
+  } else {
+    lines.push(`  ${dim('Enter = new session · [?] help')}`);
+  }
   lines.push('');
 
   return lines;
@@ -842,6 +860,9 @@ function runSession(cmd, args, label) {
   markLaunched();
   const result = spawnSync(cmd, args, { stdio: 'inherit' });
   console.log('');
+  if (result.status !== 0 && result.status !== null) {
+    console.log(`  ${yellow('Session exited with code ' + result.status + '.')} ${dim('(' + cmd + ' ' + args.join(' ') + ')')}`);
+  }
   console.log('  Returned to Data Tools — Dual Brain.');
   return result.status || 0;
 }
@@ -879,6 +900,15 @@ async function mainLoop() {
         } else {
           runSession('claude', ['-r', s.id, '--dangerously-skip-permissions'], `Resuming session ${s.id.slice(0, 8)}...`);
         }
+      } else if (!providers.claude.authed && !providers.claude.installed) {
+        console.log('');
+        console.log(`  ${yellow('Claude is not installed.')} Install first:`);
+        console.log(`  ${cyan('curl -fsSL https://claude.ai/install.sh | sh')}`);
+        console.log('');
+      } else if (!providers.claude.authed) {
+        console.log('');
+        console.log(`  ${yellow('Claude is not authenticated.')} Press ${bold('[j]')} to sign in first.`);
+        console.log('');
       } else {
         runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session...');
       }
@@ -897,7 +927,13 @@ async function mainLoop() {
     }
 
     if (choice === 'n') {
-      runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session...');
+      if (!providers.claude.authed) {
+        console.log('');
+        console.log(`  ${yellow('Claude needs to be authenticated first.')} Press ${bold('[j]')} to sign in.`);
+        console.log('');
+      } else {
+        runSession('claude', ['--dangerously-skip-permissions'], 'Starting new session...');
+      }
       continue;
     }
 
@@ -923,9 +959,14 @@ async function mainLoop() {
 
     if (choice === 'u') {
       console.log('');
-      console.log('  Updating dual-brain...');
+      console.log('  Updating Dual Brain...');
       console.log('');
-      spawnSync('npx', ['-y', 'dual-brain', 'update'], { stdio: 'inherit', cwd: CWD });
+      const upd = spawnSync('npx', ['-y', 'dual-brain', 'update'], { stdio: 'inherit', cwd: CWD });
+      if (upd.status !== 0) {
+        console.log('');
+        console.log(`  ${yellow('Update failed (exit ' + upd.status + ').')} Try manually: ${cyan('npx -y dual-brain@latest')}`);
+        console.log('');
+      }
       continue;
     }
 

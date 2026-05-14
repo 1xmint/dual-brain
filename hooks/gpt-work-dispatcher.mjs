@@ -27,11 +27,10 @@ const CONFIG_FILE = join(__dirname, '..', 'orchestrator.json');
 const EXECUTE_WORDS = /\b(edit|write|fix|implement|modify|refactor|delete|commit|test|build|run|add|update|create)\b/i;
 const SEARCH_WORDS = /\b(explore|search|find|grep|locate|list\s+files|read[-\s]?only|lookup|scan)\b/i;
 const THINK_WORDS = /\b(plan|design|architect|review|audit|security|code[-\s]?review|threat[-\s]?model|complex[-\s]?debug)\b/i;
-const GPT_TIER_SANDBOX = {
-  search: 'read-only',
-  execute: 'danger-full-access',
-  think: 'read-only',
-};
+const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
+const GPT_TIER_SANDBOX = IS_REPLIT
+  ? { search: 'danger-full-access', execute: 'danger-full-access', think: 'danger-full-access' }
+  : { search: 'read-only', execute: 'danger-full-access', think: 'read-only' };
 const GPT_TIER_PROMPTS = {
   search: 'You are a READ-ONLY search agent. Do NOT edit files.',
   execute: 'You are an execution agent. Edit files directly.',
