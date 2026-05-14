@@ -27,6 +27,7 @@ const COST_LOGGER   = resolve(HOOKS, 'cost-logger.mjs');
 const DUAL_BRAIN    = resolve(HOOKS, 'dual-brain-review.mjs');
 const ORCHESTRATOR  = resolve(HOOKS, '..', 'orchestrator.json');
 const USAGE_JSONL   = resolve(HOOKS, `usage-${new Date().toISOString().slice(0, 10)}.jsonl`);
+const BURST_FILE    = resolve(HOOKS, '.burst-state');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -646,6 +647,84 @@ test('adaptive: cost-logger records Agent errors', () => {
   } finally {
     if (backup !== null) writeFileSync(LEDGER, backup, 'utf8');
     else try { writeFileSync(LEDGER, '', 'utf8'); } catch {}
+  }
+});
+
+// ─── Test 30: enforce-tier: burst detection activates on 3+ agents ─────────
+test('enforce-tier: burst detection activates on 3+ agents', () => {
+  try {
+    // Write burst state at count 2, within window
+    writeFileSync(BURST_FILE, JSON.stringify({ count: 2, window_start: Date.now() }));
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { prompt: `burst activation test ${Date.now()}`, model: 'sonnet' },
+    });
+    const { parsed, status } = run(ENFORCE_TIER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+    if (!parsed) return 'no valid JSON output';
+
+    // Read burst state — count should have incremented to >= 3
+    if (!existsSync(BURST_FILE)) return '.burst-state file was removed unexpectedly';
+    let state;
+    try { state = JSON.parse(readFileSync(BURST_FILE, 'utf8')); } catch (e) { return `.burst-state not valid JSON: ${e.message}`; }
+    if (state.count < 3) return `expected count >= 3, got: ${state.count}`;
+    return true;
+  } finally {
+    try { unlinkSync(BURST_FILE); } catch {}
+  }
+});
+
+// ─── Test 31: enforce-tier: burst mode suppresses duplicate warnings ───────
+test('enforce-tier: burst mode suppresses duplicate warnings', () => {
+  try {
+    // Pre-set burst mode (count=5, active window)
+    writeFileSync(BURST_FILE, JSON.stringify({ count: 5, window_start: Date.now() }));
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { prompt: 'burst duplicate test identical prompt', model: 'sonnet' },
+    });
+
+    // First call — establishes the prompt hash
+    run(ENFORCE_TIER, payload);
+    // Second identical call — in burst mode, duplicate warning should be suppressed or [Wave]-prefixed
+    const { parsed, status } = run(ENFORCE_TIER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+    if (!parsed) return 'no valid JSON output';
+
+    // In burst mode: either no duplicate warning at all, or a [Wave]-prefixed one
+    const msg = parsed.systemMessage || '';
+    const hasDuplicateWarning = msg.toLowerCase().includes('duplicate');
+    if (hasDuplicateWarning && !msg.includes('[Wave]'))
+      return `expected no duplicate warning or [Wave]-prefixed in burst mode, got: ${msg}`;
+    return true;
+  } finally {
+    try { unlinkSync(BURST_FILE); } catch {}
+  }
+});
+
+// ─── Test 32: enforce-tier: non-burst mode still warns on duplicates ───────
+test('enforce-tier: non-burst mode still warns on duplicates', () => {
+  try {
+    // Expire burst state by setting window_start to 0 (well outside 90s window)
+    writeFileSync(BURST_FILE, JSON.stringify({ count: 0, window_start: 0 }));
+    const payload = JSON.stringify({
+      tool_name: 'Agent',
+      tool_input: { prompt: 'non-burst duplicate test identical prompt', model: 'sonnet' },
+    });
+
+    // First call — establishes the prompt hash
+    run(ENFORCE_TIER, payload);
+    // Second identical call — should trigger duplicate warning
+    const { parsed, status } = run(ENFORCE_TIER, payload);
+    if (status !== 0) return `non-zero exit: ${status}`;
+    if (!parsed) return 'no valid JSON output';
+
+    const msg = parsed.systemMessage || '';
+    if (!msg.toLowerCase().includes('duplicate'))
+      return `expected duplicate warning in non-burst mode, got: ${msg || '(empty)'}`;
+    return true;
+  } finally {
+    try { unlinkSync(BURST_FILE); } catch {}
   }
 });
 

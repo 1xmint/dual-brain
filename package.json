@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "3.7.2",
+  "version": "3.8.0",
   "description": "Dual-provider orchestration for Claude Code — tiered routing, budget balancing, and GPT dual-brain review across Claude + OpenAI subscriptions",
   "type": "module",
   "bin": {
@@ -21,6 +21,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/1xmint/dual-brain.git"
+  },
+  "scripts": {
+    "test": "node hooks/test-orchestrator.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

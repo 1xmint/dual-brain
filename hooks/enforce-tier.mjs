@@ -10,6 +10,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = resolve(__dirname, '..', 'orchestrator.json');
 const PROFILE_FILE = resolve(__dirname, '..', 'dual-brain.profile.json');
 const DRIFT_STATE = resolve(__dirname, '.drift-warned');
+const BURST_FILE = resolve(__dirname, '.burst-state');
+
+function detectBurst() {
+  const now = Date.now();
+  let state = { count: 0, window_start: now };
+  try { state = JSON.parse(readFileSync(BURST_FILE, 'utf8')); } catch {}
+  if (now - state.window_start > 90_000) state = { count: 0, window_start: now };
+  state.count++;
+  try { writeFileSync(BURST_FILE, JSON.stringify(state)); } catch {}
+  return state.count >= 3;
+}
 
 function loadProfile() {
   try {
@@ -205,12 +216,23 @@ try {
   // Compute prompt hash early for duplicate detection and logging
   const promptHash = createHash('sha256').update(text).digest('hex').slice(0, 12);
 
+  // Burst detection — suppress noise during wave launches (3+ agents in 90s)
+  const burstMode = detectBurst();
+
   // Check for duplicate agent dispatch before tier classification
   const duplicate = checkDuplicate(promptHash);
   let duplicateWarning = null;
   if (duplicate) {
     const minutesAgo = Math.round((Date.now() - Date.parse(duplicate.timestamp)) / 60000);
-    duplicateWarning = `**[Duplicate Warning]** A similar agent task was dispatched ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago. Reuse the prior result unless the scope changed.`;
+    if (burstMode) {
+      // In burst mode, only warn on exact hash matches (same description+prompt)
+      if (duplicate.prompt_hash === promptHash) {
+        duplicateWarning = `**[Wave] [Duplicate Warning]** A similar agent task was dispatched ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago. Reuse the prior result unless the scope changed.`;
+      }
+      // Otherwise suppress — similar-but-different agents in a wave are expected
+    } else {
+      duplicateWarning = `**[Duplicate Warning]** A similar agent task was dispatched ${minutesAgo} minute${minutesAgo !== 1 ? 's' : ''} ago. Reuse the prior result unless the scope changed.`;
+    }
   }
 
   let config;
@@ -315,7 +337,8 @@ try {
   }
 
   // Compute balance hint now that tier is resolved
-  {
+  // In burst mode, skip balance hints — one hint per wave is enough
+  if (!burstMode) {
     const currentProvider = detectProvider(currentModel);
     if (currentProvider === 'claude') {
       const balance = quickPressureCheck(tier);
