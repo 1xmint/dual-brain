@@ -666,6 +666,92 @@ async function autoSetup(cwd) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// OAuth token auto-refresh
+// ---------------------------------------------------------------------------
+
+/**
+ * Silently refresh the Claude OAuth token before it expires.
+ * Mirrors the approach used by replit-tools/data-tools claude-auth-refresh.sh,
+ * but implemented in JavaScript.
+ *
+ * Returns one of:
+ *   { status: 'valid', hoursRemaining }
+ *   { status: 'refreshed', hoursRemaining }
+ *   { status: 'expiring_no_refresh' | 'expired', hoursRemaining }
+ *   { status: 'no_credentials' | 'parse_error' | 'no_expiry' }
+ *   { status: 'refresh_failed', error }
+ *
+ * @param {string} [cwd]
+ */
+async function autoRefreshToken(cwd) {
+  const home = process.env.HOME || '/root';
+  const credPaths = [
+    join(home, '.claude', '.credentials.json'),
+    join(cwd || '.', '.replit-tools', '.claude-persistent', '.credentials.json'),
+  ];
+
+  let credPath = null;
+  for (const p of credPaths) {
+    if (existsSync(p)) { credPath = p; break; }
+  }
+  if (!credPath) return { status: 'no_credentials' };
+
+  let creds;
+  try {
+    creds = JSON.parse(readFileSync(credPath, 'utf8'));
+  } catch { return { status: 'parse_error' }; }
+
+  const oauth = creds?.claudeAiOauth;
+  if (!oauth?.expiresAt) return { status: 'no_expiry' };
+
+  const now = Date.now();
+  const remainingMs = oauth.expiresAt - now;
+  const remainingHours = Math.floor(remainingMs / 1000 / 60 / 60);
+
+  // More than 2 hours left — no refresh needed
+  if (remainingHours >= 2) {
+    return { status: 'valid', hoursRemaining: remainingHours };
+  }
+
+  // Need refresh
+  if (!oauth.refreshToken) {
+    return { status: remainingMs > 0 ? 'expiring_no_refresh' : 'expired', hoursRemaining: remainingHours };
+  }
+
+  try {
+    const res = await fetch('https://console.anthropic.com/v1/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: oauth.refreshToken,
+        client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+      }),
+    });
+
+    if (!res.ok) return { status: 'refresh_failed', error: `HTTP ${res.status}` };
+
+    const data = await res.json();
+    if (!data.access_token) return { status: 'refresh_failed', error: 'no access_token' };
+
+    // Update credentials
+    const newExpiresAt = now + (data.expires_in * 1000);
+    creds.claudeAiOauth.accessToken = data.access_token;
+    if (data.refresh_token) creds.claudeAiOauth.refreshToken = data.refresh_token;
+    creds.claudeAiOauth.expiresAt = newExpiresAt;
+
+    // Backup then write
+    try { writeFileSync(credPath + '.backup', readFileSync(credPath)); } catch {}
+    writeFileSync(credPath, JSON.stringify(creds));
+
+    const newHours = Math.floor((data.expires_in) / 60 / 60);
+    return { status: 'refreshed', hoursRemaining: newHours };
+  } catch (e) {
+    return { status: 'refresh_failed', error: e.message };
+  }
+}
+
 export {
   loadProfile, saveProfile, ensureProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
@@ -673,5 +759,5 @@ export {
   detectPlans, syncPreferencesToMemory,
   detectAuth, detectEnvironment,
   saveSubscription, listSubscriptions,
-  defaultProfile, autoSetup,
+  defaultProfile, autoSetup, autoRefreshToken,
 };

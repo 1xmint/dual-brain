@@ -685,6 +685,13 @@ async function welcomeScreen(rl, ask) {
       existing.mode = enabledCount >= 2 ? 'dual' : claudeReady ? 'solo-claude' : 'solo-openai';
       saveProfile(existing, { cwd });
     }
+    try {
+      const { ensurePersistence } = await import('../src/session.mjs');
+      const persisted = ensurePersistence(cwd);
+      if (persisted.length > 0) {
+        persisted.forEach(msg => console.log(`  ✅ ${msg}`));
+      }
+    } catch {}
     await cmdInstall(cwd);
     return { next: 'main' };
   }
@@ -849,6 +856,24 @@ async function mainScreen(rl, ask) {
   for (const line of headerLines) {
     console.log(`  ${line}`);
   }
+
+  // Silent OAuth token auto-refresh (like data-tools)
+  try {
+    const { autoRefreshToken } = await import('../src/profile.mjs');
+    const refreshResult = await autoRefreshToken(cwd);
+    if (refreshResult.status === 'refreshed') {
+      console.log(`  🔄 Token auto-refreshed (${refreshResult.hoursRemaining}h remaining)`);
+    }
+  } catch {}
+
+  // Append-only session archive sync (like data-tools)
+  try {
+    const { syncSessionMirror } = await import('../src/session.mjs');
+    const mirror = syncSessionMirror(cwd);
+    if (mirror.copied > 0 || mirror.grew > 0) {
+      console.log(`  ✅ Archive mirror: +${mirror.copied} new, ${mirror.grew} updated`);
+    }
+  } catch {}
 
   // Auto-refresh expired subscriptions
   if (claudeExpired || openaiExpired) {

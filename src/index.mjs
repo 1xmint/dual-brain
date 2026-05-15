@@ -6,14 +6,14 @@
  * orchestrate() convenience function for programmatic use.
  */
 
-export { loadProfile, saveProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel, detectAuth, detectEnvironment, saveSubscription, listSubscriptions } from './profile.mjs';
+export { loadProfile, saveProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel, detectAuth, detectEnvironment, saveSubscription, listSubscriptions, autoRefreshToken } from './profile.mjs';
 export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths } from './detect.mjs';
 export { decideRoute, getModelCapabilities, getAvailableModels, shouldDualBrain, explainDecision } from './decide.mjs';
 export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain } from './dispatch.mjs';
 export { loadPlaybook, listPlaybooks, executePlaybook, createRunArtifact } from './playbook.mjs';
 export { getHealth, markHot, markDegraded, markHealthy, checkCooldown, getProviderScore, recordDispatch, getSessionStats, resetHealth, remainingCooldownMinutes } from './health.mjs';
 export { detectRepo, loadRepoCache, getTestCommand, getLintCommand } from './repo.mjs';
-export { loadSession, saveSession, updateSession, clearSession, formatSessionCard, importReplitSessions, renameSession, pinSession, unpinSession, categorizeSession, getSessionMeta, autoLabel, enrichSessions } from './session.mjs';
+export { loadSession, saveSession, updateSession, clearSession, formatSessionCard, importReplitSessions, renameSession, pinSession, unpinSession, categorizeSession, getSessionMeta, autoLabel, enrichSessions, ensurePersistence, syncSessionMirror } from './session.mjs';
 export { decompose, isSimpleTask, taskGraphToWaves } from './decompose.mjs';
 export { generateBrief, compressPriorResults, listRoles } from './brief.mjs';
 export { redact, redactFiles, isSecretFile } from './redact.mjs';

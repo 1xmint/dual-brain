@@ -10,8 +10,8 @@
  *   formatSessionCard(session, repo, health) → compact status card string (≤5 lines)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, readdirSync, statSync, copyFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -217,6 +217,23 @@ export function formatSessionCard(session, repo, health, profile) {
 // ─── Replit-tools session import ──────────────────────────────────────────────
 
 /**
+ * Returns true if the text looks like a real user prompt (not a status line,
+ * slash command, paste marker, or agent-generated noise).
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isRealPrompt(text) {
+  if (!text || !text.trim()) return false;
+  const t = text.trim();
+  if (/^[✅❌📦🔗⚠️🚀🎉🔧📝]/.test(t)) return false;
+  if (/Claude (history|binary|versions) symlink/.test(t)) return false;
+  if (t.startsWith('# AGENTS.md')) return false;
+  if (t.startsWith('/')) return false;
+  if (t.startsWith('[Pasted')) return false;
+  return true;
+}
+
+/**
  * Human-readable time-ago string from a Unix timestamp (ms).
  * @param {number} timestamp
  * @returns {string}
@@ -299,61 +316,61 @@ export function importReplitSessions(cwd = process.cwd()) {
       sess.entries.push(entry);
       if (entry.timestamp > sess.lastTimestamp) sess.lastTimestamp = entry.timestamp;
 
-      // Find first meaningful user prompt (not slash commands, not login, not pastes)
-      if (!sess.firstPrompt && entry.display
-          && !entry.display.startsWith('/')
-          && !entry.display.startsWith('login')
-          && !entry.display.startsWith('[Pasted')) {
+      // Find first meaningful user prompt
+      if (!sess.firstPrompt && isRealPrompt(entry.display)) {
         sess.firstPrompt = entry.display;
       }
     } catch { continue; }
   }
 
-  // Scan ~/.claude/projects/-home-runner-workspace/ for JSONL files not already in bySession
-  const projectsDir = join(process.env.HOME || '/root', '.claude', 'projects', '-home-runner-workspace');
-  if (existsSync(projectsDir)) {
+  // Also read from the session archive as a fallback (contains cleaned-up sessions)
+  const archivePath = join(cwd, '.replit-tools', '.session-archive', 'claude', 'history.jsonl');
+  let archiveLines = [];
+  try {
+    if (existsSync(archivePath)) {
+      archiveLines = readFileSync(archivePath, 'utf8').split('\n').filter(Boolean);
+    }
+  } catch { /* non-fatal */ }
+
+  for (const line of archiveLines) {
     try {
-      for (const f of readdirSync(projectsDir)) {
-        if (!f.endsWith('.jsonl') || f.startsWith('agent-')) continue;
-        const sessionId = f.replace('.jsonl', '');
-        if (bySession.has(sessionId)) continue;
+      const entry = JSON.parse(line);
+      if (!entry.sessionId) continue;
+      if (bySession.has(entry.sessionId)) continue; // already indexed from main history
 
-        try {
-          const content = readFileSync(join(projectsDir, f), 'utf8');
-          const lines = content.split('\n').filter(Boolean).slice(0, 50);
-          let firstPrompt = null;
-          let lastTimestamp = 0;
+      bySession.set(entry.sessionId, {
+        sessionId: entry.sessionId,
+        project: entry.project,
+        entries: [],
+        firstPrompt: null,
+        lastTimestamp: 0,
+      });
 
-          for (const line of lines) {
-            try {
-              const entry = JSON.parse(line);
-              if (entry.timestamp && entry.timestamp > lastTimestamp) lastTimestamp = entry.timestamp;
-              if (!firstPrompt && entry.type === 'user' && entry.message?.content) {
-                const text = typeof entry.message.content === 'string'
-                  ? entry.message.content
-                  : entry.message.content?.[0]?.text;
-                if (text && !text.startsWith('/') && text.length < 200) {
-                  firstPrompt = text;
-                }
-              }
-            } catch { continue; }
-          }
-
-          if (lastTimestamp === 0) {
-            const stat = statSync(join(projectsDir, f));
-            lastTimestamp = Math.floor(stat.mtimeMs / 1000);
-          }
-
-          bySession.set(sessionId, {
-            sessionId,
-            project: '-home-runner-workspace',
-            entries: [],
-            firstPrompt: firstPrompt || sessionId.slice(0, 8) + '...',
-            lastTimestamp,
-          });
-        } catch { continue; }
+      const sess = bySession.get(entry.sessionId);
+      sess.entries.push(entry);
+      if (entry.timestamp > sess.lastTimestamp) sess.lastTimestamp = entry.timestamp;
+      if (!sess.firstPrompt && isRealPrompt(entry.display)) {
+        sess.firstPrompt = entry.display;
       }
-    } catch { /* non-fatal */ }
+    } catch { continue; }
+  }
+
+  // For archive sessions with multiple entries, finish accumulating them
+  // (second pass for sessions newly added from archive)
+  for (const line of archiveLines) {
+    try {
+      const entry = JSON.parse(line);
+      if (!entry.sessionId) continue;
+      const sess = bySession.get(entry.sessionId);
+      if (!sess) continue;
+      // Already pushed in first pass for new sessions; skip double-push
+      if (sess.entries.includes(entry)) continue;
+      sess.entries.push(entry);
+      if (entry.timestamp > sess.lastTimestamp) sess.lastTimestamp = entry.timestamp;
+      if (!sess.firstPrompt && isRealPrompt(entry.display)) {
+        sess.firstPrompt = entry.display;
+      }
+    } catch { continue; }
   }
 
   // Scan ~/.codex/sessions/ for codex session JSONLs (YYYY/MM/DD tree)
@@ -431,8 +448,22 @@ export function importReplitSessions(cwd = process.cwd()) {
     } catch { /* non-fatal */ }
   }
 
+  // Determine recency window from config (default 48 hours)
+  const configPath = join(cwd, '.replit-tools', 'config.json');
+  let windowHours = 48;
+  try {
+    if (existsSync(configPath)) {
+      const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+      windowHours = cfg.recentWindowHours || 48;
+    }
+  } catch { /* non-fatal */ }
+  const windowMs = windowHours * 60 * 60 * 1000;
+  const cutoff = Date.now() - windowMs;
+
   // Build session list
   for (const [id, sess] of bySession) {
+    // Skip sessions outside the recency window (timestamps are in seconds)
+    if (sess.lastTimestamp * 1000 < cutoff) continue;
     // Derive display name
     let name = sess.firstPrompt;
     if (!name) {
@@ -544,6 +575,169 @@ export function enrichSessions(sessions, cwd = process.cwd()) {
     return new Date(b.lastActive) - new Date(a.lastActive);
   });
   return enriched;
+}
+
+// ─── Persistence settings ─────────────────────────────────────────────────────
+
+/**
+ * Ensure Claude and Codex are configured to retain session history indefinitely.
+ * Mirrors what replit-tools does to prevent session cleanup/deletion.
+ *
+ * @param {string} [cwd]
+ * @returns {string[]} List of changes made (empty if already configured)
+ */
+export function ensurePersistence(cwd = process.cwd()) {
+  const home = process.env.HOME || '/root';
+  const results = [];
+
+  // 1. Claude: set cleanupPeriodDays
+  const claudeSettingsPaths = [
+    join(home, '.claude', 'settings.json'),
+    join(cwd, '.replit-tools', '.claude-persistent', 'settings.json'),
+  ];
+
+  for (const settingsPath of claudeSettingsPaths) {
+    if (!existsSync(settingsPath)) continue;
+    try {
+      let settings = {};
+      try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')); } catch { settings = {}; }
+      if (settings.cleanupPeriodDays !== 365250) {
+        settings.cleanupPeriodDays = 365250;
+        writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+        results.push('Claude cleanupPeriodDays set to 365250');
+      }
+      break; // only update one
+    } catch { continue; }
+  }
+
+  // 2. Codex: set history.persistence and max_bytes
+  const codexConfigPaths = [
+    join(home, '.codex', 'config.toml'),
+    join(cwd, '.replit-tools', '.codex-persistent', 'config.toml'),
+  ];
+
+  for (const configPath of codexConfigPaths) {
+    if (!existsSync(configPath)) continue;
+    try {
+      let content = readFileSync(configPath, 'utf8');
+      let changed = false;
+
+      if (!/\[history\]/.test(content)) {
+        content = content.trimEnd() + '\n\n[history]\npersistence = "save-all"\nmax_bytes = 104857600\n';
+        changed = true;
+      } else {
+        if (!/persistence\s*=/.test(content)) {
+          content = content.replace(/\[history\](\s*)/, '[history]$1persistence = "save-all"\n');
+          changed = true;
+        }
+        if (!/max_bytes\s*=/.test(content)) {
+          content = content.replace(/(persistence\s*=\s*"[^"]*"\s*\n)/, '$1max_bytes = 104857600\n');
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        writeFileSync(configPath, content);
+        results.push('Codex history persistence enabled');
+      }
+      break;
+    } catch { continue; }
+  }
+
+  return results;
+}
+
+// ─── Session archive mirror sync ─────────────────────────────────────────────
+
+/**
+ * Append-only mirror sync for Claude/Codex sessions (matches what replit-tools does).
+ * Files in the mirror only grow — if the source deletes a session, the mirror still has it.
+ *
+ * @param {string} [cwd]
+ * @returns {{ copied: number, grew: number, disabled?: boolean }}
+ */
+export function syncSessionMirror(cwd = process.cwd()) {
+  const home = process.env.HOME || '/root';
+  const mirrorBase = join(cwd, '.replit-tools', '.session-archive');
+
+  // Check if replit-tools exists
+  if (!existsSync(join(cwd, '.replit-tools'))) return { copied: 0, grew: 0 };
+
+  // Check config — mirror can be disabled
+  const configPath = join(cwd, '.replit-tools', 'config.json');
+  try {
+    if (existsSync(configPath)) {
+      const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+      if (cfg.mirror && cfg.mirror.enabled === false) return { copied: 0, grew: 0, disabled: true };
+    }
+  } catch {}
+
+  let totalCopied = 0, totalGrew = 0;
+
+  function syncTree(srcDir, destDir) {
+    if (!existsSync(srcDir)) return;
+
+    function walk(dir) {
+      let entries;
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+      for (const entry of entries) {
+        const srcPath = join(dir, entry.name);
+        const relPath = srcPath.slice(srcDir.length);
+        const destPath = join(destDir, relPath);
+
+        if (entry.isDirectory()) {
+          try { mkdirSync(destPath, { recursive: true }); } catch {}
+          walk(srcPath);
+        } else if (entry.isFile()) {
+          let destSize = 0;
+          try { destSize = statSync(destPath).size; } catch {}
+
+          let srcSize = 0;
+          try { srcSize = statSync(srcPath).size; } catch { continue; }
+
+          // Append-only: only copy if source is larger than mirror
+          if (srcSize > destSize) {
+            try {
+              mkdirSync(dirname(destPath), { recursive: true });
+              copyFileSync(srcPath, destPath);
+              if (destSize === 0) totalCopied++;
+              else totalGrew++;
+            } catch {}
+          }
+        }
+      }
+    }
+
+    walk(srcDir);
+  }
+
+  try { mkdirSync(mirrorBase, { recursive: true }); } catch {}
+
+  // Sync Claude sessions
+  const claudeDir = join(home, '.claude');
+  syncTree(join(claudeDir, 'projects'), join(mirrorBase, 'claude', 'projects'));
+  // Sync history.jsonl as a single file
+  const histSrc = join(claudeDir, 'history.jsonl');
+  const histDest = join(mirrorBase, 'claude', 'history.jsonl');
+  if (existsSync(histSrc)) {
+    try {
+      const srcSize = statSync(histSrc).size;
+      let destSize = 0;
+      try { destSize = statSync(histDest).size; } catch {}
+      if (srcSize > destSize) {
+        mkdirSync(dirname(histDest), { recursive: true });
+        copyFileSync(histSrc, histDest);
+        if (destSize === 0) totalCopied++; else totalGrew++;
+      }
+    } catch {}
+  }
+
+  // Sync Codex sessions
+  const codexDir = join(home, '.codex');
+  syncTree(join(codexDir, 'sessions'), join(mirrorBase, 'codex', 'sessions'));
+
+  return { copied: totalCopied, grew: totalGrew };
 }
 
 // ─── CLI (direct invocation) ──────────────────────────────────────────────────
