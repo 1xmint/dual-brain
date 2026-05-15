@@ -177,14 +177,22 @@ async function detectAuth() {
   // --- Claude: check .dualbrain/auth.json (before env var) ---
   if (!results.claude.found) {
     const storedAuth = loadAuthKeys();
-    if (storedAuth.claude?.key) {
-      const expired = storedAuth.claude.expiresAt && new Date(storedAuth.claude.expiresAt) <= new Date();
-      if (!expired) {
-        results.claude.found   = true;
-        results.claude.source  = '.dualbrain/auth.json';
-        results.claude.masked  = _maskCredential(storedAuth.claude.key);
-        process.env.ANTHROPIC_API_KEY = storedAuth.claude.key;
-      }
+    const claudeKeys = storedAuth.claude || [];
+    const activeClaudeKey = getActiveKey('claude');
+    if (activeClaudeKey) {
+      results.claude.found   = true;
+      results.claude.source  = '.dualbrain/auth.json';
+      results.claude.masked  = _maskCredential(activeClaudeKey.key);
+      process.env.ANTHROPIC_API_KEY = activeClaudeKey.key;
+      // Report all keys with masked values
+      const now = new Date();
+      results.claude.keys = claudeKeys.map(k => ({
+        label:   k.label || 'unlabeled',
+        masked:  _maskCredential(k.key),
+        priority: k.priority || 99,
+        enabled: k.enabled !== false,
+        expired: !!(k.expiresAt && new Date(k.expiresAt) <= now),
+      }));
     }
   }
 
@@ -225,14 +233,22 @@ async function detectAuth() {
   // --- OpenAI: check .dualbrain/auth.json (before env var) ---
   if (!results.openai.found) {
     const storedAuth = loadAuthKeys();
-    if (storedAuth.openai?.key) {
-      const expired = storedAuth.openai.expiresAt && new Date(storedAuth.openai.expiresAt) <= new Date();
-      if (!expired) {
-        results.openai.found   = true;
-        results.openai.source  = '.dualbrain/auth.json';
-        results.openai.masked  = _maskCredential(storedAuth.openai.key);
-        process.env.OPENAI_API_KEY = storedAuth.openai.key;
-      }
+    const openaiKeys = storedAuth.openai || [];
+    const activeOpenaiKey = getActiveKey('openai');
+    if (activeOpenaiKey) {
+      results.openai.found   = true;
+      results.openai.source  = '.dualbrain/auth.json';
+      results.openai.masked  = _maskCredential(activeOpenaiKey.key);
+      process.env.OPENAI_API_KEY = activeOpenaiKey.key;
+      // Report all keys with masked values
+      const now = new Date();
+      results.openai.keys = openaiKeys.map(k => ({
+        label:   k.label || 'unlabeled',
+        masked:  _maskCredential(k.key),
+        priority: k.priority || 99,
+        enabled: k.enabled !== false,
+        expired: !!(k.expiresAt && new Date(k.expiresAt) <= now),
+      }));
     }
   }
 
@@ -252,14 +268,82 @@ async function detectAuth() {
 
 const AUTH_FILE = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'auth.json');
 
+/**
+ * Migrate old single-key format to array format transparently.
+ * Old: { claude: { key, savedAt, expiresAt }, openai: { ... } }
+ * New: { claude: [{ key, label, savedAt, expiresAt, priority, enabled }], openai: [...] }
+ * @param {object} auth
+ * @returns {object} migrated auth object
+ */
+function _migrateAuthFormat(auth) {
+  const migrated = {};
+  for (const [provider, value] of Object.entries(auth)) {
+    if (Array.isArray(value)) {
+      // Already new format
+      migrated[provider] = value;
+    } else if (value && typeof value === 'object' && value.key) {
+      // Old single-key format — wrap in array
+      migrated[provider] = [
+        {
+          key: value.key,
+          label: 'primary',
+          savedAt: value.savedAt || new Date().toISOString(),
+          expiresAt: value.expiresAt || null,
+          priority: 1,
+          enabled: true,
+        },
+      ];
+    } else {
+      migrated[provider] = value;
+    }
+  }
+  return migrated;
+}
+
+/**
+ * Load .dualbrain/auth.json, migrating old single-key format to array format.
+ * @param {string} [cwd]
+ * @returns {object} auth object with arrays per provider
+ */
 function loadAuthKeys(cwd) {
   try {
-    return JSON.parse(readFileSync(AUTH_FILE(cwd), 'utf8'));
+    const raw = JSON.parse(readFileSync(AUTH_FILE(cwd), 'utf8'));
+    return _migrateAuthFormat(raw);
   } catch {
     return {};
   }
 }
 
+/**
+ * Returns the highest-priority, non-expired, enabled key for a provider.
+ * @param {string} provider
+ * @param {string} [cwd]
+ * @returns {{ key: string, label: string, priority: number, enabled: boolean, expiresAt: string|null }|null}
+ */
+function getActiveKey(provider, cwd) {
+  const auth = loadAuthKeys(cwd);
+  const keys = auth[provider] || [];
+  const now = new Date();
+
+  const valid = keys
+    .filter(k => k.enabled)
+    .filter(k => !k.expiresAt || new Date(k.expiresAt) > now)
+    .sort((a, b) => (a.priority || 99) - (b.priority || 99));
+
+  return valid[0] || null;
+}
+
+/**
+ * Append a new key to the provider's array in .dualbrain/auth.json.
+ * Injects the highest-priority valid key into process.env.
+ * @param {string} provider
+ * @param {string} key
+ * @param {object} [opts]
+ * @param {string} [opts.label]
+ * @param {string|null} [opts.expiresAt]
+ * @param {number} [opts.priority]
+ * @param {string} [opts.cwd]
+ */
 function saveAuthKey(provider, key, opts = {}) {
   const cwd = opts.cwd || process.cwd();
   const authFile = AUTH_FILE(cwd);
@@ -267,16 +351,97 @@ function saveAuthKey(provider, key, opts = {}) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const auth = loadAuthKeys(cwd);
-  auth[provider] = {
+  if (!Array.isArray(auth[provider])) auth[provider] = [];
+
+  // Determine default label and priority
+  const existing = auth[provider];
+  const defaultLabel = `key-${existing.length + 1}`;
+  const defaultPriority = existing.length > 0
+    ? Math.max(...existing.map(k => k.priority || 1)) + 1
+    : 1;
+
+  existing.push({
     key,
+    label: opts.label || defaultLabel,
     savedAt: new Date().toISOString(),
     expiresAt: opts.expiresAt || null,
-  };
+    priority: opts.priority !== undefined ? opts.priority : defaultPriority,
+    enabled: true,
+  });
+
   writeFileSync(authFile, JSON.stringify(auth, null, 2));
 
-  // Inject into process.env for this session so dispatch can use it
-  if (provider === 'claude') process.env.ANTHROPIC_API_KEY = key;
-  if (provider === 'openai') process.env.OPENAI_API_KEY = key;
+  // Inject highest-priority valid key into process.env for this session
+  const active = getActiveKey(provider, cwd);
+  if (active) {
+    if (provider === 'claude') process.env.ANTHROPIC_API_KEY = active.key;
+    if (provider === 'openai') process.env.OPENAI_API_KEY = active.key;
+  }
+}
+
+/**
+ * Remove a key by index from the provider's array.
+ * @param {string} provider
+ * @param {number} index
+ * @param {string} [cwd]
+ */
+function removeAuthKey(provider, index, cwd) {
+  const authFile = AUTH_FILE(cwd);
+  const dir = dirname(authFile);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  const auth = loadAuthKeys(cwd);
+  if (!Array.isArray(auth[provider])) return;
+
+  auth[provider].splice(index, 1);
+  writeFileSync(authFile, JSON.stringify(auth, null, 2));
+}
+
+/**
+ * Mark a key as enabled:false (used during failover when a key hits rate limits).
+ * @param {string} provider
+ * @param {number} index
+ * @param {string} [cwd]
+ */
+function disableKey(provider, index, cwd) {
+  const authFile = AUTH_FILE(cwd);
+  const dir = dirname(authFile);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  const auth = loadAuthKeys(cwd);
+  if (!Array.isArray(auth[provider]) || !auth[provider][index]) return;
+
+  auth[provider][index].enabled = false;
+  writeFileSync(authFile, JSON.stringify(auth, null, 2));
+}
+
+/**
+ * Called when the active key hits a rate limit. Disables the current active key
+ * temporarily and returns the next valid key, or null if none available.
+ * @param {string} provider
+ * @param {string} [cwd]
+ * @returns {{ key: string, label: string, priority: number, enabled: boolean, expiresAt: string|null }|null}
+ */
+function rotateToNextKey(provider, cwd) {
+  const auth = loadAuthKeys(cwd);
+  const keys = auth[provider] || [];
+  const now = new Date();
+
+  // Find current active key index
+  const sortedValid = keys
+    .map((k, i) => ({ ...k, _idx: i }))
+    .filter(k => k.enabled)
+    .filter(k => !k.expiresAt || new Date(k.expiresAt) > now)
+    .sort((a, b) => (a.priority || 99) - (b.priority || 99));
+
+  if (sortedValid.length === 0) return null;
+
+  // Disable the current active key
+  const currentIdx = sortedValid[0]._idx;
+  disableKey(provider, currentIdx, cwd);
+
+  // Reload and get the next valid key
+  return getActiveKey(provider, cwd);
 }
 
 /**
@@ -298,7 +463,9 @@ async function setupAuth(rl) {
     if (choice === '1') {
       const key = (await ask('Paste your Anthropic API key: ')).trim();
       if (key && (key.startsWith('sk-ant-') || key.startsWith('sk-'))) {
-        const expiryStr = (await ask('Set key expiry? (enter days, or press Enter to skip)\n> ')).trim();
+        const labelStr = (await ask('Label for this key (or Enter for "key-1"): ')).trim();
+        const label = labelStr || undefined;
+        const expiryStr = (await ask('Set expiry in days (or Enter to skip): ')).trim();
         let expiresAt = null;
         if (expiryStr && /^\d+$/.test(expiryStr)) {
           const d = new Date();
@@ -306,7 +473,7 @@ async function setupAuth(rl) {
           expiresAt = d.toISOString();
           console.log(`✓ Key expires in ${expiryStr} days (${d.toISOString().slice(0, 10)})`);
         }
-        saveAuthKey('claude', key, { expiresAt });
+        saveAuthKey('claude', key, { expiresAt, label });
         console.log('✓ Claude API key saved');
       } else {
         console.log('Invalid key format. Expected sk-ant-... or sk-...');
@@ -326,7 +493,9 @@ async function setupAuth(rl) {
     if (choice === '1') {
       const key = (await ask('Paste your OpenAI API key: ')).trim();
       if (key && key.startsWith('sk-')) {
-        const expiryStr = (await ask('Set key expiry? (enter days, or press Enter to skip)\n> ')).trim();
+        const labelStr = (await ask('Label for this key (or Enter for "key-1"): ')).trim();
+        const label = labelStr || undefined;
+        const expiryStr = (await ask('Set expiry in days (or Enter to skip): ')).trim();
         let expiresAt = null;
         if (expiryStr && /^\d+$/.test(expiryStr)) {
           const d = new Date();
@@ -334,7 +503,7 @@ async function setupAuth(rl) {
           expiresAt = d.toISOString();
           console.log(`✓ Key expires in ${expiryStr} days (${d.toISOString().slice(0, 10)})`);
         }
-        saveAuthKey('openai', key, { expiresAt });
+        saveAuthKey('openai', key, { expiresAt, label });
         console.log('✓ OpenAI API key saved');
       } else {
         console.log('Invalid key format. Expected sk-...');
@@ -714,4 +883,5 @@ export {
   detectPlans, syncPreferencesToMemory,
   detectAuth, detectEnvironment,
   setupAuth, saveAuthKey, loadAuthKeys,
+  getActiveKey, removeAuthKey, disableKey, rotateToNextKey,
 };

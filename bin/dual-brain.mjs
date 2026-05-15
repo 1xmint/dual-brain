@@ -29,6 +29,8 @@ import { dispatch, detectRuntime, dispatchDualBrain } from '../src/dispatch.mjs'
 import { loadRepoCache } from '../src/repo.mjs';
 import { loadSession, saveSession, formatSessionCard } from '../src/session.mjs';
 
+import { box, bar, badge, menu, separator } from '../src/tui.mjs';
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -61,13 +63,11 @@ Commands:
   remember "preference"     Save a project-scoped preference
   forget "preference"       Remove a preference by fuzzy match
 
-Interactive REPL (entered after init or npx dual-brain with no args):
-  <task description>        Dispatch a task directly
-  go <task>                 Same as dual-brain go
-  status / auth / init      Run commands without exiting
-  auth setup                Re-run API key setup
-  help                      Show this help
-  exit / quit / q           Exit the REPL
+Interactive mode (entered with no args on a TTY):
+  Shows dashboard screen with menu-driven navigation.
+  [g] Go — dispatch a task
+  [s] Status, [p] Profile, [a] Auth, [d] Diagnostics
+  [c] Command mode (REPL), [q] Exit
 
 Options:
   --version                 Print version
@@ -84,7 +84,7 @@ Options:
  */
 function printAuthTable(auth) {
   const W = 55; // inner width (wide enough for source labels)
-  const bar = '═'.repeat(W);
+  const hbar = '═'.repeat(W);
   const pad = (s) => {
     const visible = s.replace(/[̀-ͯ]/g, ''); // strip combining chars for length
     return s + ' '.repeat(Math.max(0, W - visible.length));
@@ -104,52 +104,14 @@ function printAuthTable(auth) {
     ? `           ${auth.openai.masked}`
     : `           run: dual-brain auth setup`;
 
-  console.log(`╔${bar}╗`);
+  console.log(`╔${hbar}╗`);
   console.log(`║${pad('  Auth Status')}║`);
-  console.log(`╠${bar}╣`);
+  console.log(`╠${hbar}╣`);
   console.log(`║${pad(claudeLine1)}║`);
   console.log(`║${pad(claudeLine2)}║`);
   console.log(`║${pad(openaiLine1)}║`);
   console.log(`║${pad(openaiLine2)}║`);
-  console.log(`╚${bar}╝`);
-}
-
-// ─── Card command (default) ──────────────────────────────────────────────────
-
-async function cmdCard() {
-  const cwd = process.cwd();
-  const { homedir } = await import('node:os');
-  const globalPath  = join(homedir(), '.config', 'dual-brain', 'profile.json');
-  const projectPath = join(cwd, '.dualbrain', 'profile.json');
-
-  if (!existsSync(projectPath) && !existsSync(globalPath)) {
-    console.log('Welcome to dual-brain! Let\'s set up your profile.\n');
-    await cmdInit();
-    return;
-  }
-
-  const repo    = loadRepoCache(cwd);
-  const session = loadSession(cwd);
-  const health  = getHealth(cwd);
-  const card    = formatSessionCard(session, repo, health);
-  console.log(card);
-
-  // Auth status warnings (non-blocking)
-  const auth = await detectAuth();
-  const warnings = [];
-  if (!auth.claude.found) warnings.push('Claude auth not found — run: dual-brain auth setup');
-  if (!auth.openai.found) warnings.push('OpenAI auth not found — run: dual-brain auth setup');
-  if (warnings.length > 0) {
-    console.log('\nAuth warnings:');
-    for (const w of warnings) console.log(`  ⚠  ${w}`);
-  }
-
-  // Environment info
-  const env = detectEnvironment();
-  if (env.isReplit || env.hasReplitTools) {
-    const envLabel = env.hasReplitTools ? 'Replit + replit-tools' : 'Replit';
-    console.log(`\nRuntime: ${envLabel}`);
-  }
+  console.log(`╚${hbar}╝`);
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
@@ -521,63 +483,514 @@ function cmdForget(text) {
   console.log('Preference removed (if matched).');
 }
 
-// ─── Interactive REPL ────────────────────────────────────────────────────────
+// ─── Screen helpers ───────────────────────────────────────────────────────────
 
-async function startRepl(rl) {
-  // rl may have been created by cmdCard/cmdInit — reuse it.
-  // If not provided, create a fresh one.
-  const rlOwned = !rl;
-  if (!rl) rl = createInterface({ input: process.stdin, output: process.stdout });
+function profileExists() {
+  const { homedir } = { homedir: () => process.env.HOME || '/root' };
+  const cwd = process.cwd();
+  const globalPath  = join(process.env.HOME || '/root', '.config', 'dual-brain', 'profile.json');
+  const projectPath = join(cwd, '.dualbrain', 'profile.json');
+  return existsSync(projectPath) || existsSync(globalPath);
+}
 
-  console.log('\nType a task or command. Type "help" for commands, "exit" to quit.\n');
+// ─── Screen: welcomeScreen ────────────────────────────────────────────────────
 
-  const prompt = () => {
-    rl.question('dual-brain> ', async (input) => {
-      const line = input.trim();
-      if (!line) { prompt(); return; }
+async function welcomeScreen(rl, ask) {
+  const version = readVersion();
+  console.log(box(`🧠 Dual-Brain v${version} — First-Time Setup`, [
+    'Let\'s configure your AI providers.',
+  ]));
+  console.log('');
 
-      if (line === 'exit' || line === 'quit' || line === 'q') {
-        if (rlOwned) rl.close();
-        return;
-      }
+  // --- Claude provider selection ---
+  console.log(separator('Claude (Anthropic)'));
+  console.log('  (1) $20/mo Pro');
+  console.log('  (2) $100/mo Max 5x');
+  console.log('  (3) $200/mo Max 20x');
+  console.log('  (4) API key only');
+  console.log('  (5) Skip — don\'t use Claude');
+  const claudeChoice = (await ask('> ')).trim();
 
-      try {
-        if (line === 'help') {
-          printHelp();
-        } else if (line === 'status') {
-          await cmdStatus([]);
-        } else if (line === 'auth setup' || line === 'auth-setup') {
-          await cmdAuthSetup(rl);
-        } else if (line === 'auth') {
-          await cmdAuth([], rl);
-        } else if (line.startsWith('go ')) {
-          await cmdGo(line.slice(3).trim().split(/\s+/));
-        } else if (line.startsWith('remember ')) {
-          cmdRemember(line.slice(9).trim());
-        } else if (line.startsWith('forget ')) {
-          cmdForget(line.slice(7).trim());
-        } else if (line.startsWith('hot ')) {
-          cmdHot(line.slice(4).trim());
-        } else if (line.startsWith('cool ')) {
-          cmdCool(line.slice(5).trim());
-        } else if (line === 'init') {
-          await cmdInit(rl);
-        } else {
-          // Treat as a task description → go
-          await cmdGo([line]);
-        }
-      } catch (e) {
-        process.stderr.write(`Error: ${e.message}\n`);
-      }
+  let claudePlan = null;
+  let claudeEnabled = true;
+  if (claudeChoice === '1') { claudePlan = 'pro'; }
+  else if (claudeChoice === '2') { claudePlan = 'max5'; }
+  else if (claudeChoice === '3') { claudePlan = 'max20'; }
+  else if (claudeChoice === '4') {
+    claudePlan = 'api';
+    // Ask for API key immediately
+    const key = (await ask('Paste your Anthropic API key: ')).trim();
+    if (key) {
+      const { saveAuthKey } = await import('../src/profile.mjs').then(m => m).catch(() => ({}));
+      // Inline: set env var for this session, profile will persist
+      process.env.ANTHROPIC_API_KEY = key;
+      console.log('✓ Claude API key set for this session');
+    }
+  } else if (claudeChoice === '5') {
+    claudeEnabled = false;
+    claudePlan = null;
+  } else {
+    // Default: pro
+    claudePlan = 'pro';
+  }
 
-      prompt(); // loop back
-    });
+  console.log('');
+
+  // --- OpenAI provider selection ---
+  console.log(separator('OpenAI (ChatGPT/Codex)'));
+  console.log('  (1) $20/mo Plus');
+  console.log('  (2) $100/mo Pro');
+  console.log('  (3) $200/mo Pro (higher limits)');
+  console.log('  (4) API key only');
+  console.log('  (5) Skip — don\'t use OpenAI');
+  const openaiChoice = (await ask('> ')).trim();
+
+  let openaiPlan = null;
+  let openaiEnabled = true;
+  if (openaiChoice === '1') { openaiPlan = 'plus'; }
+  else if (openaiChoice === '2') { openaiPlan = 'pro'; }
+  else if (openaiChoice === '3') { openaiPlan = 'pro200'; }
+  else if (openaiChoice === '4') {
+    openaiPlan = 'api';
+    const key = (await ask('Paste your OpenAI API key: ')).trim();
+    if (key) {
+      process.env.OPENAI_API_KEY = key;
+      console.log('✓ OpenAI API key set for this session');
+    }
+  } else if (openaiChoice === '5') {
+    openaiEnabled = false;
+    openaiPlan = null;
+  } else {
+    openaiPlan = 'plus';
+  }
+
+  console.log('');
+
+  // --- Optimization mode ---
+  console.log(separator('Optimization'));
+  console.log('  (1) Save usage — prefer cheaper models');
+  console.log('  (2) Balanced — best model per tier (recommended)');
+  console.log('  (3) Quality first — always use best available');
+  const modeChoice = (await ask('> ')).trim();
+
+  let mode = 'balanced';
+  if (modeChoice === '1') { mode = 'cost-saver'; }
+  else if (modeChoice === '3') { mode = 'quality-first'; }
+
+  // --- Build and save profile ---
+  const cwd = process.cwd();
+  const existingProfile = loadProfile(cwd);
+  const profile = {
+    ...existingProfile,
+    mode,
+    providers: {
+      claude: {
+        enabled: claudeEnabled,
+        plan: claudePlan || 'pro',
+      },
+      openai: {
+        enabled: openaiEnabled,
+        plan: openaiPlan || 'plus',
+      },
+    },
   };
+  saveProfile(profile, { cwd });
 
-  prompt();
+  // --- Detect environment for summary ---
+  const env = detectEnvironment();
+  const auth = await detectAuth();
 
-  // Return a promise that resolves when rl closes (exit/quit)
-  return new Promise(resolve => rl.on('close', resolve));
+  const summaryLines = [
+    `Mode: ${mode}`,
+    claudeEnabled
+      ? `Claude: ${claudePlan} plan ${auth.claude.found ? badge('connected') : badge('missing')}`
+      : 'Claude: disabled',
+    openaiEnabled
+      ? `OpenAI: ${openaiPlan} plan ${auth.openai.found ? badge('connected') : badge('missing')}`
+      : 'OpenAI: disabled',
+    env.isReplit ? '🌀 Replit environment detected' : '',
+  ].filter(Boolean);
+
+  console.log('');
+  console.log(box('Setup Complete', summaryLines));
+  console.log('');
+
+  return { next: 'dashboard' };
+}
+
+// ─── Screen: dashboardScreen ──────────────────────────────────────────────────
+
+async function dashboardScreen(rl, ask) {
+  const cwd = process.cwd();
+  const version = readVersion();
+  const profile = loadProfile(cwd);
+  const auth = await detectAuth();
+  const env = detectEnvironment();
+
+  // Build status lines for box
+  const claudeStatus = auth.claude.found ? `🟢 Claude ${badge('connected')}` : `🔴 Claude ${badge('missing')}`;
+  const openaiStatus = auth.openai.found ? `🟢 OpenAI ${badge('connected')}` : `🔴 OpenAI ${badge('missing')}`;
+  const envLabel = env.hasReplitTools ? 'Replit + replit-tools' : env.isReplit ? 'Replit' : 'local';
+
+  // Enforcement check
+  let guardCount = 0;
+  try {
+    const settingsFile = join(cwd, '.claude', 'settings.json');
+    if (existsSync(settingsFile)) {
+      const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
+      const preToolUse = settings?.hooks?.PreToolUse ?? [];
+      const guardCmd  = 'bash .claude/hooks/head-guard.sh';
+      const tierCmd   = 'node .claude/hooks/enforce-tier.mjs';
+      const hasEdit   = preToolUse.some(e => e.matcher === 'Edit'   && e.hooks?.some(h => h.command === guardCmd));
+      const hasWrite  = preToolUse.some(e => e.matcher === 'Write'  && e.hooks?.some(h => h.command === guardCmd));
+      const hasBash   = preToolUse.some(e => e.matcher === 'Bash'   && e.hooks?.some(h => h.command === guardCmd));
+      const hasAgent  = preToolUse.some(e => e.matcher === 'Agent'  && e.hooks?.some(h => h.command === tierCmd));
+      guardCount = [hasEdit, hasWrite, hasBash, hasAgent].filter(Boolean).length;
+    }
+  } catch { /* ignore */ }
+
+  const authSummary = (auth.claude.found && auth.openai.found)
+    ? 'both providers connected'
+    : auth.claude.found
+      ? 'Claude connected, OpenAI missing'
+      : auth.openai.found
+        ? 'OpenAI connected, Claude missing'
+        : 'no providers connected';
+
+  const dashLines = [
+    `${claudeStatus}   ${openaiStatus}`,
+    `🌀 ${envLabel}`,
+    '',
+    `✓ Profile: ${profile.mode} · ${profile.providers?.claude?.enabled && profile.providers?.openai?.enabled ? 'dual' : 'solo'} mode`,
+    `✓ Enforcement: ${guardCount} guards active`,
+    `✓ Auth: ${authSummary}`,
+  ];
+
+  console.log(box(`🧠 Dual-Brain v${version}`, dashLines));
+  console.log('');
+  console.log(menu([
+    { key: 'g', label: 'Go — dispatch a task',        section: 'Actions' },
+    { key: 's', label: 'Status — detailed provider info', section: 'Actions' },
+    { key: 'p', label: 'Profile & preferences',        section: 'Settings' },
+    { key: 'a', label: 'Auth management',              section: 'Settings' },
+    { key: 'd', label: 'Diagnostics',                  section: 'Settings' },
+    { key: 'c', label: 'Command mode (REPL)',           section: 'Session' },
+    { key: 'q', label: 'Exit',                         section: 'Session' },
+  ]));
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === 'g') {
+    const taskDesc = (await ask('  Task description: ')).trim();
+    if (taskDesc) {
+      try {
+        await cmdGo([taskDesc]);
+      } catch (e) {
+        console.error(`Error: ${e.message}`);
+      }
+    }
+    return { next: 'dashboard' };
+  }
+
+  if (choice === 's') {
+    await cmdStatus([]);
+    await ask('\n  Press Enter to return to dashboard...');
+    return { next: 'dashboard' };
+  }
+
+  if (choice === 'p') { return { next: 'profile' }; }
+  if (choice === 'a') { return { next: 'auth' }; }
+  if (choice === 'd') { return { next: 'diagnostics' }; }
+  if (choice === 'c') { return { next: 'repl' }; }
+  if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
+
+  // Unknown choice — stay on dashboard
+  return { next: 'dashboard' };
+}
+
+// ─── Screen: authScreen ───────────────────────────────────────────────────────
+
+async function authScreen(rl, ask) {
+  const auth = await detectAuth();
+
+  const authLines = [
+    'Claude:',
+  ];
+
+  if (auth.claude.found) {
+    authLines.push(`  source: ${auth.claude.source}  ${badge('connected')}`);
+    authLines.push(`  key:    ${auth.claude.masked}`);
+  } else {
+    authLines.push(`  not configured  ${badge('missing')}`);
+  }
+
+  authLines.push('');
+  authLines.push('OpenAI:');
+
+  if (auth.openai.found) {
+    authLines.push(`  source: ${auth.openai.source}  ${badge('connected')}`);
+    authLines.push(`  key:    ${auth.openai.masked}`);
+  } else {
+    authLines.push(`  not configured  ${badge('missing')}`);
+  }
+
+  console.log(box('🔑 Auth Management', authLines));
+  console.log('');
+  console.log(menu([
+    { key: 'a', label: 'Add API key',        section: '' },
+    { key: 't', label: 'Test keys',          section: '' },
+    { key: 'b', label: 'Back to dashboard',  section: '' },
+  ]));
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === 'a') {
+    await setupAuth(rl);
+    return { next: 'auth' }; // refresh
+  }
+
+  if (choice === 't') {
+    console.log('\n  Testing auth...');
+    const authNow = await detectAuth();
+    console.log(`  Claude: ${authNow.claude.found ? 'OK — ' + authNow.claude.source : 'NOT FOUND'}`);
+    console.log(`  OpenAI: ${authNow.openai.found ? 'OK — ' + authNow.openai.source : 'NOT FOUND'}`);
+    await ask('\n  Press Enter to continue...');
+    return { next: 'auth' };
+  }
+
+  if (choice === 'b' || choice === 'back') { return { next: 'dashboard' }; }
+
+  return { next: 'auth' };
+}
+
+// ─── Screen: profileScreen ────────────────────────────────────────────────────
+
+async function profileScreen(rl, ask) {
+  const cwd = process.cwd();
+  const profile = loadProfile(cwd);
+  const prefs = getActivePreferences(cwd);
+
+  const profileLines = [
+    `Mode:          ${profile.mode}`,
+    `Claude plan:   ${profile.providers?.claude?.enabled ? (profile.providers?.claude?.plan || 'n/a') : 'disabled'}`,
+    `OpenAI plan:   ${profile.providers?.openai?.enabled ? (profile.providers?.openai?.plan || 'n/a') : 'disabled'}`,
+    `Solo brain:    ${isSoloBrain(profile) ? 'yes' : 'no'}`,
+    `Head model:    ${getHeadModel(profile)}`,
+    '',
+    `Preferences (${prefs.length}):`,
+    ...prefs.map(p => `  [${p.scope}] ${p.text}`),
+    ...(prefs.length === 0 ? ['  (none)'] : []),
+  ];
+
+  console.log(box('Profile & Preferences', profileLines));
+  console.log('');
+  console.log(menu([
+    { key: '1', label: 'Switch to cost-saver mode',   section: 'Mode' },
+    { key: '2', label: 'Switch to balanced mode',     section: 'Mode' },
+    { key: '3', label: 'Switch to quality-first mode',section: 'Mode' },
+    { key: 'r', label: 'Add preference',              section: 'Preferences' },
+    { key: 'f', label: 'Remove preference',           section: 'Preferences' },
+    { key: 'b', label: 'Back to dashboard',           section: '' },
+  ]));
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === '1' || choice === '2' || choice === '3') {
+    const modeMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
+    profile.mode = modeMap[choice];
+    saveProfile(profile, { cwd });
+    console.log(`  Mode set to: ${profile.mode}`);
+    return { next: 'profile' };
+  }
+
+  if (choice === 'r') {
+    const text = (await ask('  Preference text: ')).trim();
+    if (text) cmdRemember(text);
+    return { next: 'profile' };
+  }
+
+  if (choice === 'f') {
+    const text = (await ask('  Preference to remove (fuzzy): ')).trim();
+    if (text) cmdForget(text);
+    return { next: 'profile' };
+  }
+
+  if (choice === 'b' || choice === 'back') { return { next: 'dashboard' }; }
+
+  return { next: 'profile' };
+}
+
+// ─── Screen: diagnosticsScreen ────────────────────────────────────────────────
+
+async function diagnosticsScreen(rl, ask) {
+  const cwd = process.cwd();
+  const version = readVersion();
+  const env = detectEnvironment();
+  const rt = await detectRuntime();
+
+  // Enforcement check
+  let guardCount = 0;
+  let guardDetails = 'NOT INSTALLED';
+  try {
+    const settingsFile = join(cwd, '.claude', 'settings.json');
+    if (existsSync(settingsFile)) {
+      const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
+      const preToolUse = settings?.hooks?.PreToolUse ?? [];
+      const guardCmd  = 'bash .claude/hooks/head-guard.sh';
+      const tierCmd   = 'node .claude/hooks/enforce-tier.mjs';
+      const hasEdit   = preToolUse.some(e => e.matcher === 'Edit'   && e.hooks?.some(h => h.command === guardCmd));
+      const hasWrite  = preToolUse.some(e => e.matcher === 'Write'  && e.hooks?.some(h => h.command === guardCmd));
+      const hasBash   = preToolUse.some(e => e.matcher === 'Bash'   && e.hooks?.some(h => h.command === guardCmd));
+      const hasAgent  = preToolUse.some(e => e.matcher === 'Agent'  && e.hooks?.some(h => h.command === tierCmd));
+      guardCount = [hasEdit, hasWrite, hasBash, hasAgent].filter(Boolean).length;
+      guardDetails = guardCount === 4
+        ? `${guardCount}/4 guards active (Edit, Write, Bash, Agent)`
+        : `${guardCount}/4 guards — run: dual-brain install`;
+    }
+  } catch { guardDetails = 'unknown (could not read settings)'; }
+
+  // Hook health: check if hook files exist
+  const hooksDir = join(cwd, '.claude', 'hooks');
+  const expectedHooks = [
+    'head-guard.sh', 'enforce-tier.mjs', 'budget-balancer.mjs',
+    'session-report.mjs', 'quality-gate.mjs', 'health-check.mjs',
+  ];
+  const hookStatus = expectedHooks.map(h => {
+    const present = existsSync(join(hooksDir, h));
+    return `  ${present ? '✓' : '✗'} ${h}`;
+  });
+
+  const diagLines = [
+    `Version:       ${version}`,
+    `Enforcement:   ${guardDetails}`,
+    '',
+    'Environment:',
+    `  Replit:      ${env.isReplit ? 'yes' : 'no'}`,
+    `  replit-tools:${env.hasReplitTools ? 'yes' : 'no'}`,
+    `  CI:          ${env.isCI ? 'yes' : 'no'}`,
+    '',
+    'Runtime:',
+    `  claude CLI:  ${rt.claudeAvailable ? 'available' : 'not found'}`,
+    `  codex CLI:   ${rt.codexAvailable  ? 'available' : 'not found'}`,
+    `  runtime:     ${rt.runtime}`,
+    '',
+    'Hook files:',
+    ...hookStatus,
+  ];
+
+  console.log(box('Diagnostics', diagLines));
+  console.log('');
+  console.log(menu([
+    { key: 'h', label: 'Run health check',    section: '' },
+    { key: 'i', label: 'Install hooks',       section: '' },
+    { key: 'b', label: 'Back to dashboard',  section: '' },
+  ]));
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === 'h') {
+    const hookScript = join(cwd, '.claude', 'hooks', 'health-check.mjs');
+    if (existsSync(hookScript)) {
+      try {
+        execSync(`node "${hookScript}"`, { stdio: 'inherit', cwd });
+      } catch { /* hook exits non-zero on issues — already printed output */ }
+    } else {
+      console.log('  health-check.mjs not found — run: dual-brain install');
+    }
+    await ask('\n  Press Enter to continue...');
+    return { next: 'diagnostics' };
+  }
+
+  if (choice === 'i') {
+    await cmdInstall();
+    return { next: 'diagnostics' };
+  }
+
+  if (choice === 'b' || choice === 'back') { return { next: 'dashboard' }; }
+
+  return { next: 'diagnostics' };
+}
+
+// ─── Screen: replScreen ───────────────────────────────────────────────────────
+
+async function replScreen(rl, ask) {
+  console.log('\nCommand mode. Type a task or command. "help" for commands, "back" to return.\n');
+
+  while (true) {
+    const input = (await ask('dual-brain> ')).trim();
+    const line = input;
+
+    if (!line) continue;
+
+    if (line === 'back' || line === 'exit' || line === 'quit' || line === 'q') {
+      return { next: 'dashboard' };
+    }
+
+    try {
+      if (line === 'help') {
+        printHelp();
+      } else if (line === 'status') {
+        await cmdStatus([]);
+      } else if (line === 'auth setup' || line === 'auth-setup') {
+        await cmdAuthSetup(rl);
+      } else if (line === 'auth') {
+        await cmdAuth([], rl);
+      } else if (line.startsWith('go ')) {
+        await cmdGo(line.slice(3).trim().split(/\s+/));
+      } else if (line.startsWith('remember ')) {
+        cmdRemember(line.slice(9).trim());
+      } else if (line.startsWith('forget ')) {
+        cmdForget(line.slice(7).trim());
+      } else if (line.startsWith('hot ')) {
+        cmdHot(line.slice(4).trim());
+      } else if (line.startsWith('cool ')) {
+        cmdCool(line.slice(5).trim());
+      } else if (line === 'init') {
+        await cmdInit(rl);
+      } else if (line === 'dashboard') {
+        return { next: 'dashboard' };
+      } else {
+        // Treat as a task description → go
+        await cmdGo([line]);
+      }
+    } catch (e) {
+      process.stderr.write(`Error: ${e.message}\n`);
+    }
+  }
+}
+
+// ─── Screen state machine ─────────────────────────────────────────────────────
+
+const SCREENS = {
+  welcome:     welcomeScreen,
+  dashboard:   dashboardScreen,
+  auth:        authScreen,
+  profile:     profileScreen,
+  diagnostics: diagnosticsScreen,
+  repl:        replScreen,
+};
+
+async function runScreens(startScreen = 'dashboard') {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise(res => rl.question(q, res));
+
+  let current = startScreen;
+  while (current && current !== 'exit') {
+    const screen = SCREENS[current];
+    if (!screen) break;
+    try {
+      const result = await screen(rl, ask);
+      current = result?.next || 'exit';
+    } catch (e) {
+      console.error(`Error: ${e.message}`);
+      current = 'dashboard'; // recover to dashboard on error
+    }
+  }
+  rl.close();
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -589,21 +1002,30 @@ async function main() {
   if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
   if (cmd === '--version' || cmd === '-v') { console.log(readVersion()); return; }
 
-  // Interactive-only commands: enter REPL after completing (only when TTY)
+  // Interactive-only commands: enter screen state machine (only when TTY)
   const isInteractive = process.stdin.isTTY;
 
   if (!cmd) {
-    await cmdCard();
-    if (isInteractive) await startRepl();
+    if (isInteractive) {
+      // Check if first-run (no profile) → welcome screen, else dashboard
+      const startScreen = profileExists() ? 'dashboard' : 'welcome';
+      await runScreens(startScreen);
+    } else {
+      // Non-TTY: print status card and exit
+      const cwd = process.cwd();
+      const repo    = loadRepoCache(cwd);
+      const session = loadSession(cwd);
+      const health  = getHealth(cwd);
+      const card    = formatSessionCard(session, repo, health);
+      console.log(card);
+    }
     return;
   }
 
   if (cmd === 'init') {
     if (isInteractive) {
-      // Create the shared rl upfront so init wizard and REPL share it
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
-      await cmdInit(rl);
-      await startRepl(rl);
+      // Run welcome wizard then dashboard
+      await runScreens('welcome');
     } else {
       await cmdInit();
     }
