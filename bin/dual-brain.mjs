@@ -734,13 +734,11 @@ async function dashboardScreen(rl, ask) {
   }
 
   console.log(menu([
-    { key: 'g', label: 'Go — dispatch a task',        section: 'Actions' },
-    { key: 's', label: 'Status — detailed provider info', section: 'Actions' },
+    { key: 's', label: 'Status — detailed provider info', section: 'Info' },
     { key: 'p', label: 'Profile & preferences',        section: 'Settings' },
     { key: 'a', label: 'Auth management',              section: 'Settings' },
-    { key: 'd', label: 'Diagnostics',                  section: 'Settings' },
-    { key: 'c', label: 'Command mode (REPL)',           section: 'Session' },
-    { key: 'q', label: 'Exit',                         section: 'Session' },
+    { key: 'd', label: 'Diagnostics & repair',         section: 'Settings' },
+    { key: 'q', label: 'Exit to shell',                section: '' },
   ]));
   console.log('');
 
@@ -752,18 +750,6 @@ async function dashboardScreen(rl, ask) {
     return { next: 'session-detail', session: recentSessions[numChoice - 1] };
   }
 
-  if (choice === 'g') {
-    const taskDesc = (await ask('  Task description: ')).trim();
-    if (taskDesc) {
-      try {
-        await cmdGo([taskDesc]);
-      } catch (e) {
-        console.error(`Error: ${e.message}`);
-      }
-    }
-    return { next: 'dashboard' };
-  }
-
   if (choice === 's') {
     await cmdStatus([]);
     await ask('\n  Press Enter to return to dashboard...');
@@ -773,7 +759,6 @@ async function dashboardScreen(rl, ask) {
   if (choice === 'p') { return { next: 'profile' }; }
   if (choice === 'a') { return { next: 'auth' }; }
   if (choice === 'd') { return { next: 'diagnostics' }; }
-  if (choice === 'c') { return { next: 'repl' }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
   // Unknown choice — stay on dashboard

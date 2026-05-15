@@ -229,11 +229,32 @@ function timeAgo(timestamp) {
  */
 export function importReplitSessions(cwd = process.cwd()) {
   const sessions = [];
-  const replitBase = join(cwd, '.replit-tools', '.claude-persistent');
+
+  // Check multiple possible locations for replit-tools
+  const candidates = [
+    join(cwd, '.replit-tools', '.claude-persistent'),
+    join('/home/runner/workspace', '.replit-tools', '.claude-persistent'),
+  ];
+  // Deduplicate
+  const seen = new Set();
+  const replitBases = candidates.filter(p => {
+    const norm = p.replace(/\/+$/, '');
+    if (seen.has(norm)) return false;
+    seen.add(norm);
+    return true;
+  });
+
+  let replitBase = null;
+  for (const candidate of replitBases) {
+    if (existsSync(join(candidate, 'history.jsonl'))) {
+      replitBase = candidate;
+      break;
+    }
+  }
+  if (!replitBase) return sessions;
 
   // Read history.jsonl
   const historyPath = join(replitBase, 'history.jsonl');
-  if (!existsSync(historyPath)) return sessions;
 
   let lines;
   try {
@@ -272,7 +293,9 @@ export function importReplitSessions(cwd = process.cwd()) {
   }
 
   // Read active terminal sessions
-  const sessionsDir = join(cwd, '.replit-tools', '.claude-sessions');
+  // Use the same root as replitBase (go up one level from .claude-persistent)
+  const replitRoot = join(replitBase, '..');
+  const sessionsDir = join(replitRoot, '..', '.claude-sessions');
   const activeSessionIds = new Set();
   if (existsSync(sessionsDir)) {
     try {
