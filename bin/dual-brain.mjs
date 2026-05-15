@@ -1483,7 +1483,7 @@ function detectInterruptedWork(sessions, cwd) {
  * Shows: "● Claude  ● OpenAI  ⚖️  Balanced"
  * Uses ANSI color codes for the dots — no dollar amounts or usage bars.
  */
-function buildProviderStatusLine(profile, auth) {
+function buildProviderStatusLine(profile, auth, maxWidth = 54) {
   const GREEN = '[32m●[0m';
   const RED   = '[31m●[0m';
 
@@ -1499,18 +1499,27 @@ function buildProviderStatusLine(profile, auth) {
     'solo-openai':   '⚡ Fast',
   };
   const WORK_STYLE_TIPS = {
-    'auto':          'adapts routing based on task risk',
-    'cost-saver':    'cheaper models, skips GPT for non-critical',
-    'balanced':      'smart routing, reviews on important changes',
-    'quality-first': 'dual-brain for medium+ risk, stricter reviews',
+    'auto':          'adapts routing by task risk',
+    'cost-saver':    'single model, minimal reviews',
+    'balanced':      'smart routing, reviews when needed',
+    'quality-first': 'dual-brain on everything important',
     'solo-claude':   'Claude only, no GPT dispatch',
     'solo-openai':   'OpenAI only, no Claude dispatch',
   };
   const bias  = profile?.bias || profile?.mode || 'balanced';
   const label = WORK_STYLE_LABELS[bias] || '⚖️  Balanced';
-  const tip   = WORK_STYLE_TIPS[bias]   || 'smart routing, reviews on important changes';
+  const fullTip = WORK_STYLE_TIPS[bias] || 'smart routing, reviews when needed';
 
-  return `${claudeDot} Claude  ${openaiDot} OpenAI  ${label}[2m — ${tip}[0m`;
+  // Trim tip to fit within box width (measure visible chars: strip ANSI + variation selectors)
+  const labelPlain = label.replace(/[︀-️]/g, '').replace(/[[0-9;]*m/g, '');
+  const prefixLen = ('● Claude  ● OpenAI  ' + labelPlain + ' — ').length;
+  const tipMax = maxWidth - prefixLen;
+  const tip = tipMax >= 6
+    ? (fullTip.length > tipMax ? fullTip.slice(0, tipMax - 1) + '…' : fullTip)
+    : '';
+
+  const suffix = tip ? `[2m — ${tip}[0m` : '';
+  return `${claudeDot} Claude  ${openaiDot} OpenAI  ${label}${suffix}`;
 }
 
 /**
@@ -1698,7 +1707,7 @@ async function mainScreen(rl, ask) {
   }
 
   // ── Status section ────────────────────────────────────────────────────────
-  const providerLine = buildProviderStatusLine(profile, auth);
+  const providerLine = buildProviderStatusLine(profile, auth, W);
 
   const statusRows = [row(providerLine)];
   if (dtVersion) {
@@ -1795,10 +1804,6 @@ async function mainScreen(rl, ask) {
       if (sess.isActive) {
         badges.push('\x1b[32m[active]\x1b[0m');
         badgeVisible.push('[active]'.length);
-      }
-      if (sess.source === 'replit-tools' || sess.source === 'data-tools') {
-        badges.push('\x1b[36m[dt]\x1b[0m');
-        badgeVisible.push('[dt]'.length);
       }
       const ageMs = sess.lastActive ? Date.now() - new Date(sess.lastActive).getTime() : 0;
       if (ageMs > 7 * 24 * 3600 * 1000) {
