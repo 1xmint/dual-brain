@@ -1,0 +1,58 @@
+{
+  "_version": 1,
+  "_description": "Specialist agent registry. Tier (search/execute/think) is orthogonal to specialist selection.",
+  "specialists": {
+    "python": {
+      "name": "Python",
+      "prompt_file": "python.md",
+      "triggers": {
+        "extensions": [".py", ".pyx", ".pyi", ".pyw"],
+        "keywords": ["python", "pip", "venv", "virtualenv", "pytest", "django", "flask", "fastapi", "asyncio", "typing"]
+      },
+      "tier_bias": null,
+      "description": "Python stdlib, typing, async/await, packaging, testing"
+    },
+    "typescript": {
+      "name": "TypeScript",
+      "prompt_file": "typescript.md",
+      "triggers": {
+        "extensions": [".ts", ".tsx", ".mts", ".cts"],
+        "keywords": ["typescript", "tsc", "generics", "interface", "type", "zod", "prisma", "next", "react", "node"]
+      },
+      "tier_bias": null,
+      "description": "TypeScript type system, generics, module resolution, React/Node patterns"
+    },
+    "html": {
+      "name": "HTML/CSS",
+      "prompt_file": "html.md",
+      "triggers": {
+        "extensions": [".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg"],
+        "keywords": ["html", "css", "accessibility", "a11y", "aria", "responsive", "flexbox", "grid", "tailwind", "semantic"]
+      },
+      "tier_bias": null,
+      "description": "HTML semantics, CSS layout, accessibility, responsive design"
+    },
+    "linux": {
+      "name": "Linux/DevOps",
+      "prompt_file": "linux.md",
+      "triggers": {
+        "extensions": [".sh", ".bash", ".zsh", ".conf", ".service", ".yml", ".yaml", ".toml", ".nginx", ".dockerfile"],
+        "keywords": ["linux", "bash", "shell", "systemd", "nginx", "docker", "ssh", "cron", "firewall", "vps", "deploy", "chmod", "apt"]
+      },
+      "tier_bias": null,
+      "description": "Linux sysadmin, shell scripting, Docker, nginx, systemd, security hardening"
+    },
+    "security": {
+      "name": "Security",
+      "prompt_file": "security.md",
+      "triggers": {
+        "extensions": [],
+        "keywords": ["auth", "oauth", "jwt", "token", "credential", "secret", "encrypt", "vulnerability", "vulnerabilities", "audit", "cve", "owasp", "xss", "csrf", "injection", "permission", "rbac"]
+      },
+      "tier_bias": "think",
+      "description": "Auth, crypto, OWASP top 10, threat modeling, secure code review"
+    }
+  },
+  "fallback": "generic",
+  "auto_routing": false
+}

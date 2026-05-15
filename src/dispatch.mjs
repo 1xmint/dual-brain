@@ -8,7 +8,7 @@
 //          isInsideClaude, buildNativeDispatch, normalizeResult
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, appendFileSync, existsSync } from 'node:fs';
+import { mkdirSync, appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -19,6 +19,52 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
 const TIER_TIMEOUT_MS = { search: 60_000, execute: 120_000, think: 180_000 };
 const CLAUDE_MODEL_IDS = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
+
+// ─── Specialist prompt loader ─────────────────────────────────────────────────
+
+const SPECIALISTS_DIR = join(__dirname, '..', 'agents', 'specialists');
+
+/**
+ * Load specialist registry from agents/specialists/registry.json.
+ * Returns null if registry is missing or malformed.
+ * @returns {object|null}
+ */
+function _loadSpecialistRegistry() {
+  try {
+    const raw = readFileSync(join(SPECIALISTS_DIR, 'registry.json'), 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read agents/specialists/_base.md and agents/specialists/{specialist}.md,
+ * concatenate them (base first, specialist second). Falls back gracefully:
+ * - If base is missing, only specialist content is returned.
+ * - If specialist file is missing, only base content is returned.
+ * - If both are missing, returns an empty string.
+ *
+ * @param {string} specialist  Specialist key (e.g. 'python', 'security')
+ * @returns {string}
+ */
+function loadSpecialistPrompt(specialist) {
+  if (!specialist || specialist === 'generic') return '';
+
+  const tryRead = (filePath) => {
+    try { return readFileSync(filePath, 'utf8').trim(); } catch { return ''; }
+  };
+
+  const registry = _loadSpecialistRegistry();
+  const entry = registry?.specialists?.[specialist];
+  const promptFile = entry?.prompt_file ?? `${specialist}.md`;
+
+  const base       = tryRead(join(SPECIALISTS_DIR, '_base.md'));
+  const specific   = tryRead(join(SPECIALISTS_DIR, promptFile));
+
+  const parts = [base, specific].filter(Boolean);
+  return parts.join('\n\n');
+}
 
 // ─── Median dispatch time tracker (in-process, for slow-response detection) ──
 // Rolling window of recent dispatch durations keyed by "provider:modelClass"
@@ -561,7 +607,8 @@ function _prependDispatchMarker(prompt) {
 
 // ─── Main dispatch ────────────────────────────────────────────────────────────
 async function dispatch(input = {}) {
-  const { decision = {}, files = [], cwd = process.cwd(), dryRun = false } = input;
+  const { files = [], cwd = process.cwd(), dryRun = false } = input;
+  let decision = input.decision ?? {};
   let { prompt } = input;
 
   if (!prompt) throw new Error('prompt is required');
@@ -572,6 +619,30 @@ async function dispatch(input = {}) {
   // Stamp the prompt with the dispatch marker so enforce-tier.mjs can recognise
   // that this agent call came through the official pipeline.
   prompt = _prependDispatchMarker(prompt);
+
+  // ── Specialist prompt injection ──────────────────────────────────────────────
+  const specialist = decision.specialist && decision.specialist !== 'generic'
+    ? decision.specialist
+    : null;
+
+  if (specialist) {
+    const specialistPrompt = loadSpecialistPrompt(specialist);
+    if (specialistPrompt) {
+      prompt = `${specialistPrompt}\n\n---\n\n${prompt}`;
+      process.stderr.write(`[dual-brain] specialist: ${specialist}\n`);
+    }
+
+    // Apply tier_bias from registry if decision didn't already pin a tier
+    if (!decision.tier) {
+      const registry = _loadSpecialistRegistry();
+      const tierBias = registry?.specialists?.[specialist]?.tier_bias;
+      if (tierBias) {
+        decision = { ...decision, tier: tierBias };
+        process.stderr.write(`[dual-brain] specialist tier_bias applied: ${tierBias}\n`);
+      }
+    }
+  }
+  // ── End specialist injection ─────────────────────────────────────────────────
 
   const tier     = decision.tier ?? 'execute';
   const timeoutMs = TIER_TIMEOUT_MS[tier] ?? 120_000;
@@ -651,6 +722,7 @@ async function dispatch(input = {}) {
         status:        'dry-run',
         provider:      effectiveProvider,
         model:         effectiveModel,
+        specialist:    specialist ?? 'generic',
         command,
         nativeDispatch: nativeDescriptor,
         exitCode:      null,
@@ -712,6 +784,7 @@ async function dispatch(input = {}) {
       type:          'native-agent',
       provider:      effectiveProvider,
       model:         effectiveModel,
+      specialist:    specialist ?? 'generic',
       command,
       nativeDispatch: nativeDescriptor,
       exitCode,
@@ -725,7 +798,7 @@ async function dispatch(input = {}) {
   const command = buildCommand(effectiveDecision, prompt, files, cwd);
 
   if (dryRun) {
-    return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, command, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
+    return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, specialist: specialist ?? 'generic', command, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
   }
 
   // Record this dispatch against the budget
@@ -778,6 +851,7 @@ async function dispatch(input = {}) {
     status:     success ? 'completed' : 'failed',
     provider:   effectiveProvider,
     model:      effectiveModel,
+    specialist: specialist ?? 'generic',
     command,
     exitCode,
     summary,
@@ -865,4 +939,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   }
 }
 
-export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget, isInsideClaude, buildNativeDispatch, normalizeResult };
+export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget, isInsideClaude, buildNativeDispatch, normalizeResult, loadSpecialistPrompt };

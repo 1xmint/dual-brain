@@ -4,7 +4,7 @@
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
-    "dual-brain": "./bin/dual-brain.mjs"
+    "dual-brain": "bin/dual-brain.mjs"
   },
   "main": "./src/index.mjs",
   "exports": {
@@ -35,7 +35,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/1xmint/dual-brain.git"
+    "url": "git+https://github.com/1xmint/dual-brain.git"
   },
   "scripts": {
     "test": "node .claude/hooks/test-orchestrator.mjs",
@@ -94,7 +94,6 @@
     "mcp-server/README.md",
     "install.mjs",
     "orchestrator.json",
-    "hookify.*.local.md",
     "review-rules.md",
     "AGENTS.md",
     "CLAUDE.md",

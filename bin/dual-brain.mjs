@@ -169,6 +169,14 @@ Commands:
   remember "preference"     Save a project-scoped preference
   forget "preference"       Remove a preference by fuzzy match
   search "keyword"           Search across all sessions
+  specialists               List available specialist agents with descriptions
+  python "task"             Force Python specialist for the task
+  typescript "task"         Force TypeScript specialist for the task
+  html "task"               Force HTML/CSS specialist for the task
+  linux "task"              Force Linux/DevOps specialist for the task
+  security "task"           Force Security specialist for the task
+    --dry-run               (specialist commands) Show routing without executing
+    --files a,b             (specialist commands) Provide file context
   shell-hook                Output bash snippet to add dual-brain to your shell
                             Usage: dual-brain shell-hook >> ~/.bashrc
 
@@ -2546,6 +2554,151 @@ async function runScreens(startScreen = 'dashboard') {
   rl.close();
 }
 
+// ─── Specialist commands ──────────────────────────────────────────────────────
+
+const SPECIALIST_DEFAULTS = {
+  python:     { name: 'Python',       description: 'Python stdlib, typing, async' },
+  typescript: { name: 'TypeScript',   description: 'TS type system, React, Node' },
+  html:       { name: 'HTML/CSS',     description: 'Semantic HTML, CSS, accessibility' },
+  linux:      { name: 'Linux/DevOps', description: 'Sysadmin, Docker, nginx, shell' },
+  security:   { name: 'Security',     description: 'Auth, crypto, OWASP, threat model' },
+};
+
+function loadSpecialistRegistry() {
+  const regPath = join(__dirname, '..', 'agents', 'specialists', 'registry.json');
+  try {
+    const raw = JSON.parse(readFileSync(regPath, 'utf8'));
+    const out = {};
+    for (const [key, val] of Object.entries(raw.specialists || {})) {
+      out[key] = { name: val.name || key, description: val.description || '' };
+    }
+    return out;
+  } catch {
+    return SPECIALIST_DEFAULTS;
+  }
+}
+
+function cmdSpecialists() {
+  const registry = loadSpecialistRegistry();
+  const entries  = Object.entries(registry);
+
+  // Build padded rows
+  const rows = entries.map(([key, val]) => {
+    const k = key.padEnd(12);
+    const d = val.description;
+    return `│  ${k}${d}`;
+  });
+
+  // Find longest row for width
+  const inner = Math.max(
+    ...rows.map(r => r.length),
+    '│ Usage: dual-brain python "task description"     │'.length - 2,
+  );
+  const width = inner + 1; // account for trailing │
+
+  function pad(str) {
+    return str + ' '.repeat(Math.max(0, width - str.length - 1)) + '│';
+  }
+
+  const top    = '┌' + '─'.repeat(width - 1) + '┐';
+  const title  = pad('│ 🎯 Available Specialists');
+  const divTop = '├' + '─'.repeat(width - 1) + '┤';
+  const divBot = '├' + '─'.repeat(width - 1) + '┤';
+  const bot    = '└' + '─'.repeat(width - 1) + '┘';
+
+  console.log(top);
+  console.log(title);
+  console.log(divTop);
+  for (const row of rows) console.log(pad(row));
+  console.log(divBot);
+  console.log(pad('│ Usage: dual-brain python "task description"'));
+  console.log(pad('│ Auto-routing: off (use dual-brain go for auto)'));
+  console.log(bot);
+}
+
+async function cmdSpecialistGo(specialist, args) {
+  const dryRun   = args.includes('--dry-run');
+  const verbose  = args.includes('--verbose') || args.includes('-v');
+  const filesRaw = flag(args, '--files');
+  const files    = filesRaw && typeof filesRaw === 'string'
+    ? filesRaw.split(',').map(f => f.trim()).filter(Boolean)
+    : [];
+
+  const prompt = args.find(a => !a.startsWith('--') && !a.startsWith('-') && a !== (filesRaw ?? ''));
+  if (!prompt) err(`Usage: dual-brain ${specialist} "task description" [--dry-run] [--files a,b]`);
+
+  const cwd     = process.cwd();
+  const profile = await ensureProfile(cwd);
+  const detection = detectTask({ prompt, files });
+
+  // Override specialist, preserve everything else
+  detection.specialist = specialist;
+
+  console.log(`[specialist: ${specialist}] ${detection.explanation}`);
+
+  if (verbose) {
+    vtrace(`Intent: ${detection.intent} | Risk: ${detection.risk} | Complexity: ${detection.complexity} | Effort: ${detection.effort ?? 'n/a'}`);
+    vtrace(`Tier: ${detection.tier} | Specialist override: ${specialist}`);
+  }
+
+  const decision = decideRoute({ profile, detection, cwd });
+
+  if (verbose) {
+    const modelLabel = decision.effort ? `${decision.model} (${decision.effort})` : decision.model;
+    vtrace(`Model selection: ${modelLabel}`);
+    vtrace(`Dual-brain: ${decision.dualBrain ? 'yes' : 'no'}`);
+  }
+
+  console.log(`  specialist : ${specialist}`);
+  console.log(`  provider   : ${decision.provider}`);
+  console.log(`  model      : ${decision.model}${decision.effort ? ' (' + decision.effort + ')' : ''}`);
+  console.log(`  tier       : ${decision.tier}`);
+  console.log(`  dual-brain : ${decision.dualBrain ? 'yes' : 'no'}`);
+  console.log(`  reason     : ${decision.explanation}`);
+
+  if (dryRun) {
+    console.log('\n(dry-run — not executing)');
+    return;
+  }
+
+  console.log('\nDispatching...');
+  let result;
+  if (decision.dualBrain) {
+    result = await dispatchDualBrain({ decision, prompt, files, cwd });
+    console.log(`\nConsensus: ${result.consensus}`);
+    if (result.claude?.summary) console.log(`Claude : ${result.claude.summary}`);
+    if (result.openai?.summary) console.log(`OpenAI : ${result.openai.summary}`);
+    saveSession({
+      objective:    prompt,
+      branch:       null,
+      filesChanged: files,
+      commandsRun:  [`dual-brain ${specialist} "${prompt}"`],
+      lastResult:   { status: 'success', summary: result.consensus || 'dual-brain complete' },
+      provider:     decision.provider,
+      nextAction:   null,
+    }, cwd);
+  } else {
+    result = await dispatch({ decision, prompt, files, cwd });
+    const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
+    console.log(`\n${statusLine} in ${(result.durationMs / 1000).toFixed(1)}s`);
+    if (result.summary) console.log(result.summary);
+    if (result.error)   process.stderr.write(`${result.error}\n`);
+    saveSession({
+      objective:    prompt,
+      branch:       null,
+      filesChanged: files,
+      commandsRun:  [`dual-brain ${specialist} "${prompt}"`],
+      lastResult:   {
+        status:  result.status === 'completed' ? 'success' : 'failure',
+        summary: result.summary || (result.status === 'completed' ? 'completed' : `exit ${result.exitCode}`),
+      },
+      provider:     decision.provider,
+      nextAction:   null,
+    }, cwd);
+    if (result.status !== 'completed') process.exit(1);
+  }
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 async function main() {
@@ -2632,6 +2785,11 @@ async function main() {
   if (cmd === 'remember')    { cmdRemember(args[1]); return; }
   if (cmd === 'forget')      { cmdForget(args[1]); return; }
   if (cmd === 'break-glass') { cmdBreakGlass(args.slice(1).join(' ')); return; }
+
+  if (cmd === 'specialists') { cmdSpecialists(); return; }
+
+  const SPECIALIST_CMDS = new Set(Object.keys(loadSpecialistRegistry()));
+  if (SPECIALIST_CMDS.has(cmd)) { await cmdSpecialistGo(cmd, args.slice(1)); return; }
 
   if (cmd === 'search') {
     const query = args.slice(1).filter(a => !a.startsWith('--')).join(' ');

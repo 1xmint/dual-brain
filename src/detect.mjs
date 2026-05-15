@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // detect.mjs — Task detection for dual-brain. Self-contained, no internal imports.
-// Exports: detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths
+// Exports: detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths, classifySpecialist
+
+import { readFileSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Intent definitions ────────────────────────────────────────────────────────
 
@@ -118,9 +124,12 @@ function estimateComplexity({ prompt, fileCount = 0, risk = 'low', intent = 'edi
 }
 
 /** Map intent + risk + complexity → tier (think / search / execute). */
-function inferTier({ intent, risk, complexity, effort }) {
+function inferTier({ intent, risk, complexity, effort, specialistTierBias }) {
   const thinkIntents = ['architecture', 'security', 'planning', 'compare', 'review'];
   if (thinkIntents.includes(intent) || risk === 'critical') return 'think';
+
+  // Specialist tier_bias can elevate to think before general tier logic
+  if (specialistTierBias === 'think') return 'think';
 
   const searchIntents = ['search', 'explain', 'format'];
   if (searchIntents.includes(intent) && effort === 'low') return 'search';
@@ -193,10 +202,15 @@ function detectTask(input) {
     effort = 'high';
   }
 
-  // 6. Tier
-  const tier = inferTier({ intent, risk, complexity, effort });
+  // 6. Specialist
+  const specialistResult = classifySpecialist(prompt, files);
+  const specialistDef = SPECIALIST_DEFS[specialistResult.specialist] || null;
+  const specialistTierBias = specialistDef?.tier_bias || null;
 
-  // 7. Explanation
+  // 7. Tier
+  const tier = inferTier({ intent, risk, complexity, effort, specialistTierBias });
+
+  // 8. Explanation
   const explanation = buildExplanation({ intent, risk, complexity, fileCount, priorFailures });
 
   return {
@@ -210,7 +224,97 @@ function detectTask(input) {
     designImpact,
     requiresWrite: requiresWrite(intent),
     explanation,
+    specialist: specialistResult,
   };
+}
+
+// ─── Specialist registry ──────────────────────────────────────────────────────
+
+const SPECIALIST_REGISTRY_PATH = resolve(__dirname, '../agents/specialists/registry.json');
+
+const DEFAULT_SPECIALISTS = {
+  python:     { triggers: { extensions: ['.py', '.pyx', '.pyi'], keywords: ['python', 'pip', 'pytest', 'django', 'flask', 'asyncio'] } },
+  typescript: { triggers: { extensions: ['.ts', '.tsx', '.mts'], keywords: ['typescript', 'tsc', 'generics', 'react', 'next', 'node'] } },
+  html:       { triggers: { extensions: ['.html', '.css', '.scss', '.svg'], keywords: ['html', 'css', 'accessibility', 'a11y', 'aria', 'responsive', 'tailwind'] } },
+  linux:      { triggers: { extensions: ['.sh', '.bash', '.conf', '.service', '.dockerfile'], keywords: ['linux', 'bash', 'shell', 'systemd', 'nginx', 'docker', 'ssh', 'deploy'] } },
+  security:   { triggers: { extensions: [], keywords: ['auth', 'oauth', 'jwt', 'credential', 'secret', 'encrypt', 'vulnerability', 'vulnerabilities', 'audit', 'owasp', 'xss', 'csrf'] }, tier_bias: 'think' },
+};
+
+function loadSpecialistRegistry() {
+  try {
+    const raw = readFileSync(SPECIALIST_REGISTRY_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed.specialists || DEFAULT_SPECIALISTS;
+  } catch {
+    return DEFAULT_SPECIALISTS;
+  }
+}
+
+const SPECIALIST_DEFS = loadSpecialistRegistry();
+
+/**
+ * Classify which specialist domain best matches the prompt and file list.
+ * Returns { specialist, confidence, triggers }.
+ */
+function classifySpecialist(prompt = '', files = []) {
+  const promptLower = prompt.toLowerCase();
+  const scores = {};
+  const matchedTriggers = {};
+
+  for (const [name, def] of Object.entries(SPECIALIST_DEFS)) {
+    const { extensions = [], keywords = [] } = def.triggers || {};
+    let score = 0;
+    const hits = [];
+
+    // +2 per matching file extension
+    for (const file of files) {
+      for (const ext of extensions) {
+        if (file.endsWith(ext)) {
+          score += 2;
+          hits.push(ext);
+          break; // count each file once per specialist
+        }
+      }
+    }
+
+    // +1 per matching keyword in prompt
+    for (const kw of keywords) {
+      // Use word-boundary-aware match where possible
+      const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (re.test(promptLower)) {
+        score += 1;
+        hits.push(kw);
+      }
+    }
+
+    scores[name] = score;
+    matchedTriggers[name] = hits;
+  }
+
+  // Find highest score
+  let best = null;
+  let bestScore = 0;
+  let bestExtCount = 0;
+
+  for (const [name, score] of Object.entries(scores)) {
+    if (score < 2) continue;
+    const extCount = matchedTriggers[name].filter(t => t.startsWith('.')).length;
+    if (
+      score > bestScore ||
+      (score === bestScore && extCount > bestExtCount)
+    ) {
+      best = name;
+      bestScore = score;
+      bestExtCount = extCount;
+    }
+  }
+
+  if (!best) {
+    return { specialist: 'generic', confidence: 'low', triggers: [] };
+  }
+
+  const confidence = bestScore >= 4 ? 'high' : 'medium';
+  return { specialist: best, confidence, triggers: matchedTriggers[best] };
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -238,4 +342,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   console.log(JSON.stringify(result, null, 2));
 }
 
-export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths };
+export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths, classifySpecialist };
