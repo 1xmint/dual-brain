@@ -279,18 +279,150 @@ if (!breakGlassToken) {
   runManifestCheck();
 }
 
-// Bash commands that HEAD is permitted to run (checked in order, first match wins)
-const BASH_ALLOWLIST = [
-  // Hook scripts
-  /^node\s+\.claude\/hooks\//,
-  // dual-brain CLI
-  /^dual-brain(\s|$)/,
-  // git metadata only (not git diff with full content)
-  /^git\s+status(\s|$)/,
-  /^git\s+log\s+--oneline(\s|$)/,
-  // npm release ops
-  /^npm\s+(version|publish)(\s|$)/,
-];
+// ── Tool verdict engine ───────────────────────────────────────────────────────
+
+/**
+ * Classify a Read path as allowed or blocked.
+ * Allowed: .dualbrain/ paths, package.json, CLAUDE.md, .claude/ config files,
+ *          worker output files.
+ * Blocked: src/, bin/, hooks/, agents/, or any .mjs/.js/.ts/.py file.
+ */
+function checkReadPolicy(filePath) {
+  if (!filePath) return { allowed: true, reason: 'read-no-path' };
+  const p = filePath.replace(/\\/g, '/');
+
+  // Always allow: .dualbrain/ orchestration artifacts
+  if (p.includes('/.dualbrain/') || p.includes('/.dualbrain') || p.match(/\.dualbrain\//)) {
+    return { allowed: true, reason: 'read-dualbrain-artifact' };
+  }
+  // Always allow: package.json (root-level config)
+  if (/(?:^|\/)package\.json$/.test(p)) {
+    return { allowed: true, reason: 'read-package-json' };
+  }
+  // Always allow: CLAUDE.md, .claude/ config files
+  if (/(?:^|\/)CLAUDE\.md$/.test(p) || p.includes('/.claude/') || p.endsWith('/.claude')) {
+    return { allowed: true, reason: 'read-claude-config' };
+  }
+  // Always allow: memory / persistent context files (HEAD needs to read its own memory)
+  if (p.includes('/memory/') || p.includes('claude-persistent')) {
+    return { allowed: true, reason: 'read-memory-artifact' };
+  }
+
+  // Block: source directories
+  if (/(?:^|\/)(?:src|bin|agents)\//.test(p)) {
+    return { allowed: false, reason: 'HEAD cannot read source files — dispatch a search agent' };
+  }
+  // Block: hook scripts
+  if (/(?:^|\/)hooks\//.test(p)) {
+    return { allowed: false, reason: 'HEAD cannot read source files — dispatch a search agent' };
+  }
+  // Block: source file extensions
+  if (/\.(mjs|js|ts|py)$/.test(p)) {
+    return { allowed: false, reason: 'HEAD cannot read source files — dispatch a search agent' };
+  }
+
+  // Allow everything else (worker output, task envelopes, etc.)
+  return { allowed: true, reason: 'read-allowed' };
+}
+
+/**
+ * Classify a Bash command as allowed or blocked.
+ * Allowed: hook scripts, dual-brain CLI, safe git ops, npm release, npx.
+ * Blocked: grep/find/exploratory commands, git investigation commands.
+ */
+function checkBashPolicy(command) {
+  const cmd = (command || '').trim();
+
+  // Allowed: hook scripts (both relative and absolute paths)
+  if (/^node\s+\.claude\/hooks\//.test(cmd)) return { allowed: true, reason: 'bash-hook-script' };
+  if (/^node\s+\/home\/runner\/workspace\/.claude\/hooks\//.test(cmd)) return { allowed: true, reason: 'bash-hook-script-abs' };
+
+  // Allowed: dual-brain CLI
+  if (/^dual-brain(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-dual-brain' };
+
+  // Allowed: npx
+  if (/^npx(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-npx' };
+
+  // Allowed: npm release ops
+  if (/^npm\s+(version|publish|whoami)(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-npm-release' };
+
+  // Allowed: safe git ops (push, add, commit, status — not investigation)
+  if (/^git\s+(push|add|commit|status)(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-git-safe' };
+
+  // Block: git investigation tools
+  if (/^git\s+(diff|log|show|blame)(\s|$)/.test(cmd)) {
+    return { allowed: false, reason: 'HEAD cannot explore the repo — dispatch a search agent' };
+  }
+
+  // Block: exploratory shell commands (space-suffixed to avoid false positives on words)
+  // Also check for start-of-command matches without trailing space for commands that might be alone
+  const exploratoryPatterns = [
+    /(?:^|\|\s*|\bsudo\s+)grep\s/,
+    /(?:^|\|\s*|\bsudo\s+)rg\s/,
+    /(?:^|\|\s*|\bsudo\s+)find\s/,
+    /(?:^|\|\s*|\bsudo\s+)cat\s/,
+    /(?:^|\|\s*|\bsudo\s+)head\s/,
+    /(?:^|\|\s*|\bsudo\s+)tail\s/,
+    /(?:^|\|\s*|\bsudo\s+)sed\s/,
+    /(?:^|\|\s*|\bsudo\s+)awk\s/,
+    /(?:^|\|\s*|\bsudo\s+)ls\s/,
+    /(?:^|\|\s*|\bsudo\s+)wc\s/,
+    /(?:^|\|\s*|\bsudo\s+)less(\s|$)/,
+    /(?:^|\|\s*|\bsudo\s+)more(\s|$)/,
+  ];
+  if (exploratoryPatterns.some((re) => re.test(cmd))) {
+    return { allowed: false, reason: 'HEAD cannot explore the repo — dispatch a search agent' };
+  }
+
+  // Block everything else
+  return { allowed: false, reason: 'HEAD cannot run arbitrary commands — dispatch a work agent' };
+}
+
+/**
+ * Central verdict function. Returns { allowed: boolean, reason: string }.
+ * Break-glass is checked before calling this (callers handle it).
+ */
+function getToolVerdict(tName, toolInput) {
+  // Agent dispatch — always allowed (this is HEAD's primary job)
+  if (tName === 'Agent') return { allowed: true, reason: 'agent-dispatch' };
+
+  // Write — always blocked (memory path gets a more specific message)
+  if (tName === 'Write') {
+    const filePath = (toolInput?.file_path || '').replace(/\\/g, '/');
+    if (filePath.includes('/memory/') || filePath.includes('claude-persistent')) {
+      return { allowed: false, reason: 'HEAD cannot write memories — fix the code instead' };
+    }
+    return { allowed: false, reason: 'HEAD cannot modify files — dispatch a work agent' };
+  }
+
+  // Edit — always blocked
+  if (tName === 'Edit') {
+    return { allowed: false, reason: 'HEAD cannot modify files — dispatch a work agent' };
+  }
+
+  // NotebookEdit — always blocked
+  if (tName === 'NotebookEdit') {
+    return { allowed: false, reason: 'HEAD cannot modify files — dispatch a work agent' };
+  }
+
+  // MCP filesystem write tools — blocked
+  if (tName.startsWith('mcp__') && /write|create|delete|remove|move|rename/i.test(tName)) {
+    return { allowed: false, reason: 'HEAD cannot use MCP write tools — dispatch via: dual-brain go "task description"' };
+  }
+
+  // Read — path-based policy
+  if (tName === 'Read') {
+    return checkReadPolicy(toolInput?.file_path || '');
+  }
+
+  // Bash — command-based policy
+  if (tName === 'Bash') {
+    return checkBashPolicy(toolInput?.command || '');
+  }
+
+  // Everything else (ToolSearch, WebSearch, MCP read tools, user communication) — allow
+  return { allowed: true, reason: 'default-allow' };
+}
 
 // Break-glass: allow everything, log to audit trail
 if (breakGlassToken) {
@@ -456,11 +588,23 @@ function checkDecisionArtifact(taskDescription, filePaths, cwd) {
   return null; // no sensitive area matched
 }
 
-// ── Agent tool: always allow (dispatching is HEAD's primary job) ─────────────
-if (toolName === 'Agent') {
-  checkBudgetOrDeny();
+// ── Central verdict dispatch ─────────────────────────────────────────────────
 
-  // Decision artifact advisory check
+const verdict = getToolVerdict(toolName, input.tool_input);
+
+if (!verdict.allowed) {
+  // Hard block — write reason to stderr for visibility, then deny
+  process.stderr.write(`[dual-brain] BLOCKED (${toolName}): ${verdict.reason}\n`);
+  auditDeny(`[dual-brain] ${verdict.reason}`);
+  // auditDeny exits with 2 — code below never reached
+}
+
+// Allowed path — run budget check and advisory checks before allowing
+
+checkBudgetOrDeny();
+
+// Decision artifact advisory check for Agent dispatches
+if (toolName === 'Agent') {
   const agentInput = input.tool_input || {};
   const taskDesc   = agentInput.prompt || agentInput.task || agentInput.description || '';
   const filePaths  = Array.isArray(agentInput.files) ? agentInput.files : [];
@@ -471,39 +615,7 @@ if (toolName === 'Agent') {
       `  ${artifactResult.hint}\n`
     );
   }
-
-  auditAllow('agent-dispatch');
-  process.exit(0);
 }
 
-// ── Bash tool: allowlist-only ─────────────────────────────────────────────────
-if (toolName === 'Bash') {
-  const cmd = (input.tool_input?.command || '').trim();
-  const allowed = BASH_ALLOWLIST.some((pattern) => pattern.test(cmd));
-  if (allowed) {
-    checkBudgetOrDeny();
-    auditAllow('bash-allowlist');
-    process.exit(0);
-  }
-  auditDeny('[dual-brain] HEAD cannot run arbitrary commands. Dispatch a work agent instead.');
-}
-
-// ── Read tool: deny ───────────────────────────────────────────────────────────
-if (toolName === 'Read') {
-  auditDeny('[dual-brain] HEAD cannot read files directly. Dispatch an Explore agent for investigation.');
-}
-
-// ── Edit / Write / NotebookEdit: deny (existing behaviour preserved) ──────────
-if (['Edit', 'Write', 'NotebookEdit'].includes(toolName)) {
-  auditDeny(`[dual-brain] HEAD cannot use ${toolName} directly. Dispatch via: dual-brain go "task description"`);
-}
-
-// ── MCP filesystem write tools: deny (existing behaviour preserved) ───────────
-if (toolName.startsWith('mcp__') && /write|create|delete|remove|move|rename/i.test(toolName)) {
-  auditDeny('[dual-brain] HEAD cannot use MCP write tools. Dispatch via: dual-brain go "task description"');
-}
-
-// ── Allow everything else (ToolSearch, WebSearch, MCP read tools) ─────────────
-checkBudgetOrDeny();
-auditAllow('default-allow');
+auditAllow(verdict.reason);
 process.exit(0);
