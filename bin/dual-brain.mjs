@@ -1243,47 +1243,30 @@ function detectInterruptedWork(sessions, cwd) {
 
 // ─── Provider status helpers ───────────────────────────────────────────────────
 
-const _PLAN_PRICE_MAP = {
-  pro: '$20', max5: '$100', max20: '$200',
-  plus: '$20', pro100: '$100', pro200: '$200',
-};
-
 /**
  * Build a provider status string for the dashboard status line.
- * Shows: "● Claude $100  ● OpenAI $100"
- * Uses ANSI color codes for the dots (no emoji width issues).
+ * Shows: "● Claude  ● OpenAI  ⚖️  Balanced"
+ * Uses ANSI color codes for the dots — no dollar amounts or usage bars.
  */
 function buildProviderStatusLine(profile, auth) {
   const GREEN = '[32m●[0m';
   const RED   = '[31m●[0m';
-  const now   = Date.now();
 
-  function providerSegment(provKey, displayName) {
-    const sub    = profile?.providers?.[provKey];
-    const found  = provKey === 'claude' ? auth.claude.found : auth.openai.found;
-    if (!found) return `${RED} ${displayName}: not connected`;
+  const claudeDot = auth.claude.found ? GREEN : RED;
+  const openaiDot = auth.openai.found ? GREEN : RED;
 
-    const expired = sub?.expiresAt && Date.parse(sub.expiresAt) < now;
-    if (expired)  return `${RED} ${displayName}: expired`;
+  const WORK_STYLE_LABELS = {
+    'auto':          '⚡ Fast',
+    'cost-saver':    '⚡ Fast',
+    'balanced':      '⚖️  Balanced',
+    'quality-first': '🔥 Full Power',
+    'solo-claude':   '⚡ Fast',
+    'solo-openai':   '⚡ Fast',
+  };
+  const bias  = profile?.bias || profile?.mode || 'balanced';
+  const label = WORK_STYLE_LABELS[bias] || '⚖️  Balanced';
 
-    const rawSubs = sub?.subs?.length
-      ? sub.subs
-      : sub?.plan
-        ? [{ plan: sub.plan }]
-        : [];
-    const planLabel = rawSubs.length > 0
-      ? rawSubs.map(s => _PLAN_PRICE_MAP[s.plan] || s.plan || '$100').join(' + ')
-      : null;
-
-    return planLabel
-      ? `${GREEN} ${displayName} ${planLabel}`
-      : `${GREEN} ${displayName}: connected`;
-  }
-
-  const parts = [];
-  parts.push(providerSegment('claude', 'Claude'));
-  parts.push(providerSegment('openai', 'OpenAI'));
-  return parts.join('  ');
+  return `${claudeDot} Claude  ${openaiDot} OpenAI  ${label}`;
 }
 
 /**
@@ -2297,10 +2280,24 @@ async function settingsScreen(rl, ask) {
   // Detect if gh is available + has PRs for the PR triage option
   const settingsPRs = await detectOpenPRs(cwd);
 
+  // Load current work style
+  const profile = loadProfile(cwd);
+  const currentBias = profile?.bias || profile?.mode || 'balanced';
+  const WORK_STYLE_DISPLAY = {
+    'cost-saver':    '⚡ Fast',
+    'auto':          '⚡ Fast',
+    'solo-claude':   '⚡ Fast',
+    'solo-openai':   '⚡ Fast',
+    'balanced':      '⚖️  Balanced',
+    'quality-first': '🔥 Full Power',
+  };
+  const workStyleLabel = WORK_STYLE_DISPLAY[currentBias] || '⚖️  Balanced';
+
   const lines = [
     top,
     row('Settings'),
     sep,
+    row(`[w] Work Style: ${workStyleLabel}`),
     row('[m] Manage subscriptions'),
     row('[e] Manage sessions'),
     row('[i] Import from replit-tools'),
@@ -2316,6 +2313,60 @@ async function settingsScreen(rl, ask) {
 
   const raw    = (await ask('  Choice: ')).trim();
   const choice = raw.toLowerCase();
+
+  if (choice === 'w') {
+    // Work style picker
+    const wsTop = `  ┌${'─'.repeat(51)}┐`;
+    const wsSep = `  ├${'─'.repeat(51)}┤`;
+    const wsBot = `  └${'─'.repeat(51)}┘`;
+    const wsPad = (s) => {
+      const plain = s.replace(/\x1b\[[0-9;]*m/g, '');
+      let vlen = 0;
+      for (const ch of plain) {
+        const cp = ch.codePointAt(0);
+        if (
+          (cp >= 0x1f300 && cp <= 0x1faff) ||
+          (cp >= 0x2600  && cp <= 0x27bf)  ||
+          cp === 0xfe0f || cp === 0x20e3
+        ) { vlen += 2; } else { vlen += 1; }
+      }
+      return s + ' '.repeat(Math.max(0, 51 - vlen));
+    };
+    const wsRow = (s) => `  │ ${wsPad(s)}│`;
+
+    const isFast  = currentBias === 'cost-saver' || currentBias === 'auto' || currentBias === 'solo-claude' || currentBias === 'solo-openai';
+    const isBal   = currentBias === 'balanced';
+    const isFull  = currentBias === 'quality-first';
+
+    console.log('');
+    console.log(wsTop);
+    console.log(wsRow('Work Style'));
+    console.log(wsSep);
+    console.log(wsRow(`  1. ⚡ Fast      — quick, single model${isFast  ? '  ← current' : ''}`));
+    console.log(wsRow(`  2. ⚖️  Balanced  — smart routing${isBal   ? '  ← current' : ''}`));
+    console.log(wsRow(`  3. 🔥 Full Power — dual-brain everything${isFull  ? '  ← current' : ''}`));
+    console.log(wsSep);
+    console.log(wsRow('[Enter] Keep current'));
+    console.log(wsBot);
+    console.log('');
+
+    const wsChoice = (await ask('  Choice [1/2/3/Enter]: ')).trim();
+    const wsMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
+    const newBias = wsMap[wsChoice];
+    if (newBias && newBias !== currentBias) {
+      profile.bias = newBias;
+      const enabledCount = [
+        profile.providers?.claude?.enabled,
+        profile.providers?.openai?.enabled,
+      ].filter(Boolean).length;
+      if (enabledCount >= 2) profile.mode = newBias;
+      saveProfile(profile, { cwd });
+      const newLabel = WORK_STYLE_DISPLAY[newBias] || newBias;
+      console.log(`\n  ✓ Work style set to ${newLabel}\n`);
+      await ask('  Press Enter to continue...');
+    }
+    return { next: 'settings' };
+  }
 
   if (choice === 'm') { return { next: 'subscriptions' }; }
 
@@ -2368,6 +2419,7 @@ async function settingsScreen(rl, ask) {
 
   return { next: 'main' };
 }
+
 
 // ─── Helper: aggregatePlans ───────────────────────────────────────────────────
 
@@ -2558,8 +2610,8 @@ async function subscriptionsScreen(rl, ask) {
 // ─── Onboarding Wizard ───────────────────────────────────────────────────────
 
 /**
- * 5-step onboarding wizard shown on first run (no .dualbrain/profile.json).
- * Matches the rounded ┌─┐ box style used in mainScreen / renderHeader.
+ * Streamlined onboarding: auto-detect capabilities, ask ONE question (work style).
+ * Replaces the old 5-step wizard with a ~5-second, one-choice flow.
  * @param {{ auth, plans, existingSessions }} detection
  * @param {string} cwd
  * @param {object} rl  readline interface
@@ -2589,49 +2641,49 @@ async function runOnboardingWizard(detection, cwd, rl) {
   };
   const wRow = (s) => `  │ ${wPad(s)}│`;
 
-  // ── Collected wizard state ─────────────────────────────────────────────────
-  const state = {
-    claudePlan:     null,
-    openaiPlan:     null,
-    headModel:      null,
-    importSessions: false,
-    profile:        'auto',
-  };
+  const { auth, existingSessions } = detection;
+  const claudeReady   = auth.claude.found;
+  const openaiReady   = auth.openai.found;
 
-  const { auth, plans, existingSessions } = detection;
-  const claudeReady = auth.claude.found;
-  const openaiReady = auth.openai.found;
+  // ── Detect Codex CLI availability ─────────────────────────────────────────
+  let codexAvailable = false;
+  try {
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync('which', ['codex'], { encoding: 'utf8' });
+    codexAvailable = r.status === 0;
+  } catch {}
+
+  // ── Detect replit-tools ────────────────────────────────────────────────────
+  const rt = detectReplitTools(cwd);
+
+  const GREEN = '\x1b[32m✓\x1b[0m';
+  const RED   = '\x1b[31m✗\x1b[0m';
 
   // ══════════════════════════════════════════════════════════════════════════
-  // Step 1 — Welcome & provider detection
+  // Step 1 — Auto-detect capabilities (no user input)
   // ══════════════════════════════════════════════════════════════════════════
   console.log('');
   console.log(wTop);
   console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
   console.log(wSep);
-  console.log(wRow(`Step 1 of 5: Detected providers`));
+  console.log(wRow('Checking your setup...'));
   console.log(wSep);
-
-  // Plan tier is inferred from auth config signals — not the actual plan name.
-  // Show the tier ($20/$100/$200) with "configured" suffix to be honest.
-  const claudePlanSuffix = claudeReady && plans.claude ? ` · ${plans.claude} configured` : '';
-  const openaiPlanSuffix = openaiReady && plans.openai ? ` · ${plans.openai} configured` : '';
-
   console.log(wRow(claudeReady
-    ? `✓ Claude CLI${claudePlanSuffix}`
-    : `✗ Claude CLI  not logged in`));
+    ? `${GREEN} Claude Code — available`
+    : `${RED} Claude Code — not found`));
   console.log(wRow(openaiReady
-    ? `✓ Codex CLI${openaiPlanSuffix}`
-    : `✗ Codex CLI   not logged in`));
-  if (existingSessions.length > 0) {
-    console.log(wRow(`✓ ${existingSessions.length} data-tools session${existingSessions.length !== 1 ? 's' : ''} found`));
-  }
-  console.log(wSep);
-  console.log(wRow(`[Enter] Continue setup   [s] Skip wizard`));
+    ? `${GREEN} OpenAI API — available`
+    : `${RED} OpenAI API — not found`));
+  console.log(wRow(codexAvailable
+    ? `${GREEN} Codex CLI — available`
+    : `${RED} Codex CLI — not found`));
+  console.log(wRow(rt.installed
+    ? `${GREEN} replit-tools — available`
+    : `${RED} replit-tools — not found`));
   console.log(wBottom);
-  console.log('');
 
   if (!claudeReady && !openaiReady) {
+    console.log('');
     console.log('  No AI provider found. Log in first:');
     console.log('    claude auth login   — for Claude');
     console.log('    codex login         — for OpenAI/Codex');
@@ -2639,194 +2691,55 @@ async function runOnboardingWizard(detection, cwd, rl) {
     return null;
   }
 
-  const step1 = (await ask('  > ')).trim().toLowerCase();
-  if (step1 === 's') {
-    // Skip: auto-save detected plans and proceed directly
-    const skippedProfile = loadProfile(cwd);
-    if (claudeReady) skippedProfile.providers.claude = { enabled: true, plan: plans.claude || 'pro' };
-    if (openaiReady) skippedProfile.providers.openai = { enabled: true, plan: plans.openai || 'plus' };
-    const enabledCount = [claudeReady, openaiReady].filter(Boolean).length;
-    skippedProfile.mode = enabledCount >= 2 ? 'auto' : claudeReady ? 'solo-claude' : 'solo-openai';
-    return skippedProfile;
-  }
-
   // ══════════════════════════════════════════════════════════════════════════
-  // Step 2 — Budget / plan selection
+  // Step 2 — ONE question: work style
   // ══════════════════════════════════════════════════════════════════════════
   console.log('');
   console.log(wTop);
-  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
+  console.log(wRow(`🧠 Dual-Brain v${version} — Work Style`));
   console.log(wSep);
-  console.log(wRow(`Step 2 of 5: Subscription plans`));
+  console.log(wRow('How do you want to work?'));
   console.log(wSep);
-
-  if (claudeReady) {
-    // Plan tier is inferred from auth config (rate-limit signal), not the actual plan name.
-    const configuredClaudePlan = plans.claude || '$20';
-    const configuredClaudeDesc = configuredClaudePlan + ' configured';
-    console.log(wRow(`Claude — ${configuredClaudeDesc}`));
-    console.log(wRow(`  [1] Pro ($20/mo)`));
-    console.log(wRow(`  [2] Max x5 ($100/mo)`));
-    console.log(wRow(`  [3] Max x20 ($200/mo)`));
-    console.log(wRow(`  [Enter] Keep configured (${configuredClaudePlan})`));
-    console.log(wSep);
-    const claudeChoice = (await ask('  Claude plan [1/2/3/Enter]: ')).trim();
-    const claudePlanMap = { '1': 'pro', '2': 'max5', '3': 'max20' };
-    state.claudePlan = claudePlanMap[claudeChoice] || configuredClaudePlan;
-  }
-
-  if (openaiReady) {
-    // Plan tier is inferred from JWT claim in auth config, not the actual plan name.
-    const configuredOpenaiPlan = plans.openai || '$20';
-    const configuredOpenaiDesc = configuredOpenaiPlan + ' configured';
-    console.log(wRow(`OpenAI — ${configuredOpenaiDesc}`));
-    console.log(wRow(`  [1] Plus ($20/mo)`));
-    console.log(wRow(`  [2] Pro ($100/mo)`));
-    console.log(wRow(`  [3] Pro ($200/mo higher limits)`));
-    console.log(wRow(`  [Enter] Keep configured (${configuredOpenaiPlan})`));
-    console.log(wSep);
-    const openaiChoice = (await ask('  OpenAI plan [1/2/3/Enter]: ')).trim();
-    const openaiPlanMap = { '1': 'plus', '2': 'pro', '3': 'pro200' };
-    state.openaiPlan = openaiPlanMap[openaiChoice] || configuredOpenaiPlan;
-  }
-
+  console.log(wRow('  1. ⚡ Fast      — quick answers, single model, skip reviews'));
+  console.log(wRow('  2. ⚖️  Balanced  — smart routing, reviews on important changes'));
+  console.log(wRow('                   (recommended)'));
+  console.log(wRow('  3. 🔥 Full Power — deep reasoning, dual-brain on everything'));
+  console.log(wRow('                   that matters'));
+  console.log(wSep);
+  console.log(wRow('[Enter] Balanced'));
   console.log(wBottom);
+  console.log('');
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // Step 3 — HEAD model selection
-  // ══════════════════════════════════════════════════════════════════════════
-  const hasBigPlan = state.claudePlan === 'max5' || state.claudePlan === 'max20';
-  const recommendedModel = hasBigPlan ? 'claude-opus-4-5' : 'claude-sonnet-4-5';
-  const recommendedLabel = hasBigPlan
-    ? 'Opus (Max plan — best quality)'
-    : 'Sonnet (Pro plan — balanced speed/quality)';
+  const styleChoice = (await ask('  Choice [1/2/3/Enter]: ')).trim();
+  const styleMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
+  const chosenBias = styleMap[styleChoice] || 'balanced';
 
+  // ── Non-blocking note if metered API detected ──────────────────────────────
+  if (openaiReady && !codexAvailable) {
+    console.log('');
+    console.log('  💡 OpenAI API detected — will confirm before expensive operations');
+  }
+
+  // ── Done ───────────────────────────────────────────────────────────────────
   console.log('');
   console.log(wTop);
-  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
-  console.log(wSep);
-  console.log(wRow(`Step 3 of 5: HEAD model (think-tier)`));
-  console.log(wSep);
-  console.log(wRow(`Recommended: ${recommendedLabel}`));
-  console.log(wSep);
-  console.log(wRow(`  [1] Haiku   — fastest, lowest cost`));
-  console.log(wRow(`  [2] Sonnet  — balanced (recommended for Pro)`));
-  console.log(wRow(`  [3] Opus    — best quality (recommended for Max)`));
-  console.log(wRow(`  [Enter] Use recommended`));
+  console.log(wRow(`✓ Ready. Type a task or press Enter for dashboard.`));
   console.log(wBottom);
   console.log('');
-
-  const step3 = (await ask('  HEAD model [1/2/3/Enter]: ')).trim();
-  const modelMap = {
-    '1': 'claude-haiku-4-5',
-    '2': 'claude-sonnet-4-5',
-    '3': 'claude-opus-4-5',
-  };
-  state.headModel = modelMap[step3] || recommendedModel;
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // Step 4 — Import sessions + profile selection
-  // ══════════════════════════════════════════════════════════════════════════
-  console.log('');
-  console.log(wTop);
-  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
-  console.log(wSep);
-  console.log(wRow(`Step 4 of 5: Sessions & routing profile`));
-  console.log(wSep);
-
-  if (existingSessions.length > 0) {
-    console.log(wRow(`Import ${existingSessions.length} data-tools session${existingSessions.length !== 1 ? 's' : ''}?`));
-    console.log(wRow(`  [y] Yes   [Enter/n] Skip`));
-    console.log(wSep);
-    const importChoice = (await ask('  Import sessions [y/Enter]: ')).trim().toLowerCase();
-    state.importSessions = importChoice === 'y';
-    if (state.importSessions) {
-      console.log('');
-      console.log(`  Importing ${existingSessions.length} sessions...`);
-      const recent = existingSessions.slice(0, 5);
-      for (const sess of recent) {
-        console.log(`  ${sess.age.padEnd(6)}  ${sess.name}`);
-      }
-      if (existingSessions.length > 5) {
-        console.log(`  ... and ${existingSessions.length - 5} more`);
-      }
-    }
-    console.log(wSep);
-  }
-
-  console.log(wRow(`Routing profile:`));
-  console.log(wRow(`  [1] auto         — adapts based on task risk & outcomes`));
-  console.log(wRow(`  [2] balanced     — best model per tier, normal budgets`));
-  console.log(wRow(`  [3] cost-saver   — prefer cheaper models, skip GPT`));
-  console.log(wRow(`  [4] quality-first — dual-brain for medium+ risk`));
-  console.log(wRow(`  [Enter] auto (recommended)`));
-  console.log(wBottom);
-  console.log('');
-
-  const step4 = (await ask('  Profile [1/2/3/4/Enter]: ')).trim();
-  const profileMap = { '1': 'auto', '2': 'balanced', '3': 'cost-saver', '4': 'quality-first' };
-  state.profile = profileMap[step4] || 'auto';
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // Step 5 — Summary & confirm
-  // ══════════════════════════════════════════════════════════════════════════
-  const claudeSummary = state.claudePlan
-    ? `Claude:     ${CLAUDE_PLAN_LABELS[state.claudePlan] ?? state.claudePlan}`
-    : `Claude:     not configured`;
-  const openaiSummary = state.openaiPlan
-    ? `OpenAI:     ${OPENAI_PLAN_LABELS[state.openaiPlan] ?? state.openaiPlan}`
-    : `OpenAI:     not configured`;
-  const modelSummary   = `HEAD model: ${state.headModel}`;
-  const profileSummary = `Profile:    ${state.profile}`;
-  const sessionSummary = existingSessions.length > 0
-    ? `Sessions:   ${state.importSessions ? `${existingSessions.length} imported` : 'skipped'}`
-    : null;
-
-  console.log('');
-  console.log(wTop);
-  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
-  console.log(wSep);
-  console.log(wRow(`Step 5 of 5: Summary`));
-  console.log(wSep);
-  console.log(wRow(claudeSummary));
-  console.log(wRow(openaiSummary));
-  console.log(wRow(modelSummary));
-  console.log(wRow(profileSummary));
-  if (sessionSummary) console.log(wRow(sessionSummary));
-  console.log(wSep);
-  console.log(wRow(`[Enter] Save and start   [q] Quit without saving`));
-  console.log(wBottom);
-  console.log('');
-
-  const step5 = (await ask('  > ')).trim().toLowerCase();
-  if (step5 === 'q') {
-    console.log('\n  Setup cancelled.\n');
-    return null;
-  }
 
   // ── Build and return the profile object ────────────────────────────────────
   const finalProfile = loadProfile(cwd);
 
-  if (state.claudePlan) {
-    finalProfile.providers.claude = { enabled: true, plan: state.claudePlan };
-  } else if (claudeReady) {
-    finalProfile.providers.claude = { enabled: true, plan: plans.claude || 'pro' };
+  if (claudeReady) {
+    finalProfile.providers.claude = { enabled: true };
+  }
+  if (openaiReady) {
+    finalProfile.providers.openai = { enabled: true };
   }
 
-  if (state.openaiPlan) {
-    finalProfile.providers.openai = { enabled: true, plan: state.openaiPlan };
-  } else if (openaiReady) {
-    finalProfile.providers.openai = { enabled: true, plan: plans.openai || 'plus' };
-  }
-
-  const enabledCount = [
-    finalProfile.providers?.claude?.enabled,
-    finalProfile.providers?.openai?.enabled,
-  ].filter(Boolean).length;
-
-  finalProfile.mode = enabledCount >= 2 ? state.profile : claudeReady ? 'solo-claude' : 'solo-openai';
-  finalProfile.headModel = state.headModel;
-  finalProfile.bias = state.profile;
+  const enabledCount = [claudeReady, openaiReady].filter(Boolean).length;
+  finalProfile.mode = enabledCount >= 2 ? chosenBias : claudeReady ? 'solo-claude' : 'solo-openai';
+  finalProfile.bias = chosenBias;
 
   return finalProfile;
 }
@@ -4400,8 +4313,8 @@ async function main() {
       if (profileExists(cwd)) {
         await runScreens('main');
       } else {
-        // First run: run the 5-step onboarding wizard, then go to main.
-        process.stdout.write(`\ndual-brain v${readVersion()} — Setup\n\nDetecting your setup...\n`);
+        // First run: run the onboarding wizard, then go to main.
+        // (wizard handles detection display)
         const auth  = await detectAuth();
         const plans = detectPlans();
         const existingSessions = importReplitSessions(cwd);
@@ -4442,9 +4355,9 @@ async function main() {
 
   if (cmd === 'init') {
     if (isInteractive) {
-      // Run 5-step onboarding wizard then main screen
+      // Run onboarding wizard then main screen
       const cwd = process.cwd();
-      process.stdout.write(`\ndual-brain v${readVersion()} — Setup\n\nDetecting your setup...\n`);
+      // (wizard handles detection display)
       const auth  = await detectAuth();
       const plans = detectPlans();
       const existingSessions = importReplitSessions(cwd);

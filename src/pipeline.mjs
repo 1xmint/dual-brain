@@ -5,9 +5,11 @@
 
 import { execSync } from 'node:child_process';
 import { detectTask } from './detect.mjs';
-import { decideRoute } from './decide.mjs';
+import { decideRoute, getWorkStyle, WORK_STYLES } from './decide.mjs';
 import { dispatch } from './dispatch.mjs';
 import { loadProfile } from './profile.mjs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // ─── Context Pack ─────────────────────────────────────────────────────────────
 
@@ -74,34 +76,51 @@ export function classifyReasoningDepth(contextPack) {
 // ─── Challenger policy ────────────────────────────────────────────────────────
 
 const THINK_TRIGGERS  = new Set(['think', 'review']);
-const DESIGN_TRIGGERS = new Set(['think']);
 
 /**
- * Determine challenger policy from context pack + trigger.
+ * Determine whether challenger activates based on work style and risk.
  * @param {object} contextPack
  * @param {string} trigger
- * @returns {'none'|'review-after'|'deliberate-before'}
+ * @returns {boolean}
  */
-function classifyChallengerPolicy(contextPack, trigger) {
-  const { detection, priorFailures = 0 } = contextPack;
-  const { risk = 'low', designImpact = false } = detection;
+function shouldUseChallenger(contextPack, trigger) {
+  const { detection, profile, priorFailures = 0 } = contextPack;
+  const { risk = 'low' } = detection;
 
-  if (
-    risk === 'critical' ||
-    THINK_TRIGGERS.has(trigger) ||
-    priorFailures >= 2 ||
-    designImpact
-  ) return 'deliberate-before';
+  // Always challenger for think/review triggers with prior failures or design impact
+  if (priorFailures >= 2 || detection.designImpact || THINK_TRIGGERS.has(trigger)) return true;
 
-  if (risk === 'high' || trigger === 'review' || priorFailures >= 1) return 'review-after';
+  const style = getWorkStyle(profile);
 
-  return 'none';
+  if (style.challengerPolicy === 'never') return false;
+  if (style.challengerPolicy === 'high-risk') return risk === 'high' || risk === 'critical';
+  if (style.challengerPolicy === 'medium-risk') return risk !== 'low';
+
+  return false;
+}
+
+/**
+ * Determine whether a checkpoint is required based on work style and risk.
+ * @param {object} contextPack
+ * @returns {boolean}
+ */
+function shouldCreateCheckpoint(contextPack) {
+  const { detection, profile } = contextPack;
+  const { risk = 'low', tier = 'execute' } = detection;
+
+  const style = getWorkStyle(profile);
+
+  if (style.checkpointPolicy === 'never') return false;
+  if (style.checkpointPolicy === 'all-edits') return tier !== 'search';
+  if (style.checkpointPolicy === 'risky-ops') return risk === 'high' || risk === 'critical';
+
+  return false;
 }
 
 // ─── Challenger model resolver ────────────────────────────────────────────────
 
-function resolveChallenger(policy, contextPack) {
-  if (policy === 'none') return null;
+function resolveChallenger(useChallenger, contextPack) {
+  if (!useChallenger) return null;
   const openaiEnabled =
     contextPack.profile?.providers?.openai?.enabled &&
     contextPack.profile?.providers?.openai?.plan;
@@ -127,11 +146,14 @@ export function buildExecutionPlan(contextPack, trigger, options = {}) {
 
   const reasoningDepth = options.forceDepth ?? classifyReasoningDepth(contextPack);
 
-  const challengerPolicy = options.forceChallenger
-    ? 'deliberate-before'
-    : classifyChallengerPolicy(contextPack, trigger);
+  const useChallenger = options.forceChallenger || shouldUseChallenger(contextPack, trigger);
+  const challengerModel = resolveChallenger(useChallenger, contextPack);
 
-  const challengerModel = resolveChallenger(challengerPolicy, contextPack);
+  const checkpointRequired = shouldCreateCheckpoint(contextPack);
+
+  // Work style for display and routing context
+  const workStyleObj = getWorkStyle(profile);
+  const workStyle    = workStyleObj.key;
 
   // Map reasoning depth → effort hint for decideRoute
   const depthToEffort = { low: 'low', medium: 'medium', high: 'high', ultra: 'xhigh' };
@@ -155,7 +177,9 @@ export function buildExecutionPlan(contextPack, trigger, options = {}) {
   const explanation = _buildPlanExplanation({
     displayModel,
     reasoningDepth,
-    challengerPolicy,
+    useChallenger,
+    workStyle,
+    workStyleObj,
     decision,
     detection,
     priorFailures,
@@ -166,8 +190,10 @@ export function buildExecutionPlan(contextPack, trigger, options = {}) {
     primaryModel:        displayModel,
     primaryProvider:     decision.provider,
     reasoningDepth,
-    challengerPolicy,
+    useChallenger,
     challengerModel,
+    workStyle,
+    checkpointRequired,
     tier:                detection.tier,
     verificationRequired,
     approvalRequired,
@@ -176,14 +202,17 @@ export function buildExecutionPlan(contextPack, trigger, options = {}) {
   };
 }
 
-function _buildPlanExplanation({ displayModel, reasoningDepth, challengerPolicy, decision, detection, priorFailures, trigger }) {
+function _buildPlanExplanation({ displayModel, reasoningDepth, useChallenger, workStyle, workStyleObj, decision, detection, priorFailures, trigger }) {
   const parts = [];
 
   const modelShort = displayModel.split('/').pop();
   parts.push(`${modelShort} for ${detection.risk}-risk ${detection.intent}`);
 
-  if (challengerPolicy !== 'none') {
-    parts.push(`challenger: ${challengerPolicy}`);
+  const styleLabel = workStyleObj?.label ?? workStyle ?? 'balanced';
+  parts.push(`style: ${styleLabel}`);
+
+  if (useChallenger) {
+    parts.push('challenger active');
   } else {
     parts.push('no challenger needed');
   }
@@ -204,15 +233,73 @@ function _buildPlanExplanation({ displayModel, reasoningDepth, challengerPolicy,
  */
 export function formatExecutionPlan(plan) {
   const depthLabel = { low: 'low reasoning', medium: 'medium reasoning', high: 'high reasoning', ultra: 'ultra reasoning' };
+
+  // Work style label + challenger description
+  const styleKey = plan.workStyle ?? 'balanced';
+  const styleDef = WORK_STYLES[styleKey] ?? WORK_STYLES.balanced;
+  const challengerNote = plan.useChallenger
+    ? `challenger on${plan.challengerModel ? ` (${plan.challengerModel})` : ''}`
+    : `challenger off (policy: ${styleDef.challengerPolicy})`;
+
   const lines = [
     '⚡ Execution Plan',
     `  Model: ${plan.primaryModel} (${depthLabel[plan.reasoningDepth] ?? plan.reasoningDepth})`,
-    `  Challenger: ${plan.challengerPolicy}${plan.challengerModel ? ` (${plan.challengerModel})` : ''}`,
-    `  Risk: ${plan._decision?.tier ? plan._decision.tier : plan.tier} | Tier: ${plan.tier}`,
+    `  Mode: ${styleDef.label} — ${challengerNote}`,
+    `  Checkpoint: ${plan.checkpointRequired ? 'yes (risky operation detected)' : 'no'}`,
+    `  Risk: ${plan._decision?.risk ?? 'unknown'} | Tier: ${plan.tier}`,
     `  Verify: ${plan.verificationRequired ? 'yes' : 'no'} | Approval: ${plan.approvalRequired ? 'yes' : 'no'}`,
     `  Why: ${plan.explanation}`,
   ];
   return lines.join('\n');
+}
+
+// ─── Checkpoint ───────────────────────────────────────────────────────────────
+
+/**
+ * Create a lightweight safety checkpoint before a risky operation.
+ * Tries git stash create first (non-destructive ref), falls back to recording HEAD.
+ * Always best-effort — never throws.
+ * @param {string} cwd
+ * @param {object} contextPack
+ */
+async function createCheckpoint(cwd, contextPack) {
+  try {
+    const checkpointDir = join(cwd, '.dualbrain', 'checkpoints');
+    mkdirSync(checkpointDir, { recursive: true });
+
+    let ref = null;
+
+    // Try git stash create (creates a stash object without modifying working tree)
+    try {
+      const stashRef = execSync('git stash create', { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+        .toString().trim();
+      if (stashRef) ref = stashRef;
+    } catch {
+      // git stash create failed or no changes — fall through
+    }
+
+    // Fallback: record current HEAD
+    if (!ref) {
+      try {
+        ref = execSync('git rev-parse HEAD', { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+          .toString().trim();
+      } catch {
+        ref = 'unknown';
+      }
+    }
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const entry = {
+      timestamp: new Date().toISOString(),
+      ref,
+      prompt: contextPack.prompt?.slice(0, 120),
+      risk: contextPack.detection?.risk,
+      tier: contextPack.detection?.tier,
+    };
+    writeFileSync(join(checkpointDir, `${ts}.json`), JSON.stringify(entry, null, 2));
+  } catch {
+    // Checkpoint is best-effort — never block execution
+  }
 }
 
 // ─── Verification ─────────────────────────────────────────────────────────────
@@ -331,7 +418,12 @@ export async function runPipeline(trigger, prompt, options = {}) {
       return { plan, result: null, verification: null };
     }
 
-    // ── Step 3: Execute ──────────────────────────────────────────────────────
+    // ── Step 3: Checkpoint (best-effort, before execute) ────────────────────
+    if (plan.checkpointRequired) {
+      await createCheckpoint(cwd, contextPack);
+    }
+
+    // ── Step 4: Execute ──────────────────────────────────────────────────────
     const decision = {
       ...plan._decision,
       // Pass reasoning depth as a hint; dispatch uses effort from decision
@@ -347,7 +439,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
       profile: contextPack.profile,
     });
 
-    // ── Step 4: Verify ───────────────────────────────────────────────────────
+    // ── Step 5: Verify ───────────────────────────────────────────────────────
     verification = await verify(result, plan, cwd);
 
     if (verbose) {
@@ -366,7 +458,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
     if (contextPack) _incrementFailureCache(prompt);
   }
 
-  // ── Step 5: Outcome Record ───────────────────────────────────────────────
+  // ── Step 6: Outcome Record ───────────────────────────────────────────────
   if (plan) {
     await recordOutcomeSafe(plan, result, verification);
   }

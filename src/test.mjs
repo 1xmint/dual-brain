@@ -87,7 +87,7 @@ describe('profile', () => {
 
   it('loadProfile returns defaults when no config exists', () => {
     const profile = loadProfile(tmp);
-    assert.equal(profile.schemaVersion, 1);
+    assert.equal(profile.schemaVersion, 2);
     assert.equal(profile.mode, 'auto');
     assert.equal(profile.bias, 'balanced');
     assert.ok(Array.isArray(profile.preferences));
@@ -105,14 +105,12 @@ describe('profile', () => {
       profile.mode = 'dual';
       profile.bias = 'quality-first';
       profile.providers.openai.enabled = true;
-      profile.providers.openai.plan = '$100';
       saveProfile(profile, { cwd: dir });
       const loaded = loadProfile(dir);
       assert.equal(loaded.mode, 'dual');
       assert.equal(loaded.bias, 'quality-first');
       assert.equal(loaded.providers.openai.enabled, true);
-      assert.equal(loaded.providers.openai.plan, '$100');
-      assert.equal(loaded.schemaVersion, 1);
+      assert.equal(loaded.schemaVersion, 2);
     } finally {
       removeTmp(dir);
     }
@@ -135,7 +133,7 @@ describe('profile', () => {
       // writeFileSync is already imported at the top of this file from 'node:fs'
       writeFileSync(join(profileDir, 'profile.json'), JSON.stringify(raw));
       const profile = loadProfile(dir);
-      assert.equal(profile.schemaVersion, 1);
+      assert.equal(profile.schemaVersion, 2);
       assert.equal(profile.mode, 'auto');
       assert.equal(profile.bias, 'balanced');
       assert.ok(Array.isArray(profile.preferences));
@@ -258,14 +256,16 @@ describe('profile', () => {
     assert.ok(['sonnet', 'gpt-4o'].includes(model), `Unexpected model: ${model}`);
   });
 
-  it('getHeadModel returns gpt-4o for dual profile when openai has higher plan', () => {
+  it('getHeadModel returns sonnet for dual profile (Claude Code is always HEAD)', () => {
+    // Plan tiers no longer influence head model — we're running inside Claude Code,
+    // so Claude is always the orchestrator regardless of what OpenAI plan is configured.
     const profile = {
       providers: {
-        claude: { plan: '$20', enabled: true },  // rank 1
-        openai: { plan: '$100', enabled: true }, // rank 2
+        claude: { enabled: true },
+        openai: { enabled: true },
       },
     };
-    assert.equal(getHeadModel(profile), 'gpt-4o');
+    assert.equal(getHeadModel(profile), 'sonnet');
   });
 });
 
@@ -538,38 +538,42 @@ describe('decide', () => {
   });
 
   describe('getAvailableModels', () => {
-    it('$20 claude plan excludes opus', () => {
+    it('all claude models available (no subscription gating)', () => {
+      // Model availability is no longer gated on subscription price.
+      // All models are available by default; restrict via providers.*.models array.
       const { claude } = getAvailableModels(soloClaude20);
-      assert.ok(!claude.includes('opus'), `opus found in $20 plan: ${claude.join(', ')}`);
-      assert.ok(claude.includes('sonnet'));
-      assert.ok(claude.includes('haiku'));
+      assert.ok(claude.includes('sonnet'), 'sonnet should be available');
+      assert.ok(claude.includes('haiku'),  'haiku should be available');
+      assert.ok(claude.includes('opus'),   'opus should be available — no plan gating');
     });
 
-    it('$100 claude plan includes opus', () => {
+    it('all claude models available regardless of plan field', () => {
       const { claude } = getAvailableModels(soloClaude100);
-      assert.ok(claude.includes('opus'), `opus missing from $100 plan: ${claude.join(', ')}`);
+      assert.ok(claude.includes('opus'), 'opus should be available');
     });
 
-    it('$20 openai plan excludes o3', () => {
+    it('all openai models available (no subscription gating)', () => {
       const profile = {
         providers: {
-          claude: { plan: '$20', enabled: false },
-          openai: { plan: '$20', enabled: true },
+          claude: { enabled: false },
+          openai: { enabled: true },
         },
       };
       const { openai } = getAvailableModels(profile);
-      assert.ok(!openai.includes('o3'), `o3 found in $20 plan`);
+      assert.ok(openai.includes('gpt-4o'), 'gpt-4o should be available');
+      assert.ok(openai.includes('o3'),     'o3 should be available — no plan gating');
     });
 
-    it('$100 openai plan includes o3', () => {
+    it('provider models array overrides default (explicit allowlist)', () => {
       const profile = {
         providers: {
-          claude: { plan: '$20', enabled: false },
-          openai: { plan: '$100', enabled: true },
+          claude: { enabled: false },
+          openai: { enabled: true, models: ['gpt-4o-mini', 'gpt-4.1-mini'] },
         },
       };
       const { openai } = getAvailableModels(profile);
-      assert.ok(openai.includes('o3'), `o3 missing from $100 plan`);
+      assert.ok(!openai.includes('o3'), 'o3 excluded by explicit models allowlist');
+      assert.ok(openai.includes('gpt-4o-mini'));
     });
   });
 
@@ -1132,7 +1136,7 @@ describe('CLI', () => {
         `Profile file not created at ${profileFile} (exit ${code})\nstdout:${stdout}\nstderr:${stderr}`,
       );
       const saved = JSON.parse(readFileSync(profileFile, 'utf8'));
-      assert.equal(saved.schemaVersion, 1);
+      assert.equal(saved.schemaVersion, 2);
       assert.equal(saved.providers.claude.enabled, true);
     } finally {
       removeTmp(tmp);

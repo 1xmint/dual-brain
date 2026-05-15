@@ -10,9 +10,12 @@
  *   rememberPreference(text, opts) → add/update preference
  *   forgetPreference(text, cwd)    → remove preference by fuzzy match
  *   getActivePreferences(cwd)      → enabled global + project preferences
- *   getAvailableProviders(profile) → enabled providers with plan info
+ *   getAvailableProviders(profile) → enabled providers
  *   isSoloBrain(profile)           → true if only one provider enabled
  *   getHeadModel(profile)          → suggested head model string
+ *   detectCapabilities(cwd)        → what we can actually verify
+ *   getOnboardingMessage(caps, ws) → honest 2-3 line status message
+ *   needsApiGuardrail(caps)        → true if metered API key detected
  *
  * CLI:
  *   node src/profile.mjs                  # show current profile
@@ -26,7 +29,7 @@ import { createInterface } from 'readline';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { execFile } from 'child_process';
+import { execSync } from 'child_process';
 
 // ---------------------------------------------------------------------------
 // Claude Code memory integration
@@ -123,190 +126,150 @@ function detectEnvironment() {
 }
 
 // ---------------------------------------------------------------------------
-// Auth detection
+// Capability detection — only what we can actually verify
 // ---------------------------------------------------------------------------
 
 /**
- * Detect CLI login status for Claude and Codex.
- * Checks config files on disk — never makes network calls.
+ * Detect what providers and tools are actually available.
+ * Never makes network calls, never claims to know subscription tier or price.
  *
- * @returns {{ claude: AuthEntry, openai: AuthEntry }}
- * @typedef {{ found: boolean, source: string|null, loginType: 'oauth'|'cli'|null }} AuthEntry
+ * @param {string} [cwd]
+ * @returns {Promise<{
+ *   claude:       { available: boolean, source: string|null },
+ *   openai:       { available: boolean, source: string|null, metered: boolean },
+ *   codex:        { available: boolean, source: string|null },
+ *   replitTools:  { available: boolean, checkpoints: boolean },
+ * }>}
  */
-async function detectAuth() {
-  const results = {
-    claude: { found: false, source: null, loginType: null },
-    openai: { found: false, source: null, loginType: null },
-  };
+async function detectCapabilities(cwd) {
+  const root = cwd || process.cwd();
 
-  // --- Claude: check .claude.json for oauthAccount (CLI login) ---
-  const claudePaths = [
-    '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
-    join(homedir(), '.claude', '.claude.json'),
-  ];
-  for (const p of claudePaths) {
-    try {
-      const data = JSON.parse(readFileSync(p, 'utf8'));
-      if (data?.oauthAccount) {
-        results.claude.found     = true;
-        results.claude.source    = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
-        results.claude.loginType = 'oauth';
-        break;
-      }
-      // Legacy: apiKey field in .claude.json (set by claude CLI in some versions)
-      if (data?.apiKey && typeof data.apiKey === 'string') {
-        results.claude.found     = true;
-        results.claude.source    = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
-        results.claude.loginType = 'cli';
-        break;
-      }
-    } catch { continue; }
+  // --- Claude: running inside Claude Code or has ANTHROPIC_API_KEY or ~/.claude dir ---
+  let claudeAvailable = false;
+  let claudeSource = null;
+
+  if (process.env.CLAUDE_CODE) {
+    claudeAvailable = true;
+    claudeSource = 'claude-code';
+  } else if (process.env.ANTHROPIC_API_KEY) {
+    claudeAvailable = true;
+    claudeSource = 'env-key';
+  } else {
+    // Check for ~/.claude directory (Claude Code installation)
+    const claudeDir = join(homedir(), '.claude');
+    const replitClaudeDir = join(root, '.replit-tools', '.claude-persistent');
+    if (existsSync(claudeDir) || existsSync(replitClaudeDir)) {
+      claudeAvailable = true;
+      claudeSource = existsSync(replitClaudeDir) ? 'claude-code' : 'claude-dir';
+    }
   }
 
-  // --- OpenAI/Codex: check auth.json for access_token or id_token (CLI login) ---
-  const codexPaths = [
-    '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
-    join(homedir(), '.codex', 'auth.json'),
-  ];
-  for (const p of codexPaths) {
-    try {
-      const data = JSON.parse(readFileSync(p, 'utf8'));
-      const accessToken = data?.tokens?.access_token || data?.access_token;
-      const idToken     = data?.tokens?.id_token     || data?.id_token;
+  // --- OpenAI: check for OPENAI_API_KEY (metered billing) ---
+  const openaiKey = process.env.OPENAI_API_KEY;
+  const openaiAvailable = !!(openaiKey && openaiKey.length > 0);
 
-      if (accessToken || idToken) {
-        results.openai.found     = true;
-        results.openai.source    = p.includes('.replit-tools') ? 'codex CLI (replit-tools)' : 'codex CLI';
-        results.openai.loginType = 'oauth';
-        break;
-      }
-    } catch { continue; }
-  }
-
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// Subscription management (.dualbrain/profile.json)
-// ---------------------------------------------------------------------------
-
-/**
- * Save subscription config for a provider into .dualbrain/profile.json.
- * @param {string} provider — 'claude' or 'openai'
- * @param {{ plan: string, label?: string, expiresAt?: string }} config
- * @param {string} [cwd]
- */
-function saveSubscription(provider, config, cwd) {
-  const profile = loadProfile(cwd);
-  if (!profile.providers[provider]) profile.providers[provider] = { enabled: true };
-  profile.providers[provider].plan    = config.plan;
-  profile.providers[provider].enabled = true;
-  if (config.label)     profile.providers[provider].label     = config.label;
-  if (config.expiresAt) profile.providers[provider].expiresAt = config.expiresAt;
-  saveProfile(profile, { cwd: cwd || process.cwd() });
-  return profile;
-}
-
-/**
- * Return subscription configs for all providers from the saved profile.
- * @param {string} [cwd]
- * @returns {{ [provider: string]: { plan: string, enabled: boolean, label?: string, expiresAt?: string } }}
- */
-function listSubscriptions(cwd) {
-  const profile = loadProfile(cwd);
-  return profile.providers || {};
-}
-
-// ---------------------------------------------------------------------------
-// Auto-detect subscription plans from provider config files
-// ---------------------------------------------------------------------------
-
-/**
- * Decode a JWT payload without verifying the signature.
- * Returns the payload object, or null on failure.
- * @param {string} token
- */
-function decodeJwtPayload(token) {
+  // --- Codex: check if 'codex' is in PATH ---
+  let codexAvailable = false;
+  let codexSource = null;
   try {
-    const parts = token.split('.');
-    if (parts.length < 2) return null;
-    // Base64url → base64 → Buffer
-    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    const json = Buffer.from(b64, 'base64').toString('utf8');
-    return JSON.parse(json);
+    execSync('which codex', { stdio: 'pipe', timeout: 2000 });
+    codexAvailable = true;
+    codexSource = 'cli';
   } catch {
-    return null;
+    // not in PATH
   }
+
+  // --- replit-tools: check if directory exists or binary in PATH ---
+  const replitToolsDir = join(root, '.replit-tools');
+  let replitToolsAvailable = existsSync(replitToolsDir);
+  if (!replitToolsAvailable) {
+    try {
+      execSync('which replit-tools', { stdio: 'pipe', timeout: 2000 });
+      replitToolsAvailable = true;
+    } catch {
+      // not in PATH
+    }
+  }
+
+  // Check for checkpoint capability (replit-specific)
+  const checkpointsBin = existsSync(join(replitToolsDir, 'checkpoints'))
+    || existsSync('/usr/local/bin/replit-checkpoint');
+
+  return {
+    claude: {
+      available: claudeAvailable,
+      source: claudeSource,
+    },
+    openai: {
+      available: openaiAvailable,
+      source: openaiAvailable ? 'env-key' : null,
+      metered: openaiAvailable, // API key = metered billing
+    },
+    codex: {
+      available: codexAvailable,
+      source: codexSource,
+    },
+    replitTools: {
+      available: replitToolsAvailable,
+      checkpoints: checkpointsBin,
+    },
+  };
 }
 
 /**
- * Infer plan tier from Claude Code and Codex auth config files.
- * Returns { claude: '$20'|'$100'|'$200'|null, openai: '$20'|'$100'|'$200'|null }.
- * Returns nulls for any provider whose config cannot be read — never throws.
+ * Return true if any metered API key is detected.
+ * When true, the system defaults to conservative API usage and should
+ * confirm before expensive operations.
  *
- * NOTE: This reads rate-limit tier signals (organizationRateLimitTier for Claude,
- * chatgpt_plan_type JWT claim for OpenAI) and maps them to price tiers.
- * It does NOT retrieve the actual subscription plan name from the provider —
- * labels like "Max x5" or "Pro" are our own interpretations of those signals.
+ * @param {ReturnType<typeof detectCapabilities> extends Promise<infer T> ? T : never} capabilities
+ * @returns {boolean}
  */
-function detectPlans() {
-  const plans = { claude: null, openai: null };
+function needsApiGuardrail(capabilities) {
+  return !!(capabilities?.openai?.metered);
+}
 
-  // --- Claude: read organizationRateLimitTier from .claude.json ---
-  const claudePaths = [
-    // Replit-tools persistent path (takes precedence)
-    '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
-    join(homedir(), '.claude', '.claude.json'),
-  ];
-  for (const p of claudePaths) {
-    try {
-      const data = JSON.parse(readFileSync(p, 'utf8'));
-      const tier = data?.oauthAccount?.organizationRateLimitTier;
-      if (tier) {
-        if (tier.includes('max_20x')) plans.claude = '$200';
-        else if (tier.includes('max_5x')) plans.claude = '$100';
-        else plans.claude = '$20';
-      }
-      break;
-    } catch { continue; }
+/**
+ * Generate an honest 2-3 line onboarding/status message based on
+ * what we can actually verify.
+ *
+ * @param {object} capabilities — result of detectCapabilities()
+ * @param {string} [workStyle]  — 'balanced' | 'cost-saver' | 'quality-first'
+ * @returns {string}
+ */
+function getOnboardingMessage(capabilities, workStyle = 'balanced') {
+  const found = [];
+  if (capabilities?.claude?.available)  found.push('Claude Code');
+  if (capabilities?.openai?.available)  found.push('OpenAI API');
+  if (capabilities?.codex?.available && !capabilities?.openai?.available) found.push('Codex CLI');
+
+  const styleLabels = {
+    'balanced':      'Balanced — smart routing, reviews on important changes',
+    'cost-saver':    'Cost-saver — prefers faster models, skips dual-brain for low-risk tasks',
+    'quality-first': 'Quality-first — dual-brain for medium+ risk, stricter reviews',
+  };
+  const modeLabel = styleLabels[workStyle] || styleLabels['balanced'];
+
+  const lines = [];
+  if (found.length === 0) {
+    lines.push('No providers detected');
+    lines.push('  Set ANTHROPIC_API_KEY or install Claude Code to get started');
+    return lines.join('\n');
   }
 
-  // --- OpenAI/Codex: read plan from auth.json (direct field or JWT payload) ---
-  const codexPaths = [
-    // Replit-tools persistent path (takes precedence)
-    '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
-    join(homedir(), '.codex', 'auth.json'),
-  ];
-  for (const p of codexPaths) {
-    try {
-      const data = JSON.parse(readFileSync(p, 'utf8'));
+  lines.push(`Found: ${found.join(', ')}`);
+  lines.push(`  Mode: ${modeLabel}`);
 
-      // Try a top-level `plan` field first
-      let planType = data.plan ?? null;
-
-      // Fall back to decoding the JWT id_token or access_token
-      if (!planType) {
-        for (const key of ['id_token', 'access_token']) {
-          const token = data?.tokens?.[key];
-          if (!token) continue;
-          const payload = decodeJwtPayload(token);
-          planType =
-            payload?.['https://api.openai.com/auth']?.chatgpt_plan_type ?? null;
-          if (planType) break;
-        }
-      }
-
-      if (planType) {
-        // pro / prolite → $100 | plus → $20 | pro200 / team → $200
-        if (planType === 'pro200' || planType === 'team') plans.openai = '$200';
-        else if (planType === 'pro' || planType === 'prolite') plans.openai = '$100';
-        else plans.openai = '$20';
-      }
-      break;
-    } catch { continue; }
+  // Tip: suggest OpenAI if only Claude is available
+  if (capabilities?.claude?.available && !capabilities?.openai?.available && !capabilities?.codex?.available) {
+    lines.push('  Tip: Add OPENAI_API_KEY for dual-brain collaboration');
   }
 
-  return plans;
+  // Warn about metered billing
+  if (capabilities?.openai?.metered) {
+    lines.push('  Note: OpenAI API key detected — usage is metered, guardrails enabled');
+  }
+
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -320,16 +283,18 @@ const projectPath = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'profile.j
 function defaultProfile() {
   const now = new Date().toISOString();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     createdAt: now,
     updatedAt: now,
+    workStyle: 'balanced',
     providers: {
-      claude: { plan: '$20', enabled: true  },
-      openai: { plan: '$20', enabled: false },
+      claude: { enabled: true  },
+      openai: { enabled: false },
     },
     mode: 'auto',
     bias: 'balanced',
     preferences: [],
+    apiGuardrail: false,
   };
 }
 
@@ -342,10 +307,9 @@ function migrateProfile(profile) {
   if (profile.subscriptions && !profile.providers) {
     profile.providers = {};
     for (const [key, sub] of Object.entries(profile.subscriptions)) {
-      profile.providers[key] = {
-        plan: sub.plan || '$20',
-        enabled: true,
-      };
+      profile.providers[key] = { enabled: true };
+      // Drop plan/price fields — we no longer track subscription tier
+      void sub;
     }
     delete profile.subscriptions;
   }
@@ -358,8 +322,27 @@ function migrateProfile(profile) {
     profile.preferences = profile.preferences || [];
     profile.providers = profile.providers || {};
   }
-  // Future migrations go here:
-  // if (profile.schemaVersion < 2) { ... profile.schemaVersion = 2; }
+
+  if (profile.schemaVersion < 2) {
+    // v1 → v2: remove fake subscription fields, add workStyle + apiGuardrail
+    profile.schemaVersion = 2;
+    profile.workStyle = profile.workStyle || profile.bias || 'balanced';
+    profile.apiGuardrail = profile.apiGuardrail ?? false;
+
+    // Strip price/plan/budget fields — they were never accurate
+    for (const prov of Object.values(profile.providers || {})) {
+      delete prov.plan;
+      delete prov.label;
+      delete prov.expiresAt;
+      delete prov.subs;
+    }
+    delete profile.plan;
+    delete profile.price;
+    delete profile.subscription;
+    delete profile.budget;
+    delete profile.detectedPlan;
+  }
+
   return profile;
 }
 
@@ -375,22 +358,6 @@ function loadProfile(cwd) {
     }
   }
   if (!profile) profile = defaultProfile();
-
-  // Read plan tier from auth config files (JWT or organizationRateLimitTier) and
-  // apply if it differs from the stored profile value.
-  // NOTE: detectPlans() reads rate-limit tier data from the auth config — it infers
-  // a price tier ($20/$100/$200) from that signal, not from the subscription name itself.
-  // The plan label (e.g. "Max x5") comes from our own mapping, not from Claude/OpenAI.
-  const detected = detectPlans();
-  for (const [provider, detectedPlan] of Object.entries(detected)) {
-    if (!detectedPlan) continue;
-    if (!profile.providers[provider]) continue;
-    const stored = profile.providers[provider].plan;
-    if (stored !== detectedPlan) {
-      profile.providers[provider].plan = detectedPlan;
-    }
-  }
-
   return profile;
 }
 
@@ -422,20 +389,37 @@ async function runOnboarding(opts = {}) {
   try {
     process.stdout.write('\nDual-Brain Orchestrator — First-time setup\n\n');
 
-    const q1 = (await ask('Which AI subscriptions do you have?\n  (1) Claude only  (2) OpenAI only  (3) Both\n> ')).trim();
-    if (q1 === '2') { profile.providers.claude.enabled = false; profile.providers.openai.enabled = true; }
-    else if (q1 === '3') { profile.providers.openai.enabled = true; }
+    // Detect what's actually available
+    const capabilities = await detectCapabilities(opts.cwd);
 
-    const PLANS = { '1': '$20', '2': '$100', '3': '$200' };
-    for (const [key, prov] of Object.entries(profile.providers)) {
-      if (!prov.enabled) continue;
-      const label = key === 'claude' ? 'Claude' : 'OpenAI/ChatGPT';
-      const q2 = (await ask(`\n${label} tier?\n  (1) $20/mo  (2) $100/mo  (3) $200/mo\n> `)).trim();
-      prov.plan = PLANS[q2] || '$20';
+    // Show what we found honestly
+    const foundProviders = [];
+    if (capabilities.claude.available)  foundProviders.push('Claude Code');
+    if (capabilities.openai.available)  foundProviders.push('OpenAI API (metered)');
+    if (capabilities.codex.available && !capabilities.openai.available) foundProviders.push('Codex CLI');
+
+    if (foundProviders.length > 0) {
+      process.stdout.write(`Detected: ${foundProviders.join(', ')}\n\n`);
+    } else {
+      process.stdout.write('No providers detected automatically.\n\n');
     }
 
-    const q3 = (await ask('\nDefault optimization?\n  (1) Save usage  (2) Balanced  (3) Best quality\n> ')).trim();
+    // Enable providers based on what's available
+    profile.providers.claude.enabled = capabilities.claude.available;
+    profile.providers.openai.enabled = capabilities.openai.available || capabilities.codex.available;
+    profile.apiGuardrail = needsApiGuardrail(capabilities);
+
+    // If detection missed something, ask
+    if (!capabilities.claude.available && !capabilities.openai.available && !capabilities.codex.available) {
+      const q1 = (await ask('Which AI providers do you have access to?\n  (1) Claude Code only  (2) OpenAI API only  (3) Both  (4) Neither\n> ')).trim();
+      if (q1 === '1') { profile.providers.claude.enabled = true; }
+      else if (q1 === '2') { profile.providers.claude.enabled = false; profile.providers.openai.enabled = true; profile.apiGuardrail = true; }
+      else if (q1 === '3') { profile.providers.claude.enabled = true; profile.providers.openai.enabled = true; profile.apiGuardrail = true; }
+    }
+
+    const q3 = (await ask('\nDefault work style?\n  (1) Save usage  (2) Balanced  (3) Best quality\n> ')).trim();
     profile.bias = ({ '1': 'cost-saver', '3': 'quality-first' })[q3] || 'balanced';
+    profile.workStyle = profile.bias;
 
     const n = Object.values(profile.providers).filter(p => p.enabled).length;
     profile.mode = n >= 2 ? 'dual' : profile.providers.claude.enabled ? 'solo-claude' : 'solo-openai';
@@ -505,12 +489,10 @@ function getActivePreferences(cwd) {
 // Provider helpers
 // ---------------------------------------------------------------------------
 
-const PLAN_RANK = { '$20': 1, '$100': 2, '$200': 3 };
-
 function getAvailableProviders(profile) {
   return Object.entries(profile.providers || {})
     .filter(([, p]) => p.enabled)
-    .map(([name, p]) => ({ name, plan: p.plan, rank: PLAN_RANK[p.plan] || 1 }));
+    .map(([name, p]) => ({ name, ...p }));
 }
 
 function isSoloBrain(profile) {
@@ -521,85 +503,28 @@ function getHeadModel(profile) {
   const providers = getAvailableProviders(profile);
   if (providers.length === 0) return 'sonnet';
   if (providers.length === 1) return providers[0].name === 'openai' ? 'gpt-4o' : 'sonnet';
-  const top = providers.reduce((a, b) => (b.rank > a.rank ? b : a));
-  return top.name === 'openai' ? 'gpt-4o' : 'sonnet';
+  // Both available — default to Claude (we're running in Claude Code)
+  return 'sonnet';
 }
 
 // ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
-async function main() {
-  const args = process.argv.slice(2);
-  const cwd  = process.cwd();
-  const flag = args[0];
-  const val  = args[1];
-
-  if (flag === '--init') {
-    const profile = await runOnboarding({ interactive: true });
-    saveProfile(profile, { cwd });
-    return;
-  }
-  if (flag === '--remember') {
-    if (!val) { process.stderr.write('Usage: --remember "text"\n'); process.exit(1); }
-    const p = rememberPreference(val, { cwd });
-    process.stdout.write(`Preference saved. Total: ${p.preferences.length}\n`);
-    return;
-  }
-  if (flag === '--forget') {
-    if (!val) { process.stderr.write('Usage: --forget "text"\n'); process.exit(1); }
-    forgetPreference(val, cwd);
-    process.stdout.write('Preference removed (if matched).\n');
-    return;
-  }
-  if (flag === '--providers') {
-    const providers = getAvailableProviders(loadProfile(cwd));
-    if (!providers.length) { process.stdout.write('No providers enabled.\n'); return; }
-    providers.forEach(p => process.stdout.write(`${p.name}  plan=${p.plan}\n`));
-    return;
-  }
-
-  // default: show profile
-  const profile   = loadProfile(cwd);
-  const providers = getAvailableProviders(profile);
-  [
-    `mode       : ${profile.mode}`,
-    `bias       : ${profile.bias}`,
-    `head model : ${getHeadModel(profile)}`,
-    `providers  : ${providers.map(p => `${p.name} (${p.plan})`).join(', ') || 'none'}`,
-    `prefs      : ${profile.preferences?.filter(p => p.enabled).length || 0} active`,
-  ].forEach(l => process.stdout.write(l + '\n'));
-}
-
-const isMain = process.argv[1]?.endsWith('profile.mjs');
-if (isMain) main().catch(e => { process.stderr.write(e.message + '\n'); process.exit(1); });
-
-// ---------------------------------------------------------------------------
-// Exports
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Auto-setup (1-click, no user input required)
+// Capability-based auto-setup (replaces subscription-based autoSetup)
 // ---------------------------------------------------------------------------
 
 /**
- * Attempt to configure a profile entirely from detected state — no user input.
+ * Silently configure a profile from detected capabilities — no user input.
  *
  * Returns:
  *   {
  *     confident: boolean,   // true when at least one provider was found
  *     profile: object|null, // fully-built profile ready to save, or null
- *     warnings: string[],   // non-fatal issues (e.g. missing provider)
+ *     warnings: string[],   // non-fatal issues
  *     actions: string[],    // human-readable lines for the summary box
  *   }
- *
- * IMPORTANT: this function NEVER stores credentials — it only reads what's
- * already present on disk / in environment variables.
  */
 async function autoSetup(cwd) {
-  const env  = detectEnvironment();
-  const auth = await detectAuth();
-  const plans = detectPlans();
+  const capabilities = await detectCapabilities(cwd);
+  const env = detectEnvironment();
 
   const result = {
     confident: false,
@@ -608,47 +533,45 @@ async function autoSetup(cwd) {
     actions: [],
   };
 
-  // Need at least one provider authenticated
-  if (!auth.claude.found && !auth.openai.found) {
+  // Need at least one provider
+  if (!capabilities.claude.available && !capabilities.openai.available && !capabilities.codex.available) {
     result.warnings.push('No provider credentials found');
     return result;
   }
 
-  // Build profile from detected state
   const profile = defaultProfile();
 
   // Claude
-  if (auth.claude.found) {
+  if (capabilities.claude.available) {
     profile.providers.claude.enabled = true;
-    profile.providers.claude.plan    = plans.claude || '$20';
-    // Plan tier is inferred from auth config signal — show tier with "configured",
-    // not a plan name we didn't actually detect.
-    const claudeTierLabel = plans.claude ? `${plans.claude} configured` : 'connected';
-    result.actions.push(`Claude: ${claudeTierLabel} (${auth.claude.source})`);
+    result.actions.push(`Claude: available (${capabilities.claude.source})`);
   } else {
     profile.providers.claude.enabled = false;
-    result.warnings.push('Claude CLI not logged in — run: claude login');
+    result.warnings.push('Claude not detected — install Claude Code or set ANTHROPIC_API_KEY');
   }
 
-  // OpenAI
-  if (auth.openai.found) {
+  // OpenAI / Codex
+  if (capabilities.openai.available) {
     profile.providers.openai.enabled = true;
-    profile.providers.openai.plan    = plans.openai || '$20';
-    // Plan tier is inferred from JWT claim in auth config — show tier with "configured",
-    // not a plan name we didn't actually detect.
-    const openaiTierLabel = plans.openai ? `${plans.openai} configured` : 'connected';
-    result.actions.push(`OpenAI: ${openaiTierLabel} (${auth.openai.source})`);
+    result.actions.push('OpenAI: API key detected (metered billing — guardrails enabled)');
+  } else if (capabilities.codex.available) {
+    profile.providers.openai.enabled = true;
+    result.actions.push('Codex CLI: available');
   } else {
     profile.providers.openai.enabled = false;
-    result.warnings.push('Codex CLI not logged in — run: codex login');
+    result.warnings.push('OpenAI not detected — add OPENAI_API_KEY or install Codex CLI');
   }
 
   // Mode
-  const enabledCount = [auth.claude.found, auth.openai.found].filter(Boolean).length;
+  const enabledCount = Object.values(profile.providers).filter(p => p.enabled).length;
   profile.mode = enabledCount >= 2 ? 'dual'
-    : auth.claude.found ? 'solo-claude'
+    : profile.providers.claude.enabled ? 'solo-claude'
     : 'solo-openai';
   profile.bias = 'balanced';
+  profile.workStyle = 'balanced';
+  profile.apiGuardrail = needsApiGuardrail(capabilities);
+  profile.capabilities = capabilities;
+  profile.detectedAt = new Date().toISOString();
 
   // Environment note
   if (env.isReplit && env.hasReplitTools) {
@@ -663,13 +586,11 @@ async function autoSetup(cwd) {
 }
 
 // ---------------------------------------------------------------------------
-// OAuth token auto-refresh
+// OAuth token auto-refresh (unchanged — token refresh is still valid)
 // ---------------------------------------------------------------------------
 
 /**
  * Silently refresh the Claude OAuth token before it expires.
- * Mirrors the approach used by replit-tools/data-tools claude-auth-refresh.sh,
- * but implemented in JavaScript.
  *
  * Returns one of:
  *   { status: 'valid', hoursRemaining }
@@ -749,240 +670,193 @@ async function autoRefreshToken(cwd) {
 }
 
 // ---------------------------------------------------------------------------
-// detectExistingAuth — silent onboarding scan
+// detectAuth — kept for backward compat, now delegates to detectCapabilities
 // ---------------------------------------------------------------------------
 
 /**
- * Run a CLI command with a timeout, returning stdout as a string.
- * Resolves with null on timeout, error, or non-zero exit.
- * @param {string} cmd
- * @param {string[]} args
- * @param {number} timeoutMs
- * @returns {Promise<string|null>}
- */
-function _runWithTimeout(cmd, args, timeoutMs) {
-  return new Promise(resolve => {
-    let settled = false;
-    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
-
-    let child;
-    try {
-      child = execFile(cmd, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
-        done(err ? null : (stdout || '').trim());
-      });
-    } catch {
-      done(null);
-      return;
-    }
-
-    // Belt-and-suspenders timeout fallback
-    const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch {}
-      done(null);
-    }, timeoutMs + 500);
-
-    if (child?.on) {
-      child.on('close', () => clearTimeout(timer));
-    }
-  });
-}
-
-/**
- * Derive a human-readable plan label from a plan tier string.
- * @param {'claude'|'openai'} provider
- * @param {string} plan  e.g. '$20' | '$100' | '$200'
- */
-function _planLabel(provider, plan) {
-  const labels = {
-    claude: { '$20': 'Claude Pro ($20)', '$100': 'Claude Max x5 ($100)', '$200': 'Claude Max x20 ($200)' },
-    openai: { '$20': 'ChatGPT Plus ($20)', '$100': 'ChatGPT Pro ($100)', '$200': 'ChatGPT Pro ($200)' },
-  };
-  return labels[provider]?.[plan] ?? `${provider} ${plan}`;
-}
-
-/**
- * Silently scan for existing auth from all known sources and return what was
- * found, together with smart setup recommendations.
+ * Detect CLI login status for Claude and Codex.
+ * Checks config files on disk — never makes network calls.
  *
- * Checks (in order, all non-throwing):
- *   1. data-tools / replit-tools  — ~/.claude/credentials.json or
- *      .replit-tools/.claude-persistent/.credentials.json for a session key
- *   2. Claude CLI                 — `claude auth status` with 3 s timeout
- *   3. Codex CLI                  — `codex auth status` with 3 s timeout or
- *                                   ~/.codex/ config files
- *   4. Existing dual-brain config — .dualbrain/profile.json
- *
- * Returns:
- * {
- *   claude:          { found: boolean, source: string|null, plan: string|null, expiresAt: string|null },
- *   openai:          { found: boolean, source: string|null, plan: string|null },
- *   existingProfile: boolean,
- *   recommendations: { headModel: string, budget: string, profile: string },
- * }
- *
- * @param {string} [cwd]
+ * @returns {{ claude: AuthEntry, openai: AuthEntry }}
+ * @typedef {{ found: boolean, source: string|null, loginType: 'oauth'|'cli'|null }} AuthEntry
  */
-async function detectExistingAuth(cwd) {
-  const home = homedir();
-  const root = cwd || process.cwd();
-
-  // -------------------------------------------------------------------------
-  // Result skeleton
-  // -------------------------------------------------------------------------
-  const result = {
-    claude:          { found: false, source: null, plan: null, expiresAt: null },
-    openai:          { found: false, source: null, plan: null },
-    existingProfile: false,
-    recommendations: { headModel: 'claude-sonnet-4-6', budget: '$20', profile: 'balanced' },
+async function detectAuth() {
+  const results = {
+    claude: { found: false, source: null, loginType: null },
+    openai: { found: false, source: null, loginType: null },
   };
 
-  // -------------------------------------------------------------------------
-  // 1. data-tools / replit-tools — credentials.json session key
-  // -------------------------------------------------------------------------
-  const credPaths = [
-    join(root, '.replit-tools', '.claude-persistent', '.credentials.json'),
-    join(home, '.claude', '.credentials.json'),
-    // legacy replit persistent path
-    '/home/runner/workspace/.replit-tools/.claude-persistent/.credentials.json',
+  // --- Claude: check .claude.json for oauthAccount (CLI login) ---
+  const claudePaths = [
+    '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
+    join(homedir(), '.claude', '.claude.json'),
   ];
-  for (const credPath of credPaths) {
+  for (const p of claudePaths) {
     try {
-      const creds = JSON.parse(readFileSync(credPath, 'utf8'));
-      const oauth  = creds?.claudeAiOauth;
-      if (oauth?.accessToken || oauth?.sessionKey) {
-        result.claude.found  = true;
-        result.claude.source = credPath.includes('.replit-tools') ? 'data-tools' : 'credentials.json';
-        // Expiry
-        if (oauth.expiresAt) {
-          try { result.claude.expiresAt = new Date(oauth.expiresAt).toISOString(); } catch {}
-        }
+      const data = JSON.parse(readFileSync(p, 'utf8'));
+      if (data?.oauthAccount) {
+        results.claude.found     = true;
+        results.claude.source    = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
+        results.claude.loginType = 'oauth';
         break;
       }
-    } catch { /* non-fatal */ }
-  }
-
-  // -------------------------------------------------------------------------
-  // 2. Claude CLI auth detection (config files + `claude auth status`)
-  // -------------------------------------------------------------------------
-  if (!result.claude.found) {
-    // Config-file scan (same paths as detectAuth)
-    const claudeConfigPaths = [
-      join(root, '.replit-tools', '.claude-persistent', '.claude.json'),
-      '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
-      join(home, '.claude', '.claude.json'),
-    ];
-    for (const p of claudeConfigPaths) {
-      try {
-        const data = JSON.parse(readFileSync(p, 'utf8'));
-        if (data?.oauthAccount || (data?.apiKey && typeof data.apiKey === 'string')) {
-          result.claude.found  = true;
-          result.claude.source = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
-          break;
-        }
-      } catch { /* non-fatal */ }
-    }
-
-    // CLI fallback: `claude auth status`
-    if (!result.claude.found) {
-      const out = await _runWithTimeout('claude', ['auth', 'status'], 3000);
-      if (out && /logged.in|authenticated|signed.in/i.test(out)) {
-        result.claude.found  = true;
-        result.claude.source = 'claude CLI (auth status)';
+      if (data?.apiKey && typeof data.apiKey === 'string') {
+        results.claude.found     = true;
+        results.claude.source    = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
+        results.claude.loginType = 'cli';
+        break;
       }
-    }
+    } catch { continue; }
   }
 
-  // -------------------------------------------------------------------------
-  // 3. Codex CLI / OpenAI auth detection
-  // -------------------------------------------------------------------------
-  const codexConfigPaths = [
-    join(root, '.replit-tools', '.codex-persistent', 'auth.json'),
+  // --- OpenAI/Codex: check auth.json for access_token or id_token (CLI login) ---
+  const codexPaths = [
     '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
-    join(home, '.codex', 'auth.json'),
+    join(homedir(), '.codex', 'auth.json'),
   ];
-  for (const p of codexConfigPaths) {
+  for (const p of codexPaths) {
     try {
-      const data        = JSON.parse(readFileSync(p, 'utf8'));
+      const data = JSON.parse(readFileSync(p, 'utf8'));
       const accessToken = data?.tokens?.access_token || data?.access_token;
       const idToken     = data?.tokens?.id_token     || data?.id_token;
+
       if (accessToken || idToken) {
-        result.openai.found  = true;
-        result.openai.source = p.includes('.replit-tools') ? 'codex CLI (replit-tools)' : 'codex CLI';
+        results.openai.found     = true;
+        results.openai.source    = p.includes('.replit-tools') ? 'codex CLI (replit-tools)' : 'codex CLI';
+        results.openai.loginType = 'oauth';
         break;
       }
-    } catch { /* non-fatal */ }
+    } catch { continue; }
   }
 
-  // CLI fallback: `codex auth status`
-  if (!result.openai.found) {
-    const out = await _runWithTimeout('codex', ['auth', 'status'], 3000);
-    if (out && /logged.in|authenticated|signed.in/i.test(out)) {
-      result.openai.found  = true;
-      result.openai.source = 'codex CLI (auth status)';
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // 4. Existing dual-brain profile
-  // -------------------------------------------------------------------------
-  for (const p of [projectPath(root), GLOBAL_PATH]) {
-    if (existsSync(p)) {
-      result.existingProfile = true;
-      break;
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Plan tier inference (re-uses detectPlans which reads auth config files)
-  // NOTE: This is NOT subscription detection — we infer a price tier ($20/$100/$200)
-  // from rate-limit tier signals in the auth config (organizationRateLimitTier for
-  // Claude, JWT chatgpt_plan_type for OpenAI). The CLI does not report the actual
-  // plan name or price. Any plan label shown to the user comes from our own mapping.
-  // -------------------------------------------------------------------------
-  const plans = detectPlans();
-  if (result.claude.found && plans.claude) result.claude.plan = plans.claude;
-  if (result.openai.found && plans.openai) result.openai.plan = plans.openai;
-
-  // -------------------------------------------------------------------------
-  // Smart recommendations
-  // -------------------------------------------------------------------------
-  const claudeRank = PLAN_RANK[result.claude.plan] || 0;
-  const openaiRank = PLAN_RANK[result.openai.plan] || 0;
-
-  if (result.claude.found && !result.openai.found) {
-    // Solo Claude
-    result.recommendations.headModel = 'claude-sonnet-4-6';
-    result.recommendations.budget    = result.claude.plan || '$20';
-    result.recommendations.profile   = claudeRank >= 2 ? 'quality-first' : 'balanced';
-  } else if (result.openai.found && !result.claude.found) {
-    // Solo OpenAI
-    result.recommendations.headModel = 'gpt-4o';
-    result.recommendations.budget    = result.openai.plan || '$20';
-    result.recommendations.profile   = openaiRank >= 2 ? 'quality-first' : 'balanced';
-  } else if (result.claude.found && result.openai.found) {
-    // Both available — higher-ranked provider drives HEAD model
-    if (openaiRank > claudeRank) {
-      result.recommendations.headModel = 'gpt-4o';
-    } else {
-      result.recommendations.headModel = 'claude-sonnet-4-6';
-    }
-    const topPlan = openaiRank >= claudeRank ? result.openai.plan : result.claude.plan;
-    result.recommendations.budget  = topPlan || '$20';
-    const topRank = Math.max(claudeRank, openaiRank);
-    result.recommendations.profile = topRank >= 2 ? 'quality-first' : 'balanced';
-  }
-  // else: no auth found — defaults remain (claude-sonnet-4-6 / $20 / balanced)
-
-  return result;
+  return results;
 }
+
+// ---------------------------------------------------------------------------
+// Removed: detectExistingAuth, detectPlans, decodeJwtPayload, saveSubscription,
+//          listSubscriptions, _planLabel, _runWithTimeout
+// These claimed to detect subscription tier/price from auth files — that was
+// never accurate. Use detectCapabilities() instead for honest detection.
+// ---------------------------------------------------------------------------
+
+// Thin stubs retained only so any callers that weren't updated yet
+// fail gracefully with a clear message rather than a crash.
+
+/** @deprecated Use detectCapabilities() instead. */
+async function detectExistingAuth(cwd) {
+  const caps = await detectCapabilities(cwd);
+  return {
+    claude: {
+      found: caps.claude.available,
+      source: caps.claude.source,
+      plan: null,   // not detectable
+      expiresAt: null,
+    },
+    openai: {
+      found: caps.openai.available || caps.codex.available,
+      source: caps.openai.source || caps.codex.source,
+      plan: null,   // not detectable
+    },
+    existingProfile: [projectPath(cwd), GLOBAL_PATH].some(p => existsSync(p)),
+    recommendations: {
+      headModel: caps.claude.available ? 'claude-sonnet-4-6' : 'gpt-4o',
+      // budget field removed — we don't track subscription price
+      profile: 'balanced',
+    },
+  };
+}
+
+/** @deprecated Price-based plan tiers removed. Returns null for all providers. */
+function detectPlans() {
+  return { claude: null, openai: null };
+}
+
+/** @deprecated Plan/subscription tracking removed. Use provider enabled flag instead. */
+function saveSubscription(provider, config, cwd) {
+  const profile = loadProfile(cwd);
+  if (!profile.providers[provider]) profile.providers[provider] = { enabled: true };
+  profile.providers[provider].enabled = true;
+  saveProfile(profile, { cwd: cwd || process.cwd() });
+  return profile;
+}
+
+/** @deprecated Plan/subscription tracking removed. Use getAvailableProviders() instead. */
+function listSubscriptions(cwd) {
+  const profile = loadProfile(cwd);
+  return profile.providers || {};
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cwd  = process.cwd();
+  const flag = args[0];
+  const val  = args[1];
+
+  if (flag === '--init') {
+    const profile = await runOnboarding({ interactive: true, cwd });
+    saveProfile(profile, { cwd });
+    return;
+  }
+  if (flag === '--remember') {
+    if (!val) { process.stderr.write('Usage: --remember "text"\n'); process.exit(1); }
+    const p = rememberPreference(val, { cwd });
+    process.stdout.write(`Preference saved. Total: ${p.preferences.length}\n`);
+    return;
+  }
+  if (flag === '--forget') {
+    if (!val) { process.stderr.write('Usage: --forget "text"\n'); process.exit(1); }
+    forgetPreference(val, cwd);
+    process.stdout.write('Preference removed (if matched).\n');
+    return;
+  }
+  if (flag === '--providers') {
+    const providers = getAvailableProviders(loadProfile(cwd));
+    if (!providers.length) { process.stdout.write('No providers enabled.\n'); return; }
+    providers.forEach(p => process.stdout.write(`${p.name}  enabled=${p.enabled}\n`));
+    return;
+  }
+  if (flag === '--capabilities') {
+    const caps = await detectCapabilities(cwd);
+    process.stdout.write(JSON.stringify(caps, null, 2) + '\n');
+    return;
+  }
+
+  // default: show profile
+  const profile   = loadProfile(cwd);
+  const providers = getAvailableProviders(profile);
+  const caps = await detectCapabilities(cwd);
+  [
+    `mode       : ${profile.mode}`,
+    `workStyle  : ${profile.workStyle || profile.bias}`,
+    `head model : ${getHeadModel(profile)}`,
+    `providers  : ${providers.map(p => p.name).join(', ') || 'none'}`,
+    `prefs      : ${profile.preferences?.filter(p => p.enabled).length || 0} active`,
+    `guardrail  : ${needsApiGuardrail(caps) ? 'enabled (metered API key detected)' : 'off'}`,
+    '',
+    getOnboardingMessage(caps, profile.workStyle || profile.bias),
+  ].forEach(l => process.stdout.write(l + '\n'));
+}
+
+const isMain = process.argv[1]?.endsWith('profile.mjs');
+if (isMain) main().catch(e => { process.stderr.write(e.message + '\n'); process.exit(1); });
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
 
 export {
   loadProfile, saveProfile, ensureProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
-  detectPlans, syncPreferencesToMemory,
+  detectCapabilities, getOnboardingMessage, needsApiGuardrail,
+  syncPreferencesToMemory,
   detectAuth, detectEnvironment,
-  saveSubscription, listSubscriptions,
-  defaultProfile, autoSetup, autoRefreshToken,
-  detectExistingAuth,
+  autoSetup, autoRefreshToken,
+  // backward-compat stubs (deprecated)
+  detectExistingAuth, detectPlans, saveSubscription, listSubscriptions,
+  defaultProfile,
 };

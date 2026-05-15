@@ -6,7 +6,8 @@
  * to use and explains why in one sentence.
  *
  * Exports: decideRoute, getModelCapabilities, getAvailableModels,
- *          estimateBudgetPressure, shouldDualBrain, explainDecision, getFailoverOrder
+ *          WORK_STYLES, getWorkStyle, estimateBudgetPressure,
+ *          shouldDualBrain, explainDecision, getFailoverOrder
  *
  * CLI: node src/decide.mjs --profile /path/to/profile.json \
  *        --detection '{"intent":"edit","risk":"low","complexity":"simple","effort":"medium","tier":"execute"}'
@@ -19,21 +20,56 @@ import { getProviderScore, checkCooldown } from './health.mjs';
 
 const __dirname  = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE  = join(__dirname, '..');
-// ─── Subscription token quotas (mirrors budget-balancer.mjs) ─────────────────
 
-/** Per-plan aggregate token budgets for the two rolling windows. */
-const SUB_QUOTAS = {
-  claude: {
-    '$20':  { fiveHr: 402_500,   weekly: 2_750_000  },
-    '$100': { fiveHr: 1_638_000, weekly: 11_100_000  },
-    '$200': { fiveHr: 4_120_000, weekly: 27_500_000  },
+// ─── Work Styles ─────────────────────────────────────────────────────────────
+
+/**
+ * Work styles control how aggressively the router uses stronger models,
+ * challenger (dual-brain) reviews, and checkpoints.
+ * These replace subscription-tier-based routing — the user picks a style
+ * regardless of what plan they are on.
+ */
+export const WORK_STYLES = {
+  fast: {
+    label: 'Fast',
+    defaultWorker: 'claude-sonnet-4-6',
+    complexWorker: 'claude-sonnet-4-6',
+    challengerPolicy: 'never',
+    checkpointPolicy: 'never',
+    reviewPolicy: 'skip',
+    description: 'Quick answers, single model, minimal reviews',
   },
-  openai: {
-    '$20':  { fiveHr: 400_000,   weekly: 2_700_000  },
-    '$100': { fiveHr: 1_050_000, weekly: 6_750_000  },
-    '$200': { fiveHr: 1_900_000, weekly: 17_500_000  },
+  balanced: {
+    label: 'Balanced',
+    defaultWorker: 'claude-sonnet-4-6',
+    complexWorker: 'claude-opus-4-6',
+    challengerPolicy: 'high-risk',    // only on high/critical risk
+    checkpointPolicy: 'risky-ops',    // before risky operations
+    reviewPolicy: 'important',        // important changes only
+    description: 'Smart routing, reviews on important changes',
+  },
+  fullpower: {
+    label: 'Full Power',
+    defaultWorker: 'claude-sonnet-4-6',
+    complexWorker: 'claude-opus-4-6',
+    challengerPolicy: 'medium-risk',  // medium+ risk
+    checkpointPolicy: 'all-edits',    // before all edits
+    reviewPolicy: 'non-trivial',      // everything non-trivial
+    description: 'Deep reasoning, dual-brain on everything that matters',
   },
 };
+
+/**
+ * Read the active work style from the profile.
+ * Falls back to 'balanced' if not set or unrecognized.
+ * @param {object} profile
+ * @returns {object} The matching WORK_STYLES entry, with a `key` property added.
+ */
+export function getWorkStyle(profile) {
+  const key = profile?.workStyle || profile?.work_style || 'balanced';
+  const style = WORK_STYLES[key] ?? WORK_STYLES.balanced;
+  return { ...style, key: WORK_STYLES[key] ? key : 'balanced' };
+}
 
 // ─── Slim Model Capabilities (routing-relevant only) ─────────────────────────
 
@@ -113,19 +149,32 @@ const MODEL_CAPABILITIES = {
   },
 };
 
-// ─── Subscription Model Access ────────────────────────────────────────────────
+// ─── Canonical Work Model Names ──────────────────────────────────────────────
 
-const CLAUDE_MODELS_BY_PLAN = {
-  '$20':  ['haiku', 'sonnet'],
-  '$100': ['haiku', 'sonnet', 'opus'],
-  '$200': ['haiku', 'sonnet', 'opus'],
+/**
+ * These are the authoritative model IDs used when dispatching work.
+ * The session model (what the user runs Claude Code with) is separate and
+ * does not need to be changed — the router assigns work models independently.
+ *
+ * Role → model mapping:
+ *   execute  → claude-sonnet-4-6       (native tool use, reliable workhorse)
+ *   think    → claude-opus-4-6         (deep reasoning, complex single-brain tasks)
+ *   search   → claude-haiku-4-5-20251001 / gpt-4o-mini  (cheap, fast, disposable)
+ *   challenger → o3 or gpt-4o          (independence — different training = different blind spots)
+ */
+const WORK_MODELS = {
+  execute:    'claude-sonnet-4-6',
+  think:      'claude-opus-4-6',
+  search:     'claude-haiku-4-5-20251001',
+  challengerGpt: 'o3',       // preferred challenger; falls back to gpt-4o when o3 unavailable
+  challengerGptFallback: 'gpt-4o',
+  searchGpt:  'gpt-4o-mini', // GPT-side search/classify
 };
 
-const OPENAI_MODELS_BY_PLAN = {
-  '$20':  ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o'],
-  '$100': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'],
-  '$200': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'],
-};
+/** Always recommend Sonnet as the session model. */
+const RECOMMENDED_SESSION_MODEL = 'claude-sonnet-4-6';
+const RECOMMENDED_SESSION_REASON =
+  'Sonnet has native tool use and is the most cost-effective session model for orchestrating work agents.';
 
 // ─── Exported: getModelCapabilities ──────────────────────────────────────────
 
@@ -141,17 +190,65 @@ export function getModelCapabilities(model) {
 // ─── Exported: getAvailableModels ─────────────────────────────────────────────
 
 /**
- * Return which models the user can access given their profile's provider plans.
- * @param {{ providers?: { claude?: { plan?: string, enabled?: boolean }, openai?: { plan?: string, enabled?: boolean } } }} profile
+ * Return which models the user can access.
+ * All known models are available by default; providers can explicitly restrict
+ * via profile.providers.<provider>.models (array of allowed model short names).
+ * This does NOT gate on subscription price — that was fake knowledge.
+ * @param {{ providers?: { claude?: { enabled?: boolean, models?: string[] }, openai?: { enabled?: boolean, models?: string[] } } }} profile
  * @returns {{ claude: string[], openai: string[] }}
  */
 export function getAvailableModels(profile) {
-  const claudePlan = profile?.providers?.claude?.plan || '$100';
-  const openaiPlan = profile?.providers?.openai?.plan || '$20';
+  const ALL_CLAUDE = ['haiku', 'sonnet', 'opus'];
+  const ALL_OPENAI = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+
+  const claudeModels = profile?.providers?.claude?.models;
+  const openaiModels = profile?.providers?.openai?.models;
+
   return {
-    claude: CLAUDE_MODELS_BY_PLAN[claudePlan] ?? CLAUDE_MODELS_BY_PLAN['$100'],
-    openai: OPENAI_MODELS_BY_PLAN[openaiPlan] ?? OPENAI_MODELS_BY_PLAN['$20'],
+    claude: Array.isArray(claudeModels) ? claudeModels : ALL_CLAUDE,
+    openai: Array.isArray(openaiModels) ? openaiModels : ALL_OPENAI,
   };
+}
+
+// ─── Internal: challenger model selection ────────────────────────────────────
+
+/**
+ * Pick the best challenger model from the opposing provider.
+ * Claude primary → GPT challenger (o3 preferred, gpt-4o fallback).
+ * GPT primary → Claude Opus challenger (Sonnet fallback).
+ * Falls back gracefully when the other provider is not available.
+ *
+ * @param {string} primaryProvider  'claude'|'openai'
+ * @param {object} available        Result of getAvailableModels()
+ * @returns {string|null}
+ */
+function pickChallengerModel(primaryProvider, available) {
+  if (primaryProvider === 'claude') {
+    // Claude is primary → use GPT as challenger
+    if (available.openai.includes(WORK_MODELS.challengerGpt))         return WORK_MODELS.challengerGpt;
+    if (available.openai.includes(WORK_MODELS.challengerGptFallback)) return WORK_MODELS.challengerGptFallback;
+    return null; // OpenAI not available
+  } else {
+    // OpenAI is primary → use Claude Opus as challenger
+    if (available.claude.includes('opus')) return WORK_MODELS.think;
+    if (available.claude.includes('sonnet')) return WORK_MODELS.execute;
+    return null; // Claude not available
+  }
+}
+
+/**
+ * Decide whether to trigger a challenger based on the work style policy and task risk.
+ * When only one provider is available, challenger is never triggered (no cross-provider review possible).
+ * @param {string} challengerPolicy  'never'|'high-risk'|'medium-risk'
+ * @param {'low'|'medium'|'high'|'critical'} risk
+ * @param {boolean} hasBothProviders
+ * @returns {boolean}
+ */
+function shouldTriggerChallenger(challengerPolicy, risk, hasBothProviders) {
+  if (challengerPolicy === 'never' || !hasBothProviders) return false;
+  if (challengerPolicy === 'high-risk')   return ['high', 'critical'].includes(risk);
+  if (challengerPolicy === 'medium-risk') return ['medium', 'high', 'critical'].includes(risk);
+  return false;
 }
 
 // ─── Exported: estimateBudgetPressure (deprecated stub) ──────────────────────
@@ -368,7 +465,7 @@ function chooseProvider(detection, profile, healthScores) {
   const openaiScore = healthScores.openai;
 
   // OpenAI not configured or not enabled → always use Claude
-  if (!profile?.providers?.openai?.enabled || !profile?.providers?.openai?.plan) return 'claude';
+  if (!profile?.providers?.openai?.enabled) return 'claude';
 
   // Both hot (score=0) → pick the one with the higher score; if tied, prefer Claude
   if (claudeScore === 0 && openaiScore === 0) {
@@ -400,38 +497,43 @@ function chooseProvider(detection, profile, healthScores) {
  * @returns {string}
  */
 export function explainDecision(decision, detection, profile) {
-  const { provider, model, effort, dualBrain } = decision;
+  const { provider, model, effort, dualBrain, workStyle, challengerModel } = decision;
   const { intent = 'task', risk = 'low', complexity = 'simple', tier = 'execute' } = detection;
   const healthScores = decision._healthScores || {};
   const mode = profile?.mode || profile?.profile || 'auto';
 
+  const ws = decision._workStyle ?? getWorkStyle(profile);
+  const wsLabel = ws.label ?? workStyle ?? 'Balanced';
   const modelLabel = effort ? `${model} ${effort}` : model;
 
+  if (dualBrain && challengerModel) {
+    return `${wsLabel} mode: ${modelLabel} for ${intent}, ${challengerModel} challenger on ${risk}-risk changes.`;
+  }
   if (dualBrain) {
-    return `Using ${modelLabel} with dual-brain review because this ${intent} change is ${risk} risk.`;
+    return `${wsLabel} mode: ${modelLabel} with dual-brain review because this ${intent} change is ${risk} risk.`;
   }
   // Health-based explanations
   const claudeScore = healthScores.claude ?? 100;
   const providerScore = healthScores[provider] ?? 100;
   if (claudeScore === 0 && provider === 'openai') {
-    return `Using ${modelLabel} because Claude is rate-limited and this is an isolated ${tier} task.`;
+    return `${wsLabel} mode: using ${modelLabel} because Claude is rate-limited and this is an isolated ${tier} task.`;
   }
   if (providerScore < 50) {
-    return `Using ${modelLabel} (downgraded due to rate-limit cooldown) for this ${complexity} ${intent}.`;
+    return `${wsLabel} mode: using ${modelLabel} (downgraded due to rate-limit cooldown) for this ${complexity} ${intent}.`;
   }
   if (mode === 'cost-saver') {
-    return `Using ${modelLabel} because cost-saver mode prefers cheaper models for ${risk}-risk work.`;
+    return `${wsLabel} mode: using ${modelLabel} (cost-saver bias) for ${risk}-risk ${intent}.`;
   }
   if (mode === 'quality-first') {
-    return `Using ${modelLabel} because quality-first mode prefers stronger models for ${intent}.`;
+    return `${wsLabel} mode: using ${modelLabel} (quality-first bias) for ${intent}.`;
   }
   if (THINK_INTENTS.includes(intent)) {
-    return `Using ${modelLabel} because ${intent} tasks need deep reasoning and Claude is healthy.`;
+    return `${wsLabel} mode: ${modelLabel} for ${intent} — deep reasoning needed.`;
   }
   if (tier === 'search' || SEARCH_INTENTS.includes(intent)) {
-    return `Using ${modelLabel} because this is a simple ${intent} with low risk.`;
+    return `${wsLabel} mode: ${modelLabel} for lightweight ${intent} lookup.`;
   }
-  return `Using ${modelLabel} because ${provider} is healthy and this is a routine ${intent}.`;
+  return `${wsLabel} mode: ${modelLabel} for ${intent} (${risk} risk, ${provider} healthy).`;
 }
 
 // ─── Exported: parsePreferences ──────────────────────────────────────────────
@@ -517,7 +619,10 @@ function applyCriticalRiskFloor(model, provider, available, risk) {
  * @returns {object} Routing decision
  */
 export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
-  const available     = getAvailableModels(profile);
+  const available = getAvailableModels(profile);
+
+  // Resolve active work style
+  const workStyle = getWorkStyle(profile);
 
   // Parse free-text user preferences into routing signals
   const prefSignals = parsePreferences(profile.preferences);
@@ -527,13 +632,16 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
     ? { ...profile, mode: prefSignals.biasOverride }
     : profile;
 
-  // dual-brain: start with the natural shouldDualBrain result, then apply preference overrides
-  let dual = shouldDualBrain(detection, profile);
-  if (prefSignals.alwaysDualBrain) dual = true;
-  if (prefSignals.neverDualBrain)  dual = false;
+  const { tier = 'execute', risk = 'low', complexity = 'simple', effort: detectionEffort } = detection;
+  const isHighStakes = ['critical', 'high'].includes(risk);
 
-  const { tier = 'execute', risk = 'low' } = detection;
-  const isHighStakes  = ['critical', 'high'].includes(risk);
+  // Determine whether to use the complexWorker (Opus) or defaultWorker (Sonnet).
+  // "High reasoning depth" means: think-tier intent, high/critical risk, or complex+high-risk.
+  const needsDeepReasoning =
+    THINK_INTENTS.includes(detection.intent || '') ||
+    risk === 'critical' ||
+    (complexity === 'complex' && ['high', 'critical'].includes(risk)) ||
+    detectionEffort === 'xhigh';
 
   // Get health scores for current tier
   const healthScores = getHealthScores(tier, cwd);
@@ -544,23 +652,31 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
   // Apply preferProvider / avoidProvider signals from preferences
   if (prefSignals.preferProvider) {
     const preferred = prefSignals.preferProvider;
-    const prefEnabled = profile?.providers?.[preferred]?.enabled && profile?.providers?.[preferred]?.plan;
+    const prefEnabled = profile?.providers?.[preferred]?.enabled;
     const prefScore   = healthScores[preferred] ?? 0;
-    // Use preferred provider if it is configured and has any health score (even degraded)
     if (prefEnabled && prefScore > 0) provider = preferred;
   }
   if (prefSignals.avoidProvider && provider === prefSignals.avoidProvider) {
-    // Switch to the other provider only if it is configured and healthy
     const other = prefSignals.avoidProvider === 'claude' ? 'openai' : 'claude';
-    const otherEnabled = profile?.providers?.[other]?.enabled && profile?.providers?.[other]?.plan;
+    const otherEnabled = profile?.providers?.[other]?.enabled;
     const otherScore   = healthScores[other] ?? 0;
     if (otherEnabled && otherScore > 0) provider = other;
   }
 
-  // Select base model (use bias-patched profile for model selection too)
-  let model = provider === 'claude'
-    ? pickClaudeModel(detection, available.claude)
-    : pickOpenAIModel(detection, available.openai);
+  // Select base model using work style worker assignments.
+  // For Claude primary: use complexWorker (opus) on deep reasoning, defaultWorker (sonnet) otherwise.
+  // For OpenAI primary: mirror the same logic using GPT equivalents.
+  let model;
+  if (provider === 'claude') {
+    const wantOpus = needsDeepReasoning && workStyle.key !== 'fast';
+    model = wantOpus && available.claude.includes('opus') ? 'opus' : 'sonnet';
+    if (!available.claude.includes(model)) model = available.claude[available.claude.length - 1] ?? 'sonnet';
+  } else {
+    // OpenAI primary — use o3 for deep reasoning in fullpower, gpt-4o otherwise
+    const wantO3 = needsDeepReasoning && workStyle.key === 'fullpower';
+    model = wantO3 && available.openai.includes('o3') ? 'o3' : 'gpt-4o';
+    if (!available.openai.includes(model)) model = available.openai[available.openai.length - 1] ?? 'gpt-4o';
+  }
 
   // Apply health-based downgrade (only if score < 50 and not high-stakes)
   model = applyHealthDowngrade(model, healthScores[provider], provider, available[provider], isHighStakes);
@@ -579,18 +695,39 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
     }
   }
 
+  // ── Challenger / dual-brain decision ─────────────────────────────────────
+  const hasBothProviders = !!(
+    profile?.providers?.claude?.enabled &&
+    profile?.providers?.openai?.enabled
+  );
+
+  // Work-style challenger: triggered by challengerPolicy + risk level
+  const challengerTriggered = shouldTriggerChallenger(
+    workStyle.challengerPolicy,
+    risk,
+    hasBothProviders,
+  );
+
+  // Legacy designImpact dual-brain gate (mandatory review, bypass hasBothProviders check)
+  const legacyDualBrain = !!(detection.designImpact && profile?.dual_brain_enabled !== false);
+
+  // Preference overrides
+  let dual = challengerTriggered || legacyDualBrain || shouldDualBrain(detection, profile);
+  if (prefSignals.alwaysDualBrain) dual = true;
+  if (prefSignals.neverDualBrain)  dual = false;
+
+  // When only one provider available and challenger was the reason, downgrade to single-brain
+  if (dual && !hasBothProviders && !legacyDualBrain) dual = false;
+
+  const degradedDualBrain = !!(legacyDualBrain && !hasBothProviders);
+
+  // Pick challenger model (from the opposing provider)
+  const challengerModel = dual ? pickChallengerModel(provider, available) : null;
+
   // Determine effort, modes, sandbox
   const effort  = pickEffort(model, detection);
   const modes   = pickModes(model, detection);
   const sandbox = pickSandbox(model, detection);
-
-  const hasBothProviders = !!(
-    profile?.providers?.claude?.enabled &&
-    profile?.providers?.claude?.plan &&
-    profile?.providers?.openai?.enabled &&
-    profile?.providers?.openai?.plan
-  );
-  const degradedDualBrain = !!(dual && detection.designImpact && !hasBothProviders);
 
   const decision = {
     provider,
@@ -599,16 +736,19 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
     tier,
     dualBrain: dual,
     ...(degradedDualBrain && { degradedDualBrain: true }),
+    ...(challengerModel    && { challengerModel }),
+    workStyle: workStyle.key,
     modes,
     sandbox,
     explanation: '',
     _healthScores: healthScores,
+    _workStyle: workStyle,
   };
 
   decision.explanation = explainDecision(decision, detection, profileWithEffectiveBias);
 
-  // Remove internal field from public output
-  const { _healthScores, ...result } = decision;
+  // Remove internal fields from public output
+  const { _healthScores, _workStyle, ...result } = decision;
   return result;
 }
 
@@ -648,10 +788,8 @@ export function getFailoverOrder(decision, profile) {
   const claudeRank = claudeRankByTier[tier] ?? claudeRankByTier.execute;
   const openaiRank = openaiRankByTier[tier] ?? openaiRankByTier.execute;
 
-  const claudeEnabled = !!(profile?.providers?.claude?.enabled && profile?.providers?.claude?.plan);
-  const openaiEnabled = !!(profile?.providers?.openai?.enabled && profile?.providers?.openai?.plan);
-  const claudePlan    = profile?.providers?.claude?.plan ?? '$20';
-  const openaiPlan    = profile?.providers?.openai?.plan ?? '$20';
+  const claudeEnabled = !!(profile?.providers?.claude?.enabled);
+  const openaiEnabled = !!(profile?.providers?.openai?.enabled);
 
   const fallbacks = [];
 
@@ -660,13 +798,13 @@ export function getFailoverOrder(decision, profile) {
     for (const m of claudeRank) {
       if (m === failedModel) continue;
       if (!available.claude.includes(m)) continue;
-      fallbacks.push({ provider: 'claude', model: m, plan: claudePlan, label: `Claude ${m} (${claudePlan})` });
+      fallbacks.push({ provider: 'claude', model: m, label: `Claude ${m}` });
     }
     // Cross-provider fallbacks: OpenAI models
     if (openaiEnabled) {
       for (const m of openaiRank) {
         if (!available.openai.includes(m)) continue;
-        fallbacks.push({ provider: 'openai', model: m, plan: openaiPlan, label: `OpenAI ${m} (${openaiPlan})` });
+        fallbacks.push({ provider: 'openai', model: m, label: `OpenAI ${m}` });
       }
     }
   } else {
@@ -674,13 +812,13 @@ export function getFailoverOrder(decision, profile) {
     for (const m of openaiRank) {
       if (m === failedModel) continue;
       if (!available.openai.includes(m)) continue;
-      fallbacks.push({ provider: 'openai', model: m, plan: openaiPlan, label: `OpenAI ${m} (${openaiPlan})` });
+      fallbacks.push({ provider: 'openai', model: m, label: `OpenAI ${m}` });
     }
     // Cross-provider fallbacks: Claude models
     if (claudeEnabled) {
       for (const m of claudeRank) {
         if (!available.claude.includes(m)) continue;
-        fallbacks.push({ provider: 'claude', model: m, plan: claudePlan, label: `Claude ${m} (${claudePlan})` });
+        fallbacks.push({ provider: 'claude', model: m, label: `Claude ${m}` });
       }
     }
   }
