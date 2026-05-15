@@ -1,0 +1,41 @@
+{
+  "foundations": [
+    {
+      "id": "honest-capability-detection",
+      "claim": "We can only detect provider availability (binary yes/no), not subscription tier or usage quota",
+      "status": "active",
+      "dependents": ["src/profile.mjs", "src/decide.mjs", "bin/dual-brain.mjs"],
+      "decided_in": "provider-detection"
+    },
+    {
+      "id": "work-style-routing",
+      "claim": "Routing is driven by user-chosen work style (Fast/Balanced/Full Power), not inferred budget",
+      "status": "active",
+      "dependents": ["src/decide.mjs", "src/pipeline.mjs", "bin/dual-brain.mjs"],
+      "decided_in": "routing-decisions"
+    },
+    {
+      "id": "no-fake-usage-tracking",
+      "claim": "No absolute usage/quota tracking — no API exists to verify subscription usage",
+      "status": "active",
+      "dependents": ["src/decide.mjs", ".claude/hooks/budget-balancer.mjs"],
+      "decided_in": "budget-system"
+    },
+    {
+      "id": "fake-subscription-detection",
+      "claim": "We can detect subscription tier from CLI tools",
+      "status": "invalidated",
+      "invalidated_at": "2026-05-15",
+      "reason": "No API exists for subscription tier detection from Claude or OpenAI",
+      "dependents": []
+    },
+    {
+      "id": "fake-usage-quotas",
+      "claim": "We can track usage against subscription quota limits",
+      "status": "invalidated",
+      "invalidated_at": "2026-05-15",
+      "reason": "Self-reported token counts miss everything done outside dual-brain",
+      "dependents": []
+    }
+  ]
+}

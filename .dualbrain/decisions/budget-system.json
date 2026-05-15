@@ -1,0 +1,10 @@
+{
+  "area": "budget-system",
+  "question": "How should dual-brain handle budget and usage tracking?",
+  "claude_position": "No absolute usage tracking — there's no API to query real subscription quotas. Relative session awareness (you've used Claude a lot this session) is the most we can honestly claim.",
+  "gpt_position": "Agree. Without actual provider usage APIs, internal counters are fiction. Local estimates are only useful if clearly labeled as estimates, not driving hard routing decisions.",
+  "synthesis": "No fake usage tracking. No sparkline bars. No percentage-of-quota displays. Work style drives routing, not budget math. Session-level provider lean is the only honest metric. API guardrail for metered keys.",
+  "decided_at": "2026-05-15",
+  "expires_at": "2026-11-15",
+  "status": "active"
+}

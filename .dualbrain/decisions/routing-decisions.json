@@ -1,0 +1,10 @@
+{
+  "area": "routing-decisions",
+  "question": "How should dual-brain route tasks between Claude and GPT models?",
+  "claude_position": "Route by work style (Fast/Balanced/Full Power) not budget. The real value of GPT routing is independence — different training pipeline catches different blind spots, not 'GPT is better at X'.",
+  "gpt_position": "Agree on work styles over budget. Add: route by intent, cost preference, and availability. Default paths must stay fast. Dual-brain should trigger by risk threshold, not be default for everything.",
+  "synthesis": "Three work styles drive routing policy. Sonnet is default workhorse. Opus for deep single-brain reasoning. GPT for independent challenger/review. Challenger triggers based on risk level per work style, not budget. No fake usage tracking.",
+  "decided_at": "2026-05-15",
+  "expires_at": "2026-11-15",
+  "status": "active"
+}

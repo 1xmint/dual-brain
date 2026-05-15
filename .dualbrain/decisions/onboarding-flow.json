@@ -1,0 +1,10 @@
+{
+  "area": "onboarding-flow",
+  "question": "What should the new user onboarding experience look like?",
+  "claude_position": "Auto-detect capabilities (2 seconds), ask ONE question (work style: Fast/Balanced/Full Power), done. No subscription picker, no model selector. Make the user feel smart by default.",
+  "gpt_position": "Agree. Asking about subscriptions is wrong — users think in work preferences, not plan tiers. Add non-blocking API cost guardrail if metered key detected.",
+  "synthesis": "One-question onboarding: auto-detect available providers, pick work style, start working. No plan questions. Conservative API defaults when metered keys detected. Total setup under 5 seconds.",
+  "decided_at": "2026-05-15",
+  "expires_at": "2026-11-15",
+  "status": "active"
+}

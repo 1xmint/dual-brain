@@ -391,9 +391,87 @@ function checkBudgetOrDeny() {
   }
 }
 
+// ── Decision artifact check ───────────────────────────────────────────────────
+// Advisory only — warns when a sensitive area is touched without a valid decision artifact.
+// Never blocks. Silently skips if .dualbrain/decisions/ doesn't exist.
+
+const SENSITIVE_AREAS = [
+  {
+    patterns: [/\brouting\b/, /\bdecide\b/, /\bdispatch\b/],
+    artifact: 'routing-decisions',
+    hint: 'Run dual-brain think before implementing changes to routing logic',
+  },
+  {
+    patterns: [/\bdetect\b/, /\bclassif/],
+    artifact: 'task-detection',
+    hint: 'Run dual-brain think before implementing changes to detection/classification logic',
+  },
+  {
+    patterns: [/\bprofile\b/, /\bprovider\b/, /\bcapabilit/],
+    artifact: 'provider-detection',
+    hint: 'Run dual-brain think before implementing changes to provider/profile logic',
+  },
+  {
+    patterns: [/\bonboard\b/, /\bwizard\b/, /\bsetup\b/],
+    artifact: 'onboarding-flow',
+    hint: 'Run dual-brain think before implementing changes to onboarding/setup flow',
+  },
+  {
+    patterns: [/\bbudget\b/, /\bsubscription\b/, /\bquota\b/, /\busage\b/],
+    artifact: 'budget-system',
+    hint: 'Run dual-brain think before implementing changes to budget/subscription logic',
+  },
+];
+
+function checkDecisionArtifact(taskDescription, filePaths, cwd) {
+  // Skip silently if decisions directory doesn't exist
+  const decisionsDir = join(cwd || WORKSPACE, '.dualbrain', 'decisions');
+  if (!existsSync(decisionsDir)) return null;
+
+  const haystack = [taskDescription, ...(filePaths || [])].join(' ').toLowerCase();
+
+  for (const area of SENSITIVE_AREAS) {
+    const matched = area.patterns.some((re) => re.test(haystack));
+    if (!matched) continue;
+
+    const artifactPath = join(decisionsDir, `${area.artifact}.json`);
+    if (!existsSync(artifactPath)) {
+      return { needed: true, area: area.artifact, status: 'missing', hint: area.hint };
+    }
+
+    let artifact;
+    try {
+      artifact = JSON.parse(readFileSync(artifactPath, 'utf8'));
+    } catch {
+      return { needed: true, area: area.artifact, status: 'missing', hint: area.hint };
+    }
+
+    if (artifact.expires_at && Date.now() > new Date(artifact.expires_at).getTime()) {
+      return { needed: true, area: area.artifact, status: 'expired', hint: area.hint };
+    }
+
+    return { needed: true, area: area.artifact, status: 'valid', hint: area.hint };
+  }
+
+  return null; // no sensitive area matched
+}
+
 // ── Agent tool: always allow (dispatching is HEAD's primary job) ─────────────
 if (toolName === 'Agent') {
   checkBudgetOrDeny();
+
+  // Decision artifact advisory check
+  const agentInput = input.tool_input || {};
+  const taskDesc   = agentInput.prompt || agentInput.task || agentInput.description || '';
+  const filePaths  = Array.isArray(agentInput.files) ? agentInput.files : [];
+  const artifactResult = checkDecisionArtifact(taskDesc, filePaths, WORKSPACE);
+  if (artifactResult && artifactResult.needed && artifactResult.status !== 'valid') {
+    process.stderr.write(
+      `[dual-brain] ⚠ doctor: sensitive area "${artifactResult.area}" — no decision artifact ${artifactResult.status === 'expired' ? '(expired)' : 'found'}\n` +
+      `  ${artifactResult.hint}\n`
+    );
+  }
+
   auditAllow('agent-dispatch');
   process.exit(0);
 }

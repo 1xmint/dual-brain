@@ -1,0 +1,10 @@
+{
+  "area": "provider-detection",
+  "question": "How should dual-brain detect what AI providers a user has available?",
+  "claude_position": "Only detect binary availability — Claude Code running (yes/no), OPENAI_API_KEY exists (yes/no), Codex CLI in PATH (yes/no). Never infer subscription tier.",
+  "gpt_position": "Agree. Stop modeling unknowable state. Treat plan, limits, and preferences as user-provided configuration, not inferred.",
+  "synthesis": "Detect ONLY verifiable availability. No subscription tier detection, no plan inference, no quota estimation. If we can't call an API to verify it, we don't claim to know it.",
+  "decided_at": "2026-05-15",
+  "expires_at": "2026-11-15",
+  "status": "active"
+}
