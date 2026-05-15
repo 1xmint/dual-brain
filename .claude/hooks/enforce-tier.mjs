@@ -242,6 +242,19 @@ try {
   const hasMarker = DISPATCH_MARKER_RE.test(rawPrompt);
   const inSubagent = Boolean(input.agent_id);
 
+  if (ti.run_in_background === true && !inSubagent) {
+    // Background agents dispatched from HEAD cannot be reviewed — block them.
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          '[dual-brain] HEAD must dispatch foreground agents to review results. Remove run_in_background or use dual-brain go.',
+      },
+    }));
+    process.exit(2);
+  }
+
   if (!inSubagent && !hasMarker && !isReadOnly(rawPrompt)) {
     // Write-intent detected in HEAD session without the dispatch marker → block.
     process.stdout.write(JSON.stringify({

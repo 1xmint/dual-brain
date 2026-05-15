@@ -43,6 +43,13 @@ const RISK_KEYWORDS = [
   { level: 'low',      regex: /\b(readme|docs?|comment|format|lint|changelog|typo|whitespace)\b/i },
 ];
 
+const DESIGN_IMPACT_PATTERNS = [
+  /\bbin\/dual-brain\.mjs\b/,
+  /\bsrc\/(?:tui|profile|detect|decide|dispatch|session|health|index)\.mjs\b/,
+  /\bhooks\/(?:head-guard|enforce-tier|budget-balancer|dual-brain-think|dual-brain-review|wave-orchestrator)\.mjs\b/,
+  /\bVISION\.md\b/,
+];
+
 const LEVEL_ORDER = { critical: 3, high: 2, medium: 1, low: 0 };
 
 // ─── Helpers / Exported functions ─────────────────────────────────────────────
@@ -152,6 +159,7 @@ function detectTask(input) {
   const extractedPaths = extractPaths(prompt);
   const allPaths = [...files, ...extractedPaths];
   const { level: pathRiskLevel, riskyFiles } = classifyRisk(allPaths);
+  const designImpact = allPaths.some(p => DESIGN_IMPACT_PATTERNS.some(re => re.test(p)));
 
   // 3. Keyword risk from description
   let keywordRisk = 'low';
@@ -199,6 +207,7 @@ function detectTask(input) {
     tier,
     fileCount,
     riskyFiles,
+    designImpact,
     requiresWrite: requiresWrite(intent),
     explanation,
   };

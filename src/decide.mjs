@@ -213,7 +213,7 @@ function getHealthScores(tier, cwd) {
  * @returns {boolean}
  */
 export function shouldDualBrain(detection, profile) {
-  const { intent = '', risk = 'low', complexity = 'simple' } = detection;
+  const { intent = '', risk = 'low', complexity = 'simple', designImpact = false } = detection;
   const dualEnabled = profile?.dual_brain_enabled !== false;
   const hasBothProviders = !!(
     profile?.providers?.claude?.enabled &&
@@ -227,7 +227,7 @@ export function shouldDualBrain(detection, profile) {
   const archOrSecurity    = ['architecture', 'security'].includes(intent);
   const complexHighRisk   = complexity === 'complex' && risk === 'high';
 
-  return criticalRisk || archOrSecurity || complexHighRisk;
+  return criticalRisk || archOrSecurity || complexHighRisk || designImpact;
 }
 
 // ─── Internal: select model for provider ─────────────────────────────────────
