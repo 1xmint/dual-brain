@@ -672,7 +672,7 @@ function cmdBreakGlass(reason) {
  * Render the data-tools-style rounded header box for the main screen.
  * Inner width is 39 chars. Lines are padded with spaces to fill the box.
  */
-function renderHeader(version, providerLines) {
+function renderHeader(version, providerLines, dtVersion) {
   const W = 39; // inner width
   const pad = (s) => {
     // Strip ANSI codes for length calculation
@@ -683,11 +683,13 @@ function renderHeader(version, providerLines) {
   const sep    = `  ├${'─'.repeat(W)}┤`;
   const bottom = `  └${'─'.repeat(W)}┘`;
 
-  const title  = `DATA Tools - Dual Brain v${version}`;
+  const title  = dtVersion ? `DATA Tools v${dtVersion}` : `DATA Tools`;
+  const subTitle = `🧠 Dual Brain v${version}`;
   const credit = `by Steve Moraco + dual-brain`;
 
   const lines = [top];
   lines.push(`  │ ${pad(title)}│`);
+  lines.push(`  │ ${pad(subTitle)}│`);
   lines.push(`  │ ${pad(credit)}│`);
   lines.push(sep);
   for (const pl of providerLines) {
@@ -1033,7 +1035,15 @@ async function mainScreen(rl, ask) {
     subLine('OpenAI', openaiPlan, auth.openai.found, openaiExpired, openaiDays, openaiSub),
   ];
 
-  console.log(`📦 DATA Tools - Dual Brain v${version}`);
+  const rtMain = detectReplitTools(cwd);
+  const dtVersion = (rtMain.installed && rtMain.version) ? rtMain.version : null;
+  if (dtVersion) {
+    console.log(`📦 DATA Tools v${dtVersion}`);
+    console.log(`🧠 Dual Brain v${version}`);
+  } else {
+    console.log(`📦 DATA Tools`);
+    console.log(`🧠 Dual Brain v${version}`);
+  }
   const latestVersion = await checkForUpdates(version);
   if (latestVersion) {
     console.log(`  ⬆️  Update available: v${version} → v${latestVersion}`);
@@ -1044,12 +1054,6 @@ async function mainScreen(rl, ask) {
   // Provider status (outside the box)
   for (const line of headerLines) {
     console.log(`  ${line}`);
-  }
-
-  // replit-tools indicator
-  const rtMain = detectReplitTools(cwd);
-  if (rtMain.installed && rtMain.version) {
-    console.log(`  🔗 replit-tools v${rtMain.version}`);
   }
 
   const sparkline = buildSparkline(cwd);
