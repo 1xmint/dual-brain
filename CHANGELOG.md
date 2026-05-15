@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0
+
+Fresh start. Reset from v7.1.x development versions to honest semver.
+All features from the v7.1.x series are included.
+
 ## 7.1.15
 - Timestamp fix for session import (stale dates no longer overwrite correct ones)
 - isRealPrompt filter to exclude system/hook noise from session index
