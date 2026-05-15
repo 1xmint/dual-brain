@@ -709,7 +709,7 @@ async function dispatch(input = {}) {
     ? input.situationBrief.trim()
     : null;
   if (situationBrief) {
-    prompt = `--- SITUATION BRIEF ---\n${situationBrief}\n--- END BRIEF ---\n\n${prompt}`;
+    prompt = `[SITUATION BRIEF]\n${situationBrief}\n[END BRIEF]\n\n${prompt}`;
   }
   // ── End situation brief ──────────────────────────────────────────────────────
 
@@ -1071,7 +1071,7 @@ async function dispatchDualBrain(input = {}) {
     ? input.situationBrief.trim()
     : null;
   if (_dualBrainBrief) {
-    prompt = `--- SITUATION BRIEF ---\n${_dualBrainBrief}\n--- END BRIEF ---\n\n${prompt}`;
+    prompt = `[SITUATION BRIEF]\n${_dualBrainBrief}\n[END BRIEF]\n\n${prompt}`;
   }
   // ── End situation brief ──────────────────────────────────────────────────────
 
