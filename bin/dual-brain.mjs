@@ -1133,7 +1133,8 @@ async function mainScreen(rl, ask) {
       const active = sess.isActive ? ' ●' : '';
       const cat    = sess.category ? `  [${sess.category}]` : '';
       const tool = (sess.tool === 'codex') ? 'cdx' : 'cld';
-      console.log(`  [${i + 1}] ${pin}${tool}  ${sess.age.padEnd(8)} ${sess.name}${active}${cat}`);
+      const displayName = (sess.name && sess.name.length > 40) ? sess.name.slice(0, 37) + '...' : (sess.name || sess.id.slice(0, 8));
+      console.log(`  [${i + 1}] ${pin}${tool}  ${sess.age.padEnd(8)} ${displayName}${active}${cat}`);
     });
     console.log('');
   }
@@ -1148,7 +1149,7 @@ async function mainScreen(rl, ask) {
   };
   console.log(brandTop);
   console.log(`  │ ${brandPad('Dual Brain Session Manager')}│`);
-  console.log(`  │ ${brandPad('by Steve Moraco + dual-brain')}│`);
+  console.log(`  │ ${brandPad('Built on data-tools by Steve Moraco')}│`);
   console.log(brandBottom);
   console.log('');
 
@@ -1163,6 +1164,7 @@ async function mainScreen(rl, ask) {
 
   console.log('  [c] Continue last session');
   console.log('  [n] New session');
+  console.log('');
   if (recentSessions.length > 0) {
     console.log('  [1-9] Resume numbered above');
   }
