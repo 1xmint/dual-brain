@@ -368,22 +368,24 @@ async function cmdGo(args) {
     vtrace(`Dual-brain: ${decision.dualBrain ? 'yes' : 'no'} (${isSoloBrain(profile) ? 'solo provider' : 'dual provider'}, ${detection.risk} risk)`);
   }
 
-  // Print routing table
-  console.log(`  provider   : ${decision.provider}`);
-  console.log(`  model      : ${decision.model}${decision.effort ? ' (' + decision.effort + ')' : ''}`);
-  console.log(`  tier       : ${decision.tier}`);
-  console.log(`  dual-brain : ${decision.dualBrain ? 'yes' : 'no'}`);
-  console.log(`  reason     : ${decision.explanation}`);
+  // Print routing table (only in dry-run or verbose; silent in normal mode)
+  if (dryRun || verbose) {
+    console.log(`  provider   : ${decision.provider}`);
+    console.log(`  model      : ${decision.model}${decision.effort ? ' (' + decision.effort + ')' : ''}`);
+    console.log(`  tier       : ${decision.tier}`);
+    console.log(`  dual-brain : ${decision.dualBrain ? 'yes' : 'no'}`);
+    console.log(`  reason     : ${decision.explanation}`);
+  }
 
   if (dryRun) {
     console.log('\n(dry-run — not executing)');
     return;
   }
 
-  console.log('\nDispatching...');
+  if (verbose) console.log('\nDispatching...');
   let result;
   if (decision.dualBrain) {
-    result = await dispatchDualBrain({ decision, prompt, files, cwd });
+    result = await dispatchDualBrain({ decision, prompt, files, cwd, verbose });
     console.log(`\nConsensus: ${result.consensus}`);
     if (result.claude?.summary) console.log(`Claude : ${result.claude.summary}`);
     if (result.openai?.summary) console.log(`OpenAI : ${result.openai.summary}`);
@@ -398,7 +400,7 @@ async function cmdGo(args) {
       nextAction:   null,
     }, cwd);
   } else {
-    result = await dispatch({ decision, prompt, files, cwd });
+    result = await dispatch({ decision, prompt, files, cwd, verbose });
     const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
     console.log(`\n${statusLine} in ${(result.durationMs / 1000).toFixed(1)}s`);
     if (result.summary) console.log(result.summary);
@@ -1001,6 +1003,176 @@ function loadTerminalState(cwd, terminalId) {
 // ─── Dashboard box helpers ────────────────────────────────────────────────────
 
 /**
+ * Detect repo state for action cards. All checks run with tight timeouts —
+ * best-effort only, never blocks startup.
+ *
+ * Returns: { dirtyCount, lastCommitAgeDays, lastFailure, isGitRepo }
+ */
+function detectRepoState(cwd) {
+  const result = { dirtyCount: 0, lastCommitAgeDays: 0, lastFailure: null, isGitRepo: false };
+  try {
+    execSync('git rev-parse --git-dir', { cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe' });
+    result.isGitRepo = true;
+  } catch { return result; }
+
+  try {
+    const status = execSync('git status --porcelain', { cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe' });
+    result.dirtyCount = status.trim().split('\n').filter(Boolean).length;
+  } catch {}
+
+  try {
+    const logOut = execSync('git log --format="%ct" -1', { cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe' }).trim();
+    if (logOut) {
+      const commitTs = parseInt(logOut, 10) * 1000;
+      result.lastCommitAgeDays = Math.floor((Date.now() - commitTs) / 86400000);
+    }
+  } catch {}
+
+  try {
+    const sessionPath = join(cwd, '.dualbrain', 'session.json');
+    if (existsSync(sessionPath)) {
+      const sess = JSON.parse(readFileSync(sessionPath, 'utf8'));
+      const lastResult = sess?.lastResult;
+      if (lastResult?.status === 'failure') {
+        const summary = lastResult.task
+          ? String(lastResult.task).slice(0, 40)
+          : 'last task';
+        result.lastFailure = summary;
+      }
+    }
+  } catch {}
+
+  return result;
+}
+
+/**
+ * Build action card rows for the dashboard based on repo state.
+ * Returns an array of box row strings (may be empty).
+ */
+function buildActionRows(repoState, rowFn) {
+  if (!repoState.isGitRepo) return [];
+
+  const YELLOW = '\x1b[33m';
+  const RED    = '\x1b[31m';
+  const GREEN  = '\x1b[32m';
+  const DIM    = '\x1b[2m';
+  const RESET  = '\x1b[0m';
+
+  const cards = [];
+
+  if (repoState.dirtyCount > 0) {
+    cards.push(`${YELLOW}⚡${RESET} ${repoState.dirtyCount} uncommitted file${repoState.dirtyCount === 1 ? '' : 's'}`);
+  }
+
+  if (repoState.lastFailure !== null) {
+    cards.push(`${RED}⚡${RESET} Last task failed: ${repoState.lastFailure}`);
+  }
+
+  if (repoState.lastCommitAgeDays >= 3) {
+    cards.push(`${YELLOW}⚡${RESET} ${repoState.lastCommitAgeDays} day${repoState.lastCommitAgeDays === 1 ? '' : 's'} since last commit`);
+  }
+
+  if (cards.length === 0) {
+    return [rowFn(`${DIM}${GREEN}✓${RESET}${DIM} Repo clean${RESET}`)];
+  }
+
+  return cards.map(c => rowFn(c));
+}
+
+/**
+ * Detect interrupted work from the most recent session.
+ * Returns a continuation hint if confidence is high enough, or null to skip.
+ *
+ * Signals that indicate interrupted work:
+ *  - Session < 4 hours old with no clean exit
+ *  - Last result was a failure
+ *  - Uncommitted git changes exist
+ *  - Session has high message count (user was deep in work)
+ *
+ * Minimum thresholds: messageCount > 5 OR filesChanged > 0
+ *
+ * @param {Array} sessions   — from importReplitSessions / enrichSessions
+ * @param {string} cwd
+ * @returns {{ shouldContinue: boolean, reason: string, sessionId: string, sessionName: string, lastState: string|null, ageLabel: string }|null}
+ */
+function detectInterruptedWork(sessions, cwd) {
+  if (!sessions || sessions.length === 0) return null;
+
+  const most = sessions[0]; // already sorted most-recent first
+  if (!most || !most.lastActive) return null;
+
+  const ageMs = Date.now() - new Date(most.lastActive).getTime();
+  const fourH = 4 * 60 * 60 * 1000;
+
+  // Must be within 4 hours
+  if (ageMs >= fourH) return null;
+
+  // Load session.json for deeper signal
+  const session = loadSession(cwd);
+
+  // Minimum thresholds: must have real work depth
+  const msgCount     = most.messageCount ?? most.promptCount ?? 0;
+  const filesChanged = session?.filesChanged?.length ?? 0;
+  if (msgCount <= 5 && filesChanged === 0) return null;
+
+  const lastResultStatus = session?.lastResult?.status ?? null;
+
+  // Build confidence signals
+  const signals = [];
+  if (lastResultStatus === 'failure') signals.push('last run failed');
+  if (filesChanged > 0) signals.push(`${filesChanged} file${filesChanged !== 1 ? 's' : ''} changed`);
+  if (msgCount > 10) signals.push('deep session');
+
+  // Check for uncommitted git changes
+  try {
+    const gitResult = _spawnSyncTop('git', ['status', '--porcelain'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 3000,
+    });
+    if (gitResult.status === 0 && gitResult.stdout.trim().length > 0) {
+      signals.push('uncommitted changes');
+    }
+  } catch { /* non-fatal */ }
+
+  // Need at least one signal beyond base thresholds to avoid annoying low-signal cards
+  if (signals.length === 0 && msgCount <= 10) return null;
+
+  // Build a human-readable "last state" from available data
+  let lastState = null;
+  if (session?.lastResult?.summary) {
+    lastState = session.lastResult.summary;
+  } else if (session?.objective) {
+    lastState = session.objective;
+  } else if (most.name && !/^Session [0-9a-f]{8}/i.test(most.name)) {
+    lastState = most.name;
+  }
+
+  // Trim lastState to fit on one line
+  if (lastState && lastState.length > 45) lastState = lastState.slice(0, 42) + '...';
+
+  // Build reason label
+  const reason = signals.length > 0 ? signals.join(', ') : `${msgCount} messages`;
+
+  // Age label
+  const mins = Math.floor(ageMs / 60000);
+  let ageLabel;
+  if (mins < 1)       ageLabel = 'just now';
+  else if (mins < 60) ageLabel = `${mins}m ago`;
+  else                ageLabel = `${Math.floor(mins / 60)}h ago`;
+
+  return {
+    shouldContinue: true,
+    reason,
+    sessionId:   most.id,
+    sessionName: most.name || most.id.slice(0, 8),
+    lastState,
+    ageLabel,
+  };
+}
+
+/**
  * Build a provider status string for the dashboard status line.
  * Returns a string like: "🟢 Claude $100×2 $20×1  🟢 OpenAI $100"
  * Uses ANSI color codes for the dots (no emoji width issues).
@@ -1105,6 +1277,9 @@ async function mainScreen(rl, ask) {
   const rtMain    = detectReplitTools(cwd);
   const dtVersion = (rtMain.installed && rtMain.version) ? rtMain.version : null;
 
+  // ── Interrupted work detection ────────────────────────────────────────────
+  const interrupted = detectInterruptedWork(allSessions, cwd);
+
   // ── Box layout ────────────────────────────────────────────────────────────
   const termW = process.stdout.columns || 60;
   const boxW  = Math.min(termW - 2, 60); // outer width (including │ │)
@@ -1135,6 +1310,84 @@ async function mainScreen(rl, ask) {
     }
   }
 
+  // ── Continuation card (interrupted work) ─────────────────────────────────
+  if (interrupted) {
+    const ctop = `┌${'─'.repeat(boxW - 2)}┐`;
+    const csep = `├${'─'.repeat(boxW - 2)}┤`;
+    const cbot = `└${'─'.repeat(boxW - 2)}┘`;
+    const crow = (content) => makeBoxRow(content, W);
+
+    const titleLine = `\x1b[33m💡\x1b[0m Continue: ${interrupted.sessionName}`;
+    const lastLine  = interrupted.lastState
+      ? `   Last: ${interrupted.lastState} · ${interrupted.ageLabel}`
+      : `   ${interrupted.reason} · ${interrupted.ageLabel}`;
+    const actLine   = '   [Enter] Resume  [n] New session  [s] Skip';
+
+    process.stdout.write([ctop, crow(titleLine), csep, crow(lastLine), crow(actLine), cbot].join('\n') + '\n\n');
+
+    // Wait for a keypress to decide what to do with the card
+    const readline2 = await import('node:readline');
+    readline2.emitKeypressEvents(process.stdin, rl);
+
+    const cardChoice = await new Promise((resolve) => {
+      const wasRaw2 = process.stdin.isRaw;
+      const canRaw2 = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+      if (canRaw2) process.stdin.setRawMode(true);
+
+      const cleanup2 = () => {
+        process.stdin.removeListener('keypress', onCardKey);
+        if (canRaw2) {
+          try { process.stdin.setRawMode(wasRaw2 || false); } catch {}
+        }
+      };
+
+      const onCardKey = (str, key) => {
+        if (!key) return;
+        const name = key.name || '';
+        const seq  = key.sequence || str || '';
+
+        if (key.ctrl && (name === 'c' || name === 'd')) {
+          cleanup2();
+          process.stdout.write('\n');
+          resolve('q');
+          return;
+        }
+
+        if (name === 'return' || name === 'enter' || seq === '\r' || seq === '\n') {
+          cleanup2();
+          process.stdout.write('\n');
+          resolve('resume');
+          return;
+        }
+
+        if (!str || str.length === 0) return;
+        const lower = str.toLowerCase();
+        if (lower === 'n' || lower === 's' || lower === 'q') {
+          cleanup2();
+          process.stdout.write('\n');
+          resolve(lower);
+          return;
+        }
+      };
+
+      process.stdin.on('keypress', onCardKey);
+    });
+
+    if (cardChoice === 'q') return { next: 'exit' };
+
+    if (cardChoice === 'resume') {
+      const { spawnSync } = await import('node:child_process');
+      process.stdout.write(`  Launching: claude --resume ${interrupted.sessionId}\n\n`);
+      spawnSync('claude', ['--resume', interrupted.sessionId], { stdio: 'inherit' });
+      saveTerminalState(cwd, getTerminalId(), interrupted.sessionId, 'claude');
+      return { next: 'main' };
+    }
+
+    if (cardChoice === 'n') return { next: 'new-session' };
+
+    // 's' → fall through to normal dashboard
+  }
+
   // ── Status section ────────────────────────────────────────────────────────
   const providerLine = buildProviderStatusLine(profile, auth);
 
@@ -1142,6 +1395,10 @@ async function mainScreen(rl, ask) {
   if (dtVersion) {
     statusRows.push(row(`\x1b[2m📦 data-tools v${dtVersion}\x1b[0m`));
   }
+
+  // ── Action cards (git state) ──────────────────────────────────────────────
+  const repoState  = detectRepoState(cwd);
+  const actionRows = buildActionRows(repoState, row);
 
   // ── Sessions section ──────────────────────────────────────────────────────
   const sessionRows = [];
@@ -1199,9 +1456,11 @@ async function mainScreen(rl, ask) {
   const actionsRow     = row(actionsContent);
 
   // ── Print the full box ────────────────────────────────────────────────────
+  // Include action cards between status and sessions (with separators only when non-empty)
   const lines = [
     top,
     ...statusRows,
+    ...(actionRows.length > 0 ? [sep, ...actionRows] : []),
     sep,
     ...sessionRows,
     sep,
@@ -3153,22 +3412,25 @@ async function cmdSpecialistGo(specialist, args) {
     vtrace(`Dual-brain: ${decision.dualBrain ? 'yes' : 'no'}`);
   }
 
-  console.log(`  specialist : ${specialist}`);
-  console.log(`  provider   : ${decision.provider}`);
-  console.log(`  model      : ${decision.model}${decision.effort ? ' (' + decision.effort + ')' : ''}`);
-  console.log(`  tier       : ${decision.tier}`);
-  console.log(`  dual-brain : ${decision.dualBrain ? 'yes' : 'no'}`);
-  console.log(`  reason     : ${decision.explanation}`);
+  // Print routing table (only in dry-run or verbose; silent in normal mode)
+  if (dryRun || verbose) {
+    console.log(`  specialist : ${specialist}`);
+    console.log(`  provider   : ${decision.provider}`);
+    console.log(`  model      : ${decision.model}${decision.effort ? ' (' + decision.effort + ')' : ''}`);
+    console.log(`  tier       : ${decision.tier}`);
+    console.log(`  dual-brain : ${decision.dualBrain ? 'yes' : 'no'}`);
+    console.log(`  reason     : ${decision.explanation}`);
+  }
 
   if (dryRun) {
     console.log('\n(dry-run — not executing)');
     return;
   }
 
-  console.log('\nDispatching...');
+  if (verbose) console.log('\nDispatching...');
   let result;
   if (decision.dualBrain) {
-    result = await dispatchDualBrain({ decision, prompt, files, cwd });
+    result = await dispatchDualBrain({ decision, prompt, files, cwd, verbose });
     console.log(`\nConsensus: ${result.consensus}`);
     if (result.claude?.summary) console.log(`Claude : ${result.claude.summary}`);
     if (result.openai?.summary) console.log(`OpenAI : ${result.openai.summary}`);
@@ -3182,7 +3444,7 @@ async function cmdSpecialistGo(specialist, args) {
       nextAction:   null,
     }, cwd);
   } else {
-    result = await dispatch({ decision, prompt, files, cwd });
+    result = await dispatch({ decision, prompt, files, cwd, verbose });
     const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
     console.log(`\n${statusLine} in ${(result.durationMs / 1000).toFixed(1)}s`);
     if (result.summary) console.log(result.summary);
@@ -3242,13 +3504,26 @@ async function main() {
         await runScreens('main');
       }
     } else {
-      // Non-TTY: print status card and exit
-      const cwd = process.cwd();
-      const repo    = loadRepoCache(cwd);
-      const session = loadSession(cwd);
-      const health  = getHealth(cwd);
-      const card    = formatSessionCard(session, repo, health);
-      console.log(card);
+      // Non-TTY with no args: read stdin as a task and run one-shot
+      const stdinTask = await new Promise((resolve) => {
+        let data = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', chunk => { data += chunk; });
+        process.stdin.on('end', () => resolve(data.trim()));
+        // If stdin has no data within 200ms (not truly piped), fall back to status card
+        setTimeout(() => resolve(null), 200);
+      });
+      if (stdinTask) {
+        process.stderr.write('🧠 routing...\n');
+        await cmdGo([stdinTask]);
+      } else {
+        const cwd = process.cwd();
+        const repo    = loadRepoCache(cwd);
+        const session = loadSession(cwd);
+        const health  = getHealth(cwd);
+        const card    = formatSessionCard(session, repo, health);
+        console.log(card);
+      }
     }
     return;
   }
@@ -3338,6 +3613,43 @@ if command -v dual-brain &>/dev/null; then
 fi
 `.trim();
     console.log(hook);
+    return;
+  }
+
+  // ─── One-shot mode ────────────────────────────────────────────────────────────
+  // If cmd is not a recognized subcommand, treat the entire arg list as a task.
+  // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
+  const KNOWN_COMMANDS = new Set([
+    'init', 'install', 'auth', 'go', 'status', 'hot', 'cool',
+    'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook',
+    '--help', '-h', '--version', '-v',
+    ...Object.keys(loadSpecialistRegistry()),
+  ]);
+
+  if (!KNOWN_COMMANDS.has(cmd)) {
+    // All of args are part of the task description (plus any flags like --dry-run/--files).
+    // Join non-flag words into a single prompt string so cmdGo's args.find() picks it up.
+    // We strip out flag values (e.g. the value after --files) before collecting prompt words.
+    process.stderr.write('🧠 routing...\n');
+    const flagValuesToSkip = new Set();
+    const pairedFlags = ['--files'];
+    for (const f of pairedFlags) {
+      const idx = args.indexOf(f);
+      if (idx !== -1 && args[idx + 1] && !args[idx + 1].startsWith('--')) {
+        flagValuesToSkip.add(args[idx + 1]);
+      }
+    }
+    const passedFlags = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i].startsWith('--') || args[i].startsWith('-')) {
+        passedFlags.push(args[i]);
+        if (pairedFlags.includes(args[i]) && args[i + 1] && !args[i + 1].startsWith('--')) {
+          passedFlags.push(args[++i]);
+        }
+      }
+    }
+    const promptWords = args.filter(a => !a.startsWith('--') && !a.startsWith('-') && !flagValuesToSkip.has(a));
+    await cmdGo([promptWords.join(' '), ...passedFlags]);
     return;
   }
 

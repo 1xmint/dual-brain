@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { markHot, markDegraded, markHealthy, recordDispatch } from './health.mjs';
 import { redact } from './redact.mjs';
+import { getFailoverOrder } from './decide.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
@@ -92,6 +93,44 @@ function medianDuration(provider, model) {
 
 // Rate-limit error keywords
 const RATE_LIMIT_PATTERNS = /rate.?limit|quota|capacity|too many requests|overloaded|throttl/i;
+
+// ─── Auto-heal failover helpers ───────────────────────────────────────────────
+
+const FAILOVER_LOG_DIR = join(__dirname, '..', '.dualbrain', 'audit');
+
+/** Retryable exit-code-1 patterns: rate limits, quota, capacity, timeouts */
+const RETRYABLE_PATTERNS = /rate.?limit|429|quota.?exceeded|capacity|overloaded|timeout/i;
+
+/** Non-retryable patterns: auth failures, bad input, user cancellation */
+const NON_RETRYABLE_PATTERNS = /unauthorized|forbidden|invalid.?api.?key|authentication|bad.?request|cancelled|canceled/i;
+
+/**
+ * Decide if a subprocess result is a retryable failure.
+ * Must be exit code 1 (or non-zero) AND match retryable keywords AND NOT match
+ * non-retryable keywords.
+ * @param {{ exitCode: number, stderr: string, stdout: string }} result
+ * @returns {boolean}
+ */
+function isRetryableFailure({ exitCode, stderr, stdout }) {
+  if (exitCode === 0) return false;
+  const errText = `${stderr} ${stdout}`.slice(0, 1000);
+  if (NON_RETRYABLE_PATTERNS.test(errText)) return false;
+  return RETRYABLE_PATTERNS.test(errText);
+}
+
+/**
+ * Append a failover event to .dualbrain/audit/failover.jsonl.
+ * @param {{ from: string, to: string, reason: string, attempt: number }} info
+ */
+function logFailover({ from, to, reason, attempt }) {
+  try {
+    mkdirSync(FAILOVER_LOG_DIR, { recursive: true });
+    appendFileSync(
+      join(FAILOVER_LOG_DIR, 'failover.jsonl'),
+      JSON.stringify({ ts: new Date().toISOString(), from, to, reason, attempt }) + '\n',
+    );
+  } catch {}
+}
 
 // ─── Native Claude Code detection ────────────────────────────────────────────
 
@@ -607,7 +646,7 @@ function _prependDispatchMarker(prompt) {
 
 // ─── Main dispatch ────────────────────────────────────────────────────────────
 async function dispatch(input = {}) {
-  const { files = [], cwd = process.cwd(), dryRun = false } = input;
+  const { files = [], cwd = process.cwd(), dryRun = false, verbose = false } = input;
   let decision = input.decision ?? {};
   let { prompt } = input;
 
@@ -629,7 +668,7 @@ async function dispatch(input = {}) {
     const specialistPrompt = loadSpecialistPrompt(specialist);
     if (specialistPrompt) {
       prompt = `${specialistPrompt}\n\n---\n\n${prompt}`;
-      process.stderr.write(`[dual-brain] specialist: ${specialist}\n`);
+      if (verbose) process.stderr.write(`[dual-brain] specialist: ${specialist}\n`);
     }
 
     // Apply tier_bias from registry if decision didn't already pin a tier
@@ -638,7 +677,7 @@ async function dispatch(input = {}) {
       const tierBias = registry?.specialists?.[specialist]?.tier_bias;
       if (tierBias) {
         decision = { ...decision, tier: tierBias };
-        process.stderr.write(`[dual-brain] specialist tier_bias applied: ${tierBias}\n`);
+        if (verbose) process.stderr.write(`[dual-brain] specialist tier_bias applied: ${tierBias}\n`);
       }
     }
   }
@@ -736,7 +775,39 @@ async function dispatch(input = {}) {
     _recordDispatchBudget(prompt);
 
     const dispatchEnv = { DUAL_BRAIN_DISPATCH: '1' };
-    const { exitCode, stdout, stderr, durationMs } = await runProcess(command, cwd, timeoutMs, dispatchEnv);
+
+    // ── Auto-heal failover retry loop (native Claude path) ────────────────
+    const MAX_FAILOVER_ATTEMPTS = 2;
+    let currentProvider = effectiveProvider;
+    let currentModel    = effectiveModel;
+    let currentDecision = effectiveDecision;
+    let currentCommand  = command;
+    let lastRaw;
+
+    for (let attempt = 0; attempt <= MAX_FAILOVER_ATTEMPTS; attempt++) {
+      lastRaw = await runProcess(currentCommand, cwd, timeoutMs, dispatchEnv);
+      if (lastRaw.exitCode === 0 || !isRetryableFailure(lastRaw) || attempt === MAX_FAILOVER_ATTEMPTS) break;
+
+      const failoverList = getFailoverOrder(
+        { provider: currentProvider, model: currentModel, tier },
+        input.profile ?? {},
+      );
+      if (failoverList.length === 0) break;
+
+      const next   = failoverList[0];
+      const reason = `${lastRaw.stderr || lastRaw.stdout}`.slice(0, 120);
+      logFailover({ from: `${currentProvider}/${currentModel}`, to: `${next.provider}/${next.model}`, reason, attempt: attempt + 1 });
+      process.stderr.write(`\x1b[2m[dual-brain] Provider busy, failing over to ${next.label}...\x1b[0m\n`);
+
+      markHot(currentProvider, currentModel, cwd);
+      currentProvider = next.provider;
+      currentModel    = next.model;
+      currentDecision = { ...currentDecision, provider: currentProvider, model: currentModel };
+      currentCommand  = buildCommand(currentDecision, prompt, files, cwd);
+    }
+
+    const { exitCode, stdout, stderr, durationMs } = lastRaw;
+    // ── End failover loop ────────────────────────────────────────────────
 
     // Extract token usage from JSON output if available
     let usage = null;
@@ -753,25 +824,25 @@ async function dispatch(input = {}) {
 
     // ── Health tracking ────────────────────────────────────────────────────
     if (success) {
-      recordDuration(effectiveProvider, effectiveModel, durationMs);
-      const median = medianDuration(effectiveProvider, effectiveModel);
+      recordDuration(currentProvider, currentModel, durationMs);
+      const median = medianDuration(currentProvider, currentModel);
       if (median !== null && durationMs > median * 3) {
-        markDegraded(effectiveProvider, effectiveModel, cwd);
+        markDegraded(currentProvider, currentModel, cwd);
       } else {
-        markHealthy(effectiveProvider, effectiveModel, cwd);
+        markHealthy(currentProvider, currentModel, cwd);
       }
       const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
-      recordDispatch(effectiveProvider, effectiveModel, totalTokens, cwd);
+      recordDispatch(currentProvider, currentModel, totalTokens, cwd);
     } else {
       if (RATE_LIMIT_PATTERNS.test(errorText)) {
-        markHot(effectiveProvider, effectiveModel, cwd);
+        markHot(currentProvider, currentModel, cwd);
       }
     }
     // ── End health tracking ────────────────────────────────────────────────
 
     recordUsage({
-      provider: effectiveProvider,
-      model:    effectiveModel,
+      provider: currentProvider,
+      model:    currentModel,
       tier,
       durationMs,
       inputTokens:  usage?.inputTokens  ?? null,
@@ -782,10 +853,10 @@ async function dispatch(input = {}) {
     return {
       status:        success ? 'completed' : 'failed',
       type:          'native-agent',
-      provider:      effectiveProvider,
-      model:         effectiveModel,
+      provider:      currentProvider,
+      model:         currentModel,
       specialist:    specialist ?? 'generic',
-      command,
+      command:       currentCommand,
       nativeDispatch: nativeDescriptor,
       exitCode,
       summary,
@@ -804,7 +875,38 @@ async function dispatch(input = {}) {
   // Record this dispatch against the budget
   _recordDispatchBudget(prompt);
 
-  const { exitCode, stdout, stderr, durationMs } = await runProcess(command, cwd, timeoutMs);
+  // ── Auto-heal failover retry loop (subprocess path) ──────────────────────
+  const MAX_FAILOVER_ATTEMPTS_SUB = 2;
+  let subProvider = effectiveProvider;
+  let subModel    = effectiveModel;
+  let subDecision = effectiveDecision;
+  let subCommand  = command;
+  let subRaw;
+
+  for (let attempt = 0; attempt <= MAX_FAILOVER_ATTEMPTS_SUB; attempt++) {
+    subRaw = await runProcess(subCommand, cwd, timeoutMs);
+    if (subRaw.exitCode === 0 || !isRetryableFailure(subRaw) || attempt === MAX_FAILOVER_ATTEMPTS_SUB) break;
+
+    const failoverList = getFailoverOrder(
+      { provider: subProvider, model: subModel, tier },
+      input.profile ?? {},
+    );
+    if (failoverList.length === 0) break;
+
+    const next   = failoverList[0];
+    const reason = `${subRaw.stderr || subRaw.stdout}`.slice(0, 120);
+    logFailover({ from: `${subProvider}/${subModel}`, to: `${next.provider}/${next.model}`, reason, attempt: attempt + 1 });
+    process.stderr.write(`\x1b[2m[dual-brain] Provider busy, failing over to ${next.label}...\x1b[0m\n`);
+
+    markHot(subProvider, subModel, cwd);
+    subProvider = next.provider;
+    subModel    = next.model;
+    subDecision = { ...subDecision, provider: subProvider, model: subModel };
+    subCommand  = buildCommand(subDecision, prompt, files, cwd);
+  }
+
+  const { exitCode, stdout, stderr, durationMs } = subRaw;
+  // ── End failover loop ──────────────────────────────────────────────────────
 
   // Extract token usage from JSON output if available
   let usage = null;
@@ -821,25 +923,25 @@ async function dispatch(input = {}) {
 
   // ── Health tracking ──────────────────────────────────────────────────────
   if (success) {
-    recordDuration(effectiveProvider, effectiveModel, durationMs);
-    const median = medianDuration(effectiveProvider, effectiveModel);
+    recordDuration(subProvider, subModel, durationMs);
+    const median = medianDuration(subProvider, subModel);
     if (median !== null && durationMs > median * 3) {
-      markDegraded(effectiveProvider, effectiveModel, cwd);
+      markDegraded(subProvider, subModel, cwd);
     } else {
-      markHealthy(effectiveProvider, effectiveModel, cwd);
+      markHealthy(subProvider, subModel, cwd);
     }
     const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
-    recordDispatch(effectiveProvider, effectiveModel, totalTokens, cwd);
+    recordDispatch(subProvider, subModel, totalTokens, cwd);
   } else {
     if (RATE_LIMIT_PATTERNS.test(errorText)) {
-      markHot(effectiveProvider, effectiveModel, cwd);
+      markHot(subProvider, subModel, cwd);
     }
   }
   // ── End health tracking ──────────────────────────────────────────────────
 
   recordUsage({
-    provider: effectiveProvider,
-    model: effectiveModel,
+    provider: subProvider,
+    model:    subModel,
     tier,
     durationMs,
     inputTokens:  usage?.inputTokens  ?? null,
@@ -849,10 +951,10 @@ async function dispatch(input = {}) {
 
   return {
     status:     success ? 'completed' : 'failed',
-    provider:   effectiveProvider,
-    model:      effectiveModel,
+    provider:   subProvider,
+    model:      subModel,
     specialist: specialist ?? 'generic',
-    command,
+    command:    subCommand,
     exitCode,
     summary,
     durationMs,
@@ -863,7 +965,7 @@ async function dispatch(input = {}) {
 
 // ─── Dual-brain dispatch (parallel) ───────────────────────────────────────────
 async function dispatchDualBrain(input = {}) {
-  const { decision = {}, files = [], cwd = process.cwd(), dryRun = false } = input;
+  const { decision = {}, files = [], cwd = process.cwd(), dryRun = false, verbose = false } = input;
   let { prompt } = input;
   if (!prompt) throw new Error('prompt is required');
 
@@ -887,10 +989,10 @@ async function dispatchDualBrain(input = {}) {
   const [claudeResult, openaiResult] = await Promise.all([
     validatedClaude._error
       ? Promise.resolve({ status: 'error', provider: 'claude', model: claudeDecision.model, command: null, exitCode: null, summary: validatedClaude._error, durationMs: 0, usage: null, error: validatedClaude._error })
-      : dispatch({ decision: validatedClaude, prompt, files, cwd, dryRun }),
+      : dispatch({ decision: validatedClaude, prompt, files, cwd, dryRun, verbose }),
     validatedOpenai._error
       ? Promise.resolve({ status: 'error', provider: 'openai', model: openaiDecision.model, command: null, exitCode: null, summary: validatedOpenai._error, durationMs: 0, usage: null, error: validatedOpenai._error })
-      : dispatch({ decision: validatedOpenai, prompt, files, cwd, dryRun }),
+      : dispatch({ decision: validatedOpenai, prompt, files, cwd, dryRun, verbose }),
   ]);
 
   return {

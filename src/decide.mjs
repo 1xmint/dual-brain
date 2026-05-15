@@ -6,7 +6,7 @@
  * to use and explains why in one sentence.
  *
  * Exports: decideRoute, getModelCapabilities, getAvailableModels,
- *          estimateBudgetPressure, shouldDualBrain, explainDecision
+ *          estimateBudgetPressure, shouldDualBrain, explainDecision, getFailoverOrder
  *
  * CLI: node src/decide.mjs --profile /path/to/profile.json \
  *        --detection '{"intent":"edit","risk":"low","complexity":"simple","effort":"medium","tier":"execute"}'
@@ -600,6 +600,82 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
   // Remove internal field from public output
   const { _healthScores, ...result } = decision;
   return result;
+}
+
+// ─── Exported: getFailoverOrder ──────────────────────────────────────────────
+
+/**
+ * Given a failed routing decision and the active profile, return an ordered list
+ * of fallback options to try next.
+ *
+ * Priority order:
+ *   1. Other subscriptions of the same provider (e.g. Claude Max #2 before Claude Pro)
+ *   2. Other provider (OpenAI or Claude, whichever wasn't tried)
+ *
+ * Within each group, options are ordered by capability match for the tier
+ * (best fit first, cheapest last).
+ *
+ * @param {object} decision  The routing decision that just failed (provider, model, tier)
+ * @param {object} profile   Active profile with providers/subscriptions info
+ * @returns {Array<{ provider: string, model: string, plan: string, label: string }>}
+ */
+export function getFailoverOrder(decision, profile) {
+  const { provider: failedProvider, model: failedModel, tier = 'execute' } = decision;
+  const available = getAvailableModels(profile);
+
+  // Build a ranked model list for Claude (best capability for tier → cheapest)
+  const claudeRankByTier = {
+    think:   ['opus', 'sonnet', 'haiku'],
+    execute: ['sonnet', 'opus', 'haiku'],
+    search:  ['haiku', 'sonnet', 'opus'],
+  };
+  const openaiRankByTier = {
+    think:   ['o3', 'gpt-4o', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o-mini'],
+    execute: ['gpt-4o', 'gpt-4.1', 'o3', 'gpt-4.1-mini', 'gpt-4o-mini'],
+    search:  ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o3'],
+  };
+
+  const claudeRank = claudeRankByTier[tier] ?? claudeRankByTier.execute;
+  const openaiRank = openaiRankByTier[tier] ?? openaiRankByTier.execute;
+
+  const claudeEnabled = !!(profile?.providers?.claude?.enabled && profile?.providers?.claude?.plan);
+  const openaiEnabled = !!(profile?.providers?.openai?.enabled && profile?.providers?.openai?.plan);
+  const claudePlan    = profile?.providers?.claude?.plan ?? '$20';
+  const openaiPlan    = profile?.providers?.openai?.plan ?? '$20';
+
+  const fallbacks = [];
+
+  if (failedProvider === 'claude') {
+    // Same-provider fallbacks: other Claude models (skip the one that just failed)
+    for (const m of claudeRank) {
+      if (m === failedModel) continue;
+      if (!available.claude.includes(m)) continue;
+      fallbacks.push({ provider: 'claude', model: m, plan: claudePlan, label: `Claude ${m} (${claudePlan})` });
+    }
+    // Cross-provider fallbacks: OpenAI models
+    if (openaiEnabled) {
+      for (const m of openaiRank) {
+        if (!available.openai.includes(m)) continue;
+        fallbacks.push({ provider: 'openai', model: m, plan: openaiPlan, label: `OpenAI ${m} (${openaiPlan})` });
+      }
+    }
+  } else {
+    // Same-provider fallbacks: other OpenAI models (skip the one that just failed)
+    for (const m of openaiRank) {
+      if (m === failedModel) continue;
+      if (!available.openai.includes(m)) continue;
+      fallbacks.push({ provider: 'openai', model: m, plan: openaiPlan, label: `OpenAI ${m} (${openaiPlan})` });
+    }
+    // Cross-provider fallbacks: Claude models
+    if (claudeEnabled) {
+      for (const m of claudeRank) {
+        if (!available.claude.includes(m)) continue;
+        fallbacks.push({ provider: 'claude', model: m, plan: claudePlan, label: `Claude ${m} (${claudePlan})` });
+      }
+    }
+  }
+
+  return fallbacks;
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
