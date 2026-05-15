@@ -95,6 +95,40 @@ function cleanStaleMarkers(cwd) {
   } catch {}
 }
 
+function buildSparkline(cwd) {
+  const indexPath = join(cwd, '.dualbrain', 'session-index.json');
+  let index = {};
+  try { index = JSON.parse(readFileSync(indexPath, 'utf8')); } catch { return null; }
+
+  const sessions = Object.values(index);
+  if (sessions.length < 2) return null;
+
+  const now = Date.now();
+  const days = 7;
+  const buckets = new Array(days).fill(0);
+
+  for (const sess of sessions) {
+    if (!sess.date) continue;
+    const age = (now - Date.parse(sess.date)) / 86400000;
+    const bucket = Math.floor(age);
+    if (bucket >= 0 && bucket < days) {
+      buckets[days - 1 - bucket]++;
+    }
+  }
+
+  const max = Math.max(...buckets, 1);
+  const blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+  const spark = buckets.map(v => {
+    if (v === 0) return ' ';
+    const idx = Math.min(Math.floor((v / max) * (blocks.length - 1)), blocks.length - 1);
+    return blocks[idx];
+  }).join('');
+
+  const total = buckets.reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+  return `${spark} ${total} sessions (7d)`;
+}
+
 function daysUntil(isoDate) {
   if (!isoDate) return null;
   const ms = Date.parse(isoDate) - Date.now();
@@ -134,6 +168,7 @@ Commands:
   cool <provider>           Manually clear hot state for a provider
   remember "preference"     Save a project-scoped preference
   forget "preference"       Remove a preference by fuzzy match
+  search "keyword"           Search across all sessions
   shell-hook                Output bash snippet to add dual-brain to your shell
                             Usage: dual-brain shell-hook >> ~/.bashrc
 
@@ -146,6 +181,30 @@ Options:
   --help                    Show this help
   --verbose, -v             Enable verbose routing trace output (stderr)
 `.trim());
+}
+
+// ─── replit-tools detection ───────────────────────────────────────────────────
+
+function detectReplitTools(cwd) {
+  const replitToolsDir = join(cwd, '.replit-tools');
+  const hasDir = existsSync(replitToolsDir);
+  const hasConfig = existsSync(join(replitToolsDir, 'config.json'));
+  const hasScripts = existsSync(join(replitToolsDir, 'scripts', 'setup-claude-code.sh'));
+  const hasArchive = existsSync(join(replitToolsDir, '.session-archive'));
+
+  let version = null;
+  try {
+    version = readFileSync(join(replitToolsDir, '.version'), 'utf8').trim();
+  } catch {}
+
+  return {
+    installed: hasDir,
+    version,
+    hasConfig,
+    hasScripts,
+    hasArchive,
+    dir: replitToolsDir,
+  };
 }
 
 // ─── Subscription status table ────────────────────────────────────────────────
@@ -677,9 +736,26 @@ async function welcomeScreen(rl, ask) {
     detectedLines.push(`  ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} found from data-tools`);
   }
 
+  // --- Detect replit-tools ---
+  const rt = detectReplitTools(cwd);
+  if (rt.installed) {
+    detectedLines.push(`  replit-tools v${rt.version || '?'} detected`);
+    if (rt.hasArchive) {
+      try {
+        const archiveDir = join(rt.dir, '.session-archive', 'claude', 'projects', '-home-runner-workspace');
+        if (existsSync(archiveDir)) {
+          const count = readdirSync(archiveDir).filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-')).length;
+          if (count > 0) detectedLines.push(`  ${count} archived sessions available`);
+        }
+      } catch {}
+    }
+  } else {
+    detectedLines.push(`  replit-tools not found — install with: npx replit-tools`);
+  }
+
   // Show detection results in a box
   const detectedFormatted = detectedLines.map(line => {
-    const ok = !line.includes('not logged');
+    const ok = !line.includes('not logged') && !line.includes('not found');
     return `${ok ? '✅' : '⚠️ '} ${line.trim()}`;
   });
   console.log('');
@@ -698,6 +774,11 @@ async function welcomeScreen(rl, ask) {
   console.log('  [c]     Customize plan tier');
   if (existingSessions.length > 0) {
     console.log(`  [i]     Import ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} from data-tools`);
+  }
+  if (!rt.installed) {
+    console.log('');
+    console.log('  💡 Tip: Install replit-tools for session persistence:');
+    console.log('     npx replit-tools');
   }
   console.log('');
 
@@ -948,6 +1029,17 @@ async function mainScreen(rl, ask) {
     console.log(`  ${line}`);
   }
 
+  // replit-tools indicator
+  const rtMain = detectReplitTools(cwd);
+  if (rtMain.installed && rtMain.version) {
+    console.log(`  🔗 replit-tools v${rtMain.version}`);
+  }
+
+  const sparkline = buildSparkline(cwd);
+  if (sparkline) {
+    console.log(`  Activity: ${sparkline}`);
+  }
+
   // Silent OAuth token auto-refresh (like data-tools)
   try {
     const { autoRefreshToken } = await import('../src/profile.mjs');
@@ -992,6 +1084,12 @@ async function mainScreen(rl, ask) {
   }
   console.log('');
 
+  // Build session index in background (powers search + smart resume)
+  try {
+    const { buildSessionIndex } = await import('../src/session.mjs');
+    buildSessionIndex(cwd);
+  } catch {}
+
   const recentSessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 7);
 
   if (recentSessions.length > 0) {
@@ -1035,6 +1133,7 @@ async function mainScreen(rl, ask) {
     console.log('  [1-9] Resume numbered above');
   }
   console.log('  [r] Resume (full list)');
+  console.log('  [/] Search sessions');
   console.log('  [e] Manage sessions');
   console.log('  [i] Import from replit-tools');
   console.log('  [m] Manage subscriptions');
@@ -1061,6 +1160,17 @@ async function mainScreen(rl, ask) {
       return { next: 'main' };
     }
 
+    // Smart resume preview
+    try {
+      const { getSessionContext } = await import('../src/session.mjs');
+      const ctx = getSessionContext(targetId, cwd);
+      if (ctx) {
+        console.log('');
+        if (ctx.lastPrompt) console.log(`  Last working on: ${ctx.lastPrompt}`);
+        if (ctx.filesTouched.length > 0) console.log(`  Files touched: ${ctx.filesTouched.join(', ')}`);
+      }
+    } catch {}
+
     const { spawnSync } = await import('node:child_process');
     const tool = termState?.tool || 'claude';
     console.log(`\n  Resuming: ${tool} --resume ${targetId}\n`);
@@ -1072,6 +1182,18 @@ async function mainScreen(rl, ask) {
   const numChoice = parseInt(choice, 10);
   if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= recentSessions.length) {
     const sess = recentSessions[numChoice - 1];
+
+    // Smart resume preview
+    try {
+      const { getSessionContext } = await import('../src/session.mjs');
+      const ctx = getSessionContext(sess.id, cwd);
+      if (ctx) {
+        console.log('');
+        if (ctx.lastPrompt) console.log(`  Last working on: ${ctx.lastPrompt}`);
+        if (ctx.filesTouched.length > 0) console.log(`  Files touched: ${ctx.filesTouched.join(', ')}`);
+      }
+    } catch {}
+
     const { spawnSync } = await import('node:child_process');
     console.log(`\n  Launching: claude --resume ${sess.id}\n`);
     spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
@@ -1101,6 +1223,43 @@ async function mainScreen(rl, ask) {
     const num = parseInt(pick, 10);
     if (!isNaN(num) && num >= 1 && num <= allSessions.length) {
       const sess = allSessions[num - 1];
+      const { spawnSync } = await import('node:child_process');
+      const tool = sess.tool === 'codex' ? 'codex' : 'claude';
+      console.log(`\n  Launching: ${tool} --resume ${sess.id}\n`);
+      spawnSync(tool, ['--resume', sess.id], { stdio: 'inherit' });
+    }
+    return { next: 'main' };
+  }
+
+  if (choice === '/') {
+    const query = (await ask('  Search: ')).trim();
+    if (!query) return { next: 'main' };
+
+    const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
+    // Build index if needed (silent)
+    try { buildSessionIndex(cwd); } catch {}
+
+    const results = searchSessions(query, cwd);
+    if (results.length === 0) {
+      console.log(`\n  No sessions matching "${query}"\n`);
+      await ask('  Press Enter to continue...');
+      return { next: 'main' };
+    }
+
+    console.log(`\n  Found ${results.length} session${results.length === 1 ? '' : 's'}:`);
+    results.slice(0, 9).forEach((sess, i) => {
+      const tool = sess.tool === 'codex' ? 'cdx' : 'cld';
+      const date = sess.date ? new Date(sess.date).toLocaleDateString() : '?';
+      const topics = sess.topics.slice(0, 3).join(', ');
+      console.log(`  [${i + 1}] ${tool}  ${date}  ${sess.prompts.first || sess.id.slice(0, 8)}`);
+      if (topics) console.log(`       topics: ${topics}`);
+    });
+    console.log('');
+
+    const pick = (await ask('  Enter number to resume (or Enter to cancel): ')).trim();
+    const num = parseInt(pick, 10);
+    if (!isNaN(num) && num >= 1 && num <= Math.min(results.length, 9)) {
+      const sess = results[num - 1];
       const { spawnSync } = await import('node:child_process');
       const tool = sess.tool === 'codex' ? 'codex' : 'claude';
       console.log(`\n  Launching: ${tool} --resume ${sess.id}\n`);
@@ -2146,6 +2305,37 @@ async function main() {
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
   if (cmd === 'remember') { cmdRemember(args[1]); return; }
   if (cmd === 'forget')   { cmdForget(args[1]); return; }
+
+  if (cmd === 'search') {
+    const query = args.slice(1).filter(a => !a.startsWith('--')).join(' ');
+    if (!query) {
+      console.log('Usage: dual-brain search "keyword"');
+      process.exit(1);
+    }
+
+    const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
+    const cwd = process.cwd();
+    try { buildSessionIndex(cwd); } catch {}
+
+    const results = searchSessions(query, cwd);
+    if (results.length === 0) {
+      console.log(`No sessions matching "${query}"`);
+      process.exit(0);
+    }
+
+    console.log(`Found ${results.length} session${results.length === 1 ? '' : 's'}:\n`);
+    results.slice(0, 10).forEach((sess, i) => {
+      const tool = sess.tool === 'codex' ? 'cdx' : 'cld';
+      const date = sess.date ? new Date(sess.date).toLocaleDateString() : '?';
+      console.log(`  ${i + 1}. [${tool}] ${date}  ${sess.prompts.first || sess.id.slice(0, 8)}`);
+      if (sess.topics.length > 0) console.log(`     topics: ${sess.topics.slice(0, 5).join(', ')}`);
+      if (sess.files.length > 0) console.log(`     files: ${sess.files.slice(0, 5).join(', ')}`);
+      console.log(`     id: ${sess.id}`);
+      console.log('');
+    });
+
+    process.exit(0);
+  }
 
   if (cmd === 'shell-hook') {
     // Output a bash snippet users can add to their .bashrc or source directly.

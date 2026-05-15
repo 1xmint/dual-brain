@@ -740,6 +740,287 @@ export function syncSessionMirror(cwd = process.cwd()) {
   return { copied: totalCopied, grew: totalGrew };
 }
 
+// ─── Session index ────────────────────────────────────────────────────────────
+
+/**
+ * Build/update `.dualbrain/session-index.json` from Claude and Codex JSONL session files.
+ * Extracts topics, file references, prompt snippets, and metadata per session.
+ *
+ * @param {string} [cwd]
+ * @returns {object} index — keyed by session UUID
+ */
+export function buildSessionIndex(cwd = process.cwd()) {
+  const home = process.env.HOME || '/root';
+  const indexPath = join(cwd, '.dualbrain', 'session-index.json');
+
+  // Load existing index
+  let index = {};
+  try {
+    if (existsSync(indexPath)) {
+      index = JSON.parse(readFileSync(indexPath, 'utf8'));
+    }
+  } catch {}
+
+  // Find all session JSONLs
+  const sources = [
+    join(home, '.claude', 'projects', '-home-runner-workspace'),
+    join(cwd, '.replit-tools', '.session-archive', 'claude', 'projects', '-home-runner-workspace'),
+  ];
+
+  const STOP_WORDS = new Set(['the','and','this','that','with','from','have','been','will','would','could','should','just','also','into','about','some','what','when','where','which','their','there','then','than','them','these','those','other','more','only','very','each','most','like','make','want','need','does','dont','didnt','cant','wont','your','they','were','are','for','not','but','was','you','all','can','had','her','one','our','out','use','its','let','get','has','him','his','how','did','got','may','new','now','old','see','way','who','any','few','said']);
+
+  for (const dir of sources) {
+    if (!existsSync(dir)) continue;
+    let files;
+    try { files = readdirSync(dir); } catch { continue; }
+
+    for (const f of files) {
+      if (!f.endsWith('.jsonl') || f.startsWith('agent-')) continue;
+      const sessionId = f.replace('.jsonl', '');
+
+      // Skip if already indexed and file hasn't grown
+      const filePath = join(dir, f);
+      let fileSize = 0;
+      try { fileSize = statSync(filePath).size; } catch { continue; }
+      if (index[sessionId] && index[sessionId]._fileSize >= fileSize) continue;
+
+      // Parse session
+      try {
+        const content = readFileSync(filePath, 'utf8');
+        const lines = content.split('\n').filter(Boolean);
+
+        const wordCounts = {};
+        const fileSet = new Set();
+        let firstPrompt = null;
+        let lastPrompt = null;
+        let lastTimestamp = 0;
+        let messageCount = 0;
+
+        for (const line of lines) {
+          try {
+            const entry = JSON.parse(line);
+
+            // Track timestamps
+            if (entry.timestamp) {
+              const ts = typeof entry.timestamp === 'number' ? entry.timestamp : Date.parse(entry.timestamp) / 1000;
+              if (ts > lastTimestamp) lastTimestamp = ts;
+            }
+
+            // Extract user messages
+            let text = null;
+            if (entry.type === 'user' && entry.message?.content) {
+              text = typeof entry.message.content === 'string'
+                ? entry.message.content
+                : entry.message.content?.[0]?.text;
+            }
+            if (entry.display) text = text || entry.display;
+
+            if (!text) continue;
+            messageCount++;
+
+            if (!firstPrompt) firstPrompt = text.slice(0, 80);
+            lastPrompt = text.slice(0, 80);
+
+            // Extract file paths
+            const filePaths = text.match(/[\w./~-]+\.(?:mjs|js|ts|tsx|jsx|json|md|css|html|py|sh|sql|toml|yaml|yml)\b/g);
+            if (filePaths) filePaths.forEach(p => fileSet.add(p));
+
+            // Count words for topics
+            const words = text.toLowerCase().split(/\W+/).filter(w => w.length > 3 && !STOP_WORDS.has(w));
+            for (const w of words) {
+              wordCounts[w] = (wordCounts[w] || 0) + 1;
+            }
+          } catch { continue; }
+        }
+
+        // Top 10 topics by frequency
+        const topics = Object.entries(wordCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10)
+          .map(([w]) => w);
+
+        index[sessionId] = {
+          id: sessionId,
+          topics,
+          files: [...fileSet].slice(0, 20),
+          prompts: { first: firstPrompt || '', last: lastPrompt || '' },
+          date: lastTimestamp ? new Date(lastTimestamp * 1000).toISOString() : null,
+          messageCount,
+          tool: 'claude',
+          _fileSize: fileSize,
+        };
+      } catch { continue; }
+    }
+  }
+
+  // Also index codex sessions (same pattern)
+  const codexDir = join(home, '.codex', 'sessions');
+  if (existsSync(codexDir)) {
+    const walk = (dir) => {
+      let results = [];
+      try {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) results = results.concat(walk(full));
+          else if (entry.isFile() && entry.name.endsWith('.jsonl')) results.push(full);
+        }
+      } catch {}
+      return results;
+    };
+
+    for (const filePath of walk(codexDir)) {
+      try {
+        const content = readFileSync(filePath, 'utf8');
+        const lines = content.split('\n').filter(Boolean);
+        if (!lines.length) continue;
+        const meta = JSON.parse(lines[0]);
+        if (meta.type !== 'session_meta' || !meta.payload) continue;
+        const id = meta.payload.id;
+        if (!id || index[id]) continue;
+
+        let fileSize = 0;
+        try { fileSize = statSync(filePath).size; } catch { continue; }
+
+        let firstPrompt = null, lastPrompt = null, messageCount = 0;
+        let lastTimestamp = Date.parse(meta.payload.timestamp || meta.timestamp) / 1000 || 0;
+
+        for (const ln of lines) {
+          try {
+            const j = JSON.parse(ln);
+            if (j.timestamp) {
+              const ts = Date.parse(j.timestamp) / 1000;
+              if (ts > lastTimestamp) lastTimestamp = ts;
+            }
+            if (j.type === 'event_msg' && j.payload?.type === 'user_message') {
+              const text = (j.payload.message || '').trim();
+              if (text) {
+                messageCount++;
+                if (!firstPrompt) firstPrompt = text.slice(0, 80);
+                lastPrompt = text.slice(0, 80);
+              }
+            }
+          } catch { continue; }
+        }
+
+        index[id] = {
+          id, topics: [], files: [],
+          prompts: { first: firstPrompt || '', last: lastPrompt || '' },
+          date: lastTimestamp ? new Date(lastTimestamp * 1000).toISOString() : null,
+          messageCount, tool: 'codex', _fileSize: fileSize,
+        };
+      } catch { continue; }
+    }
+  }
+
+  // Save index
+  try {
+    mkdirSync(join(cwd, '.dualbrain'), { recursive: true });
+    writeFileSync(indexPath, JSON.stringify(index, null, 2));
+  } catch {}
+
+  return index;
+}
+
+/**
+ * Search the session index by keyword. Returns matching sessions sorted by relevance.
+ *
+ * @param {string} query
+ * @param {string} [cwd]
+ * @returns {Array<object>} sessions with `_score` field, sorted descending
+ */
+export function searchSessions(query, cwd = process.cwd()) {
+  const indexPath = join(cwd, '.dualbrain', 'session-index.json');
+  let index = {};
+  try { index = JSON.parse(readFileSync(indexPath, 'utf8')); } catch {}
+
+  if (Object.keys(index).length === 0) {
+    index = buildSessionIndex(cwd);
+  }
+
+  const terms = query.toLowerCase().split(/\W+/).filter(Boolean);
+  const results = [];
+
+  for (const session of Object.values(index)) {
+    let score = 0;
+    const searchText = [
+      ...session.topics,
+      ...session.files,
+      session.prompts.first,
+      session.prompts.last,
+    ].join(' ').toLowerCase();
+
+    for (const term of terms) {
+      if (searchText.includes(term)) score++;
+      if (session.topics.includes(term)) score += 2;
+      if (session.files.some(f => f.includes(term))) score += 2;
+    }
+
+    if (score > 0) {
+      results.push({ ...session, _score: score });
+    }
+  }
+
+  return results.sort((a, b) => b._score - a._score);
+}
+
+/**
+ * Get detailed context for a session (for smart resume preview).
+ * Reads the last 20 lines of the session JSONL to surface the most recent prompt
+ * and files touched.
+ *
+ * @param {string} sessionId
+ * @param {string} [cwd]
+ * @returns {{ lastPrompt: string|null, filesTouched: string[], totalLines: number }|null}
+ */
+export function getSessionContext(sessionId, cwd = process.cwd()) {
+  const home = process.env.HOME || '/root';
+  const paths = [
+    join(home, '.claude', 'projects', '-home-runner-workspace', sessionId + '.jsonl'),
+    join(cwd, '.replit-tools', '.session-archive', 'claude', 'projects', '-home-runner-workspace', sessionId + '.jsonl'),
+  ];
+
+  let filePath = null;
+  for (const p of paths) {
+    if (existsSync(p)) { filePath = p; break; }
+  }
+  if (!filePath) return null;
+
+  try {
+    const content = readFileSync(filePath, 'utf8');
+    const lines = content.split('\n').filter(Boolean);
+
+    // Read last 20 lines for recent context
+    const recentLines = lines.slice(-20);
+    let lastUserPrompt = null;
+    const filesSet = new Set();
+
+    for (const line of recentLines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'user' && entry.message?.content) {
+          const text = typeof entry.message.content === 'string'
+            ? entry.message.content
+            : entry.message.content?.[0]?.text;
+          if (text) lastUserPrompt = text.slice(0, 120);
+        }
+        if (entry.display) lastUserPrompt = entry.display.slice(0, 120);
+
+        // Look for file edits in tool use
+        if (entry.type === 'tool_use' || entry.type === 'tool_result') {
+          const fp = entry.tool_input?.file_path || entry.tool_input?.path;
+          if (fp) filesSet.add(fp.split('/').pop());
+        }
+      } catch { continue; }
+    }
+
+    return {
+      lastPrompt: lastUserPrompt,
+      filesTouched: [...filesSet].slice(0, 5),
+      totalLines: lines.length,
+    };
+  } catch { return null; }
+}
+
 // ─── CLI (direct invocation) ──────────────────────────────────────────────────
 
 const isMain = process.argv[1]?.endsWith('session.mjs');
