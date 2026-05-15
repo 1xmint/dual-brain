@@ -23,9 +23,9 @@
  */
 
 import { createInterface } from 'readline';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
-import { dirname, join } from 'path';
+import { join } from 'path';
 
 // ---------------------------------------------------------------------------
 // Claude Code memory integration
@@ -126,31 +126,19 @@ function detectEnvironment() {
 // ---------------------------------------------------------------------------
 
 /**
- * Mask a credential string: show first 4 + "..." + last 4 chars.
- * For short strings (< 8 chars), just returns "***".
- * @param {string} str
- * @returns {string}
- */
-function _maskCredential(str) {
-  if (!str || str.length < 8) return '***';
-  return str.slice(0, 4) + '...' + str.slice(-4);
-}
-
-/**
- * Detect authentication credentials from all known sources.
- * Checks in priority order: config files first, then env vars.
- * Never makes network calls — validation is always null in v1.
+ * Detect CLI login status for Claude and Codex.
+ * Checks config files on disk — never makes network calls.
  *
  * @returns {{ claude: AuthEntry, openai: AuthEntry }}
- * @typedef {{ found: boolean, source: string|null, masked: string|null, validated: null }} AuthEntry
+ * @typedef {{ found: boolean, source: string|null, loginType: 'oauth'|'cli'|null }} AuthEntry
  */
 async function detectAuth() {
   const results = {
-    claude: { found: false, source: null, masked: null, validated: null },
-    openai: { found: false, source: null, masked: null, validated: null },
+    claude: { found: false, source: null, loginType: null },
+    openai: { found: false, source: null, loginType: null },
   };
 
-  // --- Claude: check .claude.json for oauthAccount or apiKey ---
+  // --- Claude: check .claude.json for oauthAccount (CLI login) ---
   const claudePaths = [
     '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
     join(homedir(), '.claude', '.claude.json'),
@@ -159,51 +147,22 @@ async function detectAuth() {
     try {
       const data = JSON.parse(readFileSync(p, 'utf8'));
       if (data?.oauthAccount) {
-        // OAuth session found
-        results.claude.found   = true;
-        results.claude.source  = p.includes('.replit-tools') ? '.claude.json (replit-tools)' : '.claude.json';
-        results.claude.masked  = 'oauth:configured';
+        results.claude.found     = true;
+        results.claude.source    = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
+        results.claude.loginType = 'oauth';
         break;
       }
+      // Legacy: apiKey field in .claude.json (set by claude CLI in some versions)
       if (data?.apiKey && typeof data.apiKey === 'string') {
-        results.claude.found   = true;
-        results.claude.source  = p.includes('.replit-tools') ? '.claude.json (replit-tools)' : '.claude.json';
-        results.claude.masked  = _maskCredential(data.apiKey);
+        results.claude.found     = true;
+        results.claude.source    = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
+        results.claude.loginType = 'cli';
         break;
       }
     } catch { continue; }
   }
 
-  // --- Claude: check .dualbrain/auth.json (before env var) ---
-  if (!results.claude.found) {
-    const storedAuth = loadAuthKeys();
-    const claudeKeys = storedAuth.claude || [];
-    const activeClaudeKey = getActiveKey('claude');
-    if (activeClaudeKey) {
-      results.claude.found   = true;
-      results.claude.source  = '.dualbrain/auth.json';
-      results.claude.masked  = _maskCredential(activeClaudeKey.key);
-      process.env.ANTHROPIC_API_KEY = activeClaudeKey.key;
-      // Report all keys with masked values
-      const now = new Date();
-      results.claude.keys = claudeKeys.map(k => ({
-        label:   k.label || 'unlabeled',
-        masked:  _maskCredential(k.key),
-        priority: k.priority || 99,
-        enabled: k.enabled !== false,
-        expired: !!(k.expiresAt && new Date(k.expiresAt) <= now),
-      }));
-    }
-  }
-
-  // --- Claude: fallback to ANTHROPIC_API_KEY env var ---
-  if (!results.claude.found && process.env.ANTHROPIC_API_KEY) {
-    results.claude.found  = true;
-    results.claude.source = 'env:ANTHROPIC_API_KEY';
-    results.claude.masked = _maskCredential(process.env.ANTHROPIC_API_KEY);
-  }
-
-  // --- OpenAI/Codex: check auth.json for access_token or id_token ---
+  // --- OpenAI/Codex: check auth.json for access_token or id_token (CLI login) ---
   const codexPaths = [
     '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
     join(homedir(), '.codex', 'auth.json'),
@@ -213,208 +172,48 @@ async function detectAuth() {
       const data = JSON.parse(readFileSync(p, 'utf8'));
       const accessToken = data?.tokens?.access_token || data?.access_token;
       const idToken     = data?.tokens?.id_token     || data?.id_token;
-      const apiKey      = data?.apiKey ?? data?.api_key ?? null;
 
       if (accessToken || idToken) {
-        results.openai.found   = true;
-        results.openai.source  = p.includes('.replit-tools') ? 'codex auth.json (replit-tools)' : 'codex auth.json';
-        results.openai.masked  = 'oauth:configured';
-        break;
-      }
-      if (apiKey && typeof apiKey === 'string') {
-        results.openai.found   = true;
-        results.openai.source  = p.includes('.replit-tools') ? 'codex auth.json (replit-tools)' : 'codex auth.json';
-        results.openai.masked  = _maskCredential(apiKey);
+        results.openai.found     = true;
+        results.openai.source    = p.includes('.replit-tools') ? 'codex CLI (replit-tools)' : 'codex CLI';
+        results.openai.loginType = 'oauth';
         break;
       }
     } catch { continue; }
-  }
-
-  // --- OpenAI: check .dualbrain/auth.json (before env var) ---
-  if (!results.openai.found) {
-    const storedAuth = loadAuthKeys();
-    const openaiKeys = storedAuth.openai || [];
-    const activeOpenaiKey = getActiveKey('openai');
-    if (activeOpenaiKey) {
-      results.openai.found   = true;
-      results.openai.source  = '.dualbrain/auth.json';
-      results.openai.masked  = _maskCredential(activeOpenaiKey.key);
-      process.env.OPENAI_API_KEY = activeOpenaiKey.key;
-      // Report all keys with masked values
-      const now = new Date();
-      results.openai.keys = openaiKeys.map(k => ({
-        label:   k.label || 'unlabeled',
-        masked:  _maskCredential(k.key),
-        priority: k.priority || 99,
-        enabled: k.enabled !== false,
-        expired: !!(k.expiresAt && new Date(k.expiresAt) <= now),
-      }));
-    }
-  }
-
-  // --- OpenAI: fallback to OPENAI_API_KEY env var ---
-  if (!results.openai.found && process.env.OPENAI_API_KEY) {
-    results.openai.found  = true;
-    results.openai.source = 'env:OPENAI_API_KEY';
-    results.openai.masked = _maskCredential(process.env.OPENAI_API_KEY);
   }
 
   return results;
 }
 
 // ---------------------------------------------------------------------------
-// API key storage (.dualbrain/auth.json)
+// Subscription management (.dualbrain/profile.json)
 // ---------------------------------------------------------------------------
 
-const AUTH_FILE = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'auth.json');
-
 /**
- * Load .dualbrain/auth.json.
+ * Save subscription config for a provider into .dualbrain/profile.json.
+ * @param {string} provider — 'claude' or 'openai'
+ * @param {{ plan: string, label?: string, expiresAt?: string }} config
  * @param {string} [cwd]
- * @returns {object} auth object with arrays per provider
  */
-function loadAuthKeys(cwd) {
-  try {
-    return JSON.parse(readFileSync(AUTH_FILE(cwd), 'utf8'));
-  } catch {
-    return {};
-  }
+function saveSubscription(provider, config, cwd) {
+  const profile = loadProfile(cwd);
+  if (!profile.providers[provider]) profile.providers[provider] = { enabled: true };
+  profile.providers[provider].plan    = config.plan;
+  profile.providers[provider].enabled = true;
+  if (config.label)     profile.providers[provider].label     = config.label;
+  if (config.expiresAt) profile.providers[provider].expiresAt = config.expiresAt;
+  saveProfile(profile, { cwd: cwd || process.cwd() });
+  return profile;
 }
 
 /**
- * Returns the highest-priority, non-expired, enabled key for a provider.
- * @param {string} provider
+ * Return subscription configs for all providers from the saved profile.
  * @param {string} [cwd]
- * @returns {{ key: string, label: string, priority: number, enabled: boolean, expiresAt: string|null }|null}
+ * @returns {{ [provider: string]: { plan: string, enabled: boolean, label?: string, expiresAt?: string } }}
  */
-function getActiveKey(provider, cwd) {
-  const auth = loadAuthKeys(cwd);
-  const keys = auth[provider] || [];
-  const now = new Date();
-
-  const valid = keys
-    .filter(k => k.enabled)
-    .filter(k => !k.expiresAt || new Date(k.expiresAt) > now)
-    .sort((a, b) => (a.priority || 99) - (b.priority || 99));
-
-  return valid[0] || null;
-}
-
-/**
- * Append a new key to the provider's array in .dualbrain/auth.json.
- * Injects the highest-priority valid key into process.env.
- * @param {string} provider
- * @param {string} key
- * @param {object} [opts]
- * @param {string} [opts.label]
- * @param {string|null} [opts.expiresAt]
- * @param {number} [opts.priority]
- * @param {string} [opts.cwd]
- */
-function saveAuthKey(provider, key, opts = {}) {
-  const cwd = opts.cwd || process.cwd();
-  const authFile = AUTH_FILE(cwd);
-  const dir = dirname(authFile);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-
-  const auth = loadAuthKeys(cwd);
-  if (!Array.isArray(auth[provider])) auth[provider] = [];
-
-  // Determine default label and priority
-  const existing = auth[provider];
-  const defaultLabel = `key-${existing.length + 1}`;
-  const defaultPriority = existing.length > 0
-    ? Math.max(...existing.map(k => k.priority || 1)) + 1
-    : 1;
-
-  existing.push({
-    key,
-    label: opts.label || defaultLabel,
-    savedAt: new Date().toISOString(),
-    expiresAt: opts.expiresAt || null,
-    priority: opts.priority !== undefined ? opts.priority : defaultPriority,
-    enabled: true,
-  });
-
-  writeFileSync(authFile, JSON.stringify(auth, null, 2));
-  chmodSync(authFile, 0o600);
-
-  // Inject highest-priority valid key into process.env for this session
-  const active = getActiveKey(provider, cwd);
-  if (active) {
-    if (provider === 'claude') process.env.ANTHROPIC_API_KEY = active.key;
-    if (provider === 'openai') process.env.OPENAI_API_KEY = active.key;
-  }
-}
-
-/**
- * Interactive setup flow: walks user through entering API keys for missing providers.
- * Accepts an existing readline Interface (rl) — does NOT close it.
- * @param {import('readline').Interface} rl
- */
-async function setupAuth(rl) {
-  const ask = (q) => new Promise(res => rl.question(q, res));
-  const auth = await detectAuth();
-
-  // Claude setup
-  if (!auth.claude.found) {
-    console.log('\n— Claude Setup —');
-    console.log('Options:');
-    console.log('  (1) Paste API key (recommended for Replit)');
-    console.log('  (2) Skip for now');
-    const choice = (await ask('> ')).trim();
-    if (choice === '1') {
-      const key = (await ask('Paste your Anthropic API key: ')).trim();
-      if (key && (key.startsWith('sk-ant-') || key.startsWith('sk-'))) {
-        const labelStr = (await ask('Label for this key (or Enter for "key-1"): ')).trim();
-        const label = labelStr || undefined;
-        const expiryStr = (await ask('Set expiry in days (or Enter to skip): ')).trim();
-        let expiresAt = null;
-        if (expiryStr && /^\d+$/.test(expiryStr)) {
-          const d = new Date();
-          d.setDate(d.getDate() + parseInt(expiryStr, 10));
-          expiresAt = d.toISOString();
-          console.log(`✓ Key expires in ${expiryStr} days (${d.toISOString().slice(0, 10)})`);
-        }
-        saveAuthKey('claude', key, { expiresAt, label });
-        console.log('✓ Claude API key saved');
-      } else {
-        console.log('Invalid key format. Expected sk-ant-... or sk-...');
-      }
-    }
-  } else {
-    console.log(`\n✓ Claude: already configured via ${auth.claude.source}`);
-  }
-
-  // OpenAI setup
-  if (!auth.openai.found) {
-    console.log('\n— OpenAI Setup —');
-    console.log('Options:');
-    console.log('  (1) Paste API key (recommended for Replit)');
-    console.log('  (2) Skip for now');
-    const choice = (await ask('> ')).trim();
-    if (choice === '1') {
-      const key = (await ask('Paste your OpenAI API key: ')).trim();
-      if (key && key.startsWith('sk-')) {
-        const labelStr = (await ask('Label for this key (or Enter for "key-1"): ')).trim();
-        const label = labelStr || undefined;
-        const expiryStr = (await ask('Set expiry in days (or Enter to skip): ')).trim();
-        let expiresAt = null;
-        if (expiryStr && /^\d+$/.test(expiryStr)) {
-          const d = new Date();
-          d.setDate(d.getDate() + parseInt(expiryStr, 10));
-          expiresAt = d.toISOString();
-          console.log(`✓ Key expires in ${expiryStr} days (${d.toISOString().slice(0, 10)})`);
-        }
-        saveAuthKey('openai', key, { expiresAt, label });
-        console.log('✓ OpenAI API key saved');
-      } else {
-        console.log('Invalid key format. Expected sk-...');
-      }
-    }
-  } else {
-    console.log(`\n✓ OpenAI: already configured via ${auth.openai.source}`);
-  }
+function listSubscriptions(cwd) {
+  const profile = loadProfile(cwd);
+  return profile.providers || {};
 }
 
 // ---------------------------------------------------------------------------
@@ -827,10 +626,10 @@ async function autoSetup(cwd) {
       '$100': 'Claude Max x5 ($100)',
       '$200': 'Claude Max x20 ($200)',
     }[profile.providers.claude.plan] || profile.providers.claude.plan;
-    result.actions.push(`${planLabel} via ${auth.claude.source}`);
+    result.actions.push(`${planLabel} (${auth.claude.source})`);
   } else {
     profile.providers.claude.enabled = false;
-    result.warnings.push('Claude not authenticated');
+    result.warnings.push('Claude CLI not logged in — run: claude login');
   }
 
   // OpenAI
@@ -842,10 +641,10 @@ async function autoSetup(cwd) {
       '$100': 'ChatGPT Pro ($100)',
       '$200': 'ChatGPT Pro ($200)',
     }[profile.providers.openai.plan] || profile.providers.openai.plan;
-    result.actions.push(`${planLabel} via ${auth.openai.source}`);
+    result.actions.push(`${planLabel} (${auth.openai.source})`);
   } else {
     profile.providers.openai.enabled = false;
-    result.warnings.push('OpenAI not authenticated');
+    result.warnings.push('Codex CLI not logged in — run: codex login');
   }
 
   // Mode
@@ -873,7 +672,6 @@ export {
   getAvailableProviders, isSoloBrain, getHeadModel,
   detectPlans, syncPreferencesToMemory,
   detectAuth, detectEnvironment,
-  setupAuth, saveAuthKey, loadAuthKeys,
-  getActiveKey,
+  saveSubscription, listSubscriptions,
   defaultProfile, autoSetup,
 };

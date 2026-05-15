@@ -4,14 +4,15 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync as _spawnSyncTop } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 import {
   ensureProfile, loadProfile, saveProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
-  detectAuth, detectEnvironment, setupAuth,
+  detectAuth, detectEnvironment, detectPlans,
+  saveSubscription, listSubscriptions,
   autoSetup,
 } from '../src/profile.mjs';
 
@@ -50,8 +51,7 @@ dual-brain <command> [options]
 
 Commands:
   init                      First-time setup → flows into interactive REPL
-  auth                      Show authentication status for all providers
-  auth setup                Paste API keys directly (recommended for Replit)
+  auth                      Show subscription and login status
   install                   Install Claude Code hooks into the current project
   go "task description"     Detect → decide → dispatch a task
     --dry-run               Show routing decision without executing
@@ -63,6 +63,8 @@ Commands:
   cool <provider>           Manually clear hot state for a provider
   remember "preference"     Save a project-scoped preference
   forget "preference"       Remove a preference by fuzzy match
+  shell-hook                Output bash snippet to add dual-brain to your shell
+                            Usage: dual-brain shell-hook >> ~/.bashrc
 
 Interactive mode (entered with no args on a TTY):
   Session manager with recent sessions and routing.
@@ -75,43 +77,44 @@ Options:
 `.trim());
 }
 
-// ─── Auth helpers ─────────────────────────────────────────────────────────────
+// ─── Subscription status table ────────────────────────────────────────────────
 
 /**
- * Print a compact auth status table to stdout.
- * @param {{ claude: object, openai: object }} auth  Result from detectAuth()
- * @param {object} [profile]  Optional loaded profile to cross-check enabled state
+ * Print a subscription status table to stdout.
  */
-function printAuthTable(auth, profile) {
-  const W = 55; // inner width (wide enough for source labels)
+function printSubscriptionTable(auth, profile) {
+  const W = 55;
   const hbar = '═'.repeat(W);
   const pad = (s) => {
-    const visible = s.replace(/[̀-ͯ]/g, ''); // strip combining chars for length
+    const visible = s.replace(/[̀-ͯ]/g, '');
     return s + ' '.repeat(Math.max(0, W - visible.length));
   };
 
-  const claudeDisabled = profile?.providers?.claude?.enabled === false;
-  const openaiDisabled = profile?.providers?.openai?.enabled === false;
+  const claudeSub  = profile?.providers?.claude;
+  const openaiSub  = profile?.providers?.openai;
 
-  const claudeDisabledNote = claudeDisabled ? ' (auth ok, but disabled in profile)' : '';
-  const openaiDisabledNote = openaiDisabled ? ' (auth ok, but disabled in profile)' : '';
+  const claudePlanLabel = claudeSub?.enabled
+    ? ({ pro: 'Pro ($20/mo)', max5: 'Max x5 ($100/mo)', max20: 'Max x20 ($200/mo)', '$20': 'Pro ($20/mo)', '$100': 'Max x5 ($100/mo)', '$200': 'Max x20 ($200/mo)' }[claudeSub.plan] ?? claudeSub.plan)
+    : 'disabled';
+  const openaiPlanLabel = openaiSub?.enabled
+    ? ({ plus: 'Plus ($20/mo)', pro: 'Pro ($100/mo)', pro100: 'Pro ($100/mo)', pro200: 'Pro ($200/mo)', '$20': 'Plus ($20/mo)', '$100': 'Pro ($100/mo)', '$200': 'Pro ($200/mo)' }[openaiSub.plan] ?? openaiSub.plan)
+    : 'disabled';
+
+  const claudeLabel = claudeSub?.label ? ` [${claudeSub.label}]` : '';
+  const openaiLabel = openaiSub?.label ? ` [${openaiSub.label}]` : '';
 
   const claudeLine1 = auth.claude.found
-    ? `  Claude:  ✓ found via ${auth.claude.source}${claudeDisabledNote}`
-    : `  Claude:  ✗ not found`;
-  const claudeLine2 = auth.claude.found
-    ? `           ${auth.claude.masked}`
-    : `           run: dual-brain auth setup`;
+    ? `  Claude:  logged in (${auth.claude.source})`
+    : `  Claude:  not logged in — run: claude login`;
+  const claudeLine2 = `           plan: ${claudePlanLabel}${claudeLabel}`;
 
   const openaiLine1 = auth.openai.found
-    ? `  OpenAI:  ✓ found via ${auth.openai.source}${openaiDisabledNote}`
-    : `  OpenAI:  ✗ not found`;
-  const openaiLine2 = auth.openai.found
-    ? `           ${auth.openai.masked}`
-    : `           run: dual-brain auth setup`;
+    ? `  OpenAI:  logged in (${auth.openai.source})`
+    : `  OpenAI:  not logged in — run: codex login`;
+  const openaiLine2 = `           plan: ${openaiPlanLabel}${openaiLabel}`;
 
   console.log(`╔${hbar}╗`);
-  console.log(`║${pad('  Auth Status')}║`);
+  console.log(`║${pad('  Subscription Status')}║`);
   console.log(`╠${hbar}╣`);
   console.log(`║${pad(claudeLine1)}║`);
   console.log(`║${pad(claudeLine2)}║`);
@@ -125,35 +128,24 @@ function printAuthTable(auth, profile) {
 async function cmdInit(rl) {
   const cwd = process.cwd();
 
-  // --- Step 1: Auth preflight ---
+  // --- Step 1: Detect auth ---
   const auth = await detectAuth();
-  printAuthTable(auth, loadProfile(cwd));
+  printSubscriptionTable(auth, loadProfile(cwd));
 
   const noneFound = !auth.claude.found && !auth.openai.found;
   if (noneFound) {
-    console.log('\nNo AI provider credentials found. Let\'s set up at least one now.\n');
-    // Use the provided rl (REPL instance) or create a temporary one
-    const rlOwned = !rl;
-    if (!rl) rl = createInterface({ input: process.stdin, output: process.stdout });
-    try {
-      await setupAuth(rl);
-    } finally {
-      if (rlOwned) rl.close();
-    }
-    // Re-check after setup
-    const authAfter = await detectAuth();
-    if (!authAfter.claude.found && !authAfter.openai.found) {
-      console.log('\nNo credentials configured. You can run "auth setup" in the REPL anytime.');
-      // Still flow into REPL — don't exit
-      return;
-    }
+    console.log('\nNo AI provider found. Log in first:');
+    console.log('  Claude:  claude login');
+    console.log('  OpenAI:  codex login\n');
+    console.log('Then re-run: dual-brain init');
+    return;
   }
 
-  // --- Step 2: Run onboarding wizard (pass shared rl so it isn't closed) ---
+  // --- Step 2: Run onboarding wizard ---
   const profile = await runOnboarding({ interactive: true, detectedAuth: auth, rl });
   saveProfile(profile, { cwd });
 
-  // --- Step 2b: Install hooks so enforcement is active from first run ---
+  // --- Step 2b: Install hooks ---
   await cmdInstall(cwd);
 
   // --- Step 3: Show dashboard ---
@@ -166,30 +158,18 @@ async function cmdInit(rl) {
   console.log('\nReady! Type a task below, or "help" for commands.\n');
 }
 
-async function cmdAuth(subArgs = [], rl) {
-  const sub = subArgs[0];
-
-  if (sub === 'setup') {
-    return cmdAuthSetup(rl);
-  }
-
-  const auth = await detectAuth();
+/**
+ * Show subscription status (replaces old API key auth display).
+ */
+async function cmdAuth(subArgs = []) {
+  const auth    = await detectAuth();
   const profile = loadProfile(process.cwd());
-  printAuthTable(auth, profile);
+  printSubscriptionTable(auth, profile);
 
-  // If anything is missing, point to setup command
   if (!auth.claude.found || !auth.openai.found) {
-    console.log('\nRun "dual-brain auth setup" (or "auth setup" in REPL) to paste API keys.');
-  }
-}
-
-async function cmdAuthSetup(rl) {
-  const rlOwned = !rl;
-  if (!rl) rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    await setupAuth(rl);
-  } finally {
-    if (rlOwned) rl.close();
+    console.log('');
+    if (!auth.claude.found) console.log('  Claude not logged in. Run: claude login');
+    if (!auth.openai.found) console.log('  OpenAI not logged in. Run: codex login');
   }
 }
 
@@ -531,183 +511,227 @@ function profileExists(cwd) {
   return existsSync(projectPath) || existsSync(globalPath);
 }
 
+// ─── Plan label helpers ───────────────────────────────────────────────────────
+
+const CLAUDE_PLAN_LABELS = {
+  pro:   'Pro ($20/mo)',
+  max5:  'Max x5 ($100/mo)',
+  max20: 'Max x20 ($200/mo)',
+  '$20':  'Pro ($20/mo)',
+  '$100': 'Max x5 ($100/mo)',
+  '$200': 'Max x20 ($200/mo)',
+};
+const OPENAI_PLAN_LABELS = {
+  plus:   'Plus ($20/mo)',
+  pro:    'Pro ($100/mo)',
+  pro100: 'Pro ($100/mo)',
+  pro200: 'Pro ($200/mo)',
+  '$20':  'Plus ($20/mo)',
+  '$100': 'Pro ($100/mo)',
+  '$200': 'Pro ($200/mo)',
+};
+
 // ─── Screen: welcomeScreen ────────────────────────────────────────────────────
 
 async function welcomeScreen(rl, ask) {
   const version = readVersion();
   const cwd = process.cwd();
 
-  // --- Try auto-setup first ---
-  console.log(box(`🧠 Dual-Brain v${version} — Setup`, [
-    'Detecting environment...',
-  ]));
+  // --- Detect CLI login status ---
+  process.stdout.write(`\ndual-brain v${version} — Setup\n\nDetecting your setup...\n`);
+
+  const auth  = await detectAuth();
+  const plans = detectPlans();
+
+  const claudeReady = auth.claude.found;
+  const openaiReady = auth.openai.found;
+
+  const claudePlanLabel = claudeReady
+    ? (CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude ?? 'plan unknown')
+    : null;
+  const openaiPlanLabel = openaiReady
+    ? (OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai ?? 'plan unknown')
+    : null;
+
+  const detectedLines = [];
+  if (claudeReady) detectedLines.push(`  Claude CLI ready${claudePlanLabel ? ` (${claudePlanLabel})` : ''}`);
+  else             detectedLines.push(`  Claude CLI not logged in`);
+  if (openaiReady) detectedLines.push(`  Codex CLI ready${openaiPlanLabel ? ` (${openaiPlanLabel})` : ''}`);
+  else             detectedLines.push(`  Codex CLI not logged in`);
+
+  console.log('');
+  console.log('Detected:');
+  for (const line of detectedLines) {
+    const ok = !line.includes('not logged');
+    console.log(`  ${ok ? '' : ''}${line.trim()}`);
+  }
   console.log('');
 
-  const setup = await autoSetup(cwd);
+  // --- Detect data-tools / replit-tools sessions ---
+  const env = detectEnvironment();
+  const existingSessions = importReplitSessions(cwd);
+  if (env.hasReplitTools) {
+    detectedLines.push(`  data-tools detected`);
+  }
+  if (existingSessions.length > 0) {
+    detectedLines.push(`  ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} found from data-tools`);
+  }
 
-  if (setup.confident) {
-    // Build summary lines for the auto-detected state
-    const detectedLines = [
-      'Detecting environment...',
-      ...setup.actions.map(a => `✓ ${a}`),
-      ...setup.warnings.map(w => `⚠ ${w}`),
-    ];
+  // Re-print with full detection results
+  console.log('\r\x1b[K'); // clear the partial output
+  console.log('Detected:');
+  for (const line of detectedLines) {
+    const ok = !line.includes('not logged');
+    console.log(`  ${ok ? '✓' : '✗'} ${line.trim()}`);
+  }
+  console.log('');
 
-    const modeLabel = setup.profile.mode === 'dual'      ? 'dual mode, balanced'
-      : setup.profile.mode === 'solo-claude' ? 'Claude-only mode, balanced'
-      : setup.profile.mode === 'solo-openai' ? 'OpenAI-only mode, balanced'
-      : `${setup.profile.mode}, balanced`;
+  if (!claudeReady && !openaiReady) {
+    console.log('No CLI login found. Log in first:');
+    console.log('  claude login   — for Claude');
+    console.log('  codex login    — for OpenAI/Codex\n');
+    console.log('Then re-run: dual-brain init');
+    return { next: 'exit' };
+  }
 
-    const readyBox = box(`🧠 Dual-Brain v${version} — Setup`, [
-      ...detectedLines,
-      '',
-      `Ready to go! Auto-configured ${modeLabel}.`,
-    ]);
-    console.log(readyBox);
-    console.log('');
-    console.log('  [Enter] Start coding →');
-    console.log('  [c]     Customize setup');
-    console.log('  [a]     Auth management');
-    console.log('');
+  console.log('  [Enter] Save and go');
+  console.log('  [c]     Customize plan tier');
+  if (existingSessions.length > 0) {
+    console.log(`  [i]     Import ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} from data-tools`);
+  }
+  console.log('');
 
-    const choice = (await ask('  Choice: ')).trim().toLowerCase();
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
 
-    if (choice === 'c') {
-      // Fall through to manual wizard below
-    } else if (choice === 'a') {
-      return { next: 'auth' };
-    } else {
-      // Enter or anything else → save and go to dashboard
+  if (choice === 'i' && existingSessions.length > 0) {
+    console.log(`\n  Importing ${existingSessions.length} sessions from data-tools...\n`);
+    const recent = existingSessions.slice(0, 5);
+    for (const sess of recent) {
+      console.log(`  ${sess.age.padEnd(6)}  ${sess.name}`);
+    }
+    if (existingSessions.length > 5) {
+      console.log(`  ... and ${existingSessions.length - 5} more`);
+    }
+    console.log('\n  Sessions imported! They\'ll appear in your Recent list.\n');
+    await ask('  Press Enter to continue...');
+    // Fall through to auto-save
+  }
+
+  if (choice !== 'c') {
+    // Auto-save detected plans and proceed
+    const setup = await autoSetup(cwd);
+    if (setup.confident && setup.profile) {
       saveProfile(setup.profile, { cwd });
-      await cmdInstall(cwd);
-      return { next: 'main' };
+    } else {
+      // Build profile from what we know
+      const existing = loadProfile(cwd);
+      if (claudeReady) {
+        existing.providers.claude = { enabled: true, plan: plans.claude || 'pro' };
+      }
+      if (openaiReady) {
+        existing.providers.openai = { enabled: true, plan: plans.openai || 'plus' };
+      }
+      const enabledCount = [claudeReady, openaiReady].filter(Boolean).length;
+      existing.mode = enabledCount >= 2 ? 'dual' : claudeReady ? 'solo-claude' : 'solo-openai';
+      saveProfile(existing, { cwd });
     }
-  } else {
-    // Not confident — show what's missing before falling through to wizard
-    if (setup.warnings.length > 0) {
-      console.log(box(`🧠 Dual-Brain v${version} — Setup`, [
-        'Auto-detection incomplete:',
-        ...setup.warnings.map(w => `  ✗ ${w}`),
-        '',
-        'Let\'s configure manually.',
-      ]));
-      console.log('');
+    await cmdInstall(cwd);
+    return { next: 'main' };
+  }
+
+  // ── [c] Customize: plan picker ───────────────────────────────────────────
+
+  const existingProfile = loadProfile(cwd);
+
+  // Claude plan picker
+  if (claudeReady) {
+    console.log('');
+    console.log(separator('Claude subscription'));
+    console.log('  (1) Pro ($20/mo)');
+    console.log('  (2) Max x5 ($100/mo)');
+    console.log('  (3) Max x20 ($200/mo)');
+    console.log('  (4) Skip');
+    const claudeChoice = (await ask('> ')).trim();
+    const claudePlanMap = { '1': 'pro', '2': 'max5', '3': 'max20' };
+    if (claudeChoice !== '4') {
+      existingProfile.providers.claude = {
+        enabled: true,
+        plan: claudePlanMap[claudeChoice] || plans.claude || 'pro',
+      };
+    } else {
+      existingProfile.providers.claude = { enabled: false, plan: plans.claude || 'pro' };
     }
   }
 
-  // --- Manual wizard (fallback or [c] Customize) ---
-  console.log(separator('Claude (Anthropic)'));
-  console.log('  (1) $20/mo Pro');
-  console.log('  (2) $100/mo Max 5x');
-  console.log('  (3) $200/mo Max 20x');
-  console.log('  (4) API key only');
-  console.log('  (5) Skip — don\'t use Claude');
-  const claudeChoice = (await ask('> ')).trim();
-
-  let claudePlan = null;
-  let claudeEnabled = true;
-  if (claudeChoice === '1') { claudePlan = 'pro'; }
-  else if (claudeChoice === '2') { claudePlan = 'max5'; }
-  else if (claudeChoice === '3') { claudePlan = 'max20'; }
-  else if (claudeChoice === '4') {
-    claudePlan = 'api';
-    // Ask for API key immediately
-    const key = (await ask('Paste your Anthropic API key: ')).trim();
-    if (key) {
-      // Inline: set env var for this session, profile will persist
-      process.env.ANTHROPIC_API_KEY = key;
-      console.log('✓ Claude API key set for this session');
+  // OpenAI plan picker
+  if (openaiReady) {
+    console.log('');
+    console.log(separator('OpenAI subscription'));
+    console.log('  (1) Plus ($20/mo)');
+    console.log('  (2) Pro ($100/mo)');
+    console.log('  (3) Pro ($200/mo higher limits)');
+    console.log('  (4) Skip');
+    const openaiChoice = (await ask('> ')).trim();
+    const openaiPlanMap = { '1': 'plus', '2': 'pro', '3': 'pro200' };
+    if (openaiChoice !== '4') {
+      existingProfile.providers.openai = {
+        enabled: true,
+        plan: openaiPlanMap[openaiChoice] || plans.openai || 'plus',
+      };
+    } else {
+      existingProfile.providers.openai = { enabled: false, plan: plans.openai || 'plus' };
     }
-  } else if (claudeChoice === '5') {
-    claudeEnabled = false;
-    claudePlan = null;
-  } else {
-    // Default: pro
-    claudePlan = 'pro';
   }
 
+  // Mode picker
   console.log('');
-
-  // --- OpenAI provider selection ---
-  console.log(separator('OpenAI (ChatGPT/Codex)'));
-  console.log('  (1) $20/mo Plus');
-  console.log('  (2) $100/mo Pro');
-  console.log('  (3) $200/mo Pro (higher limits)');
-  console.log('  (4) API key only');
-  console.log('  (5) Skip — don\'t use OpenAI');
-  const openaiChoice = (await ask('> ')).trim();
-
-  let openaiPlan = null;
-  let openaiEnabled = true;
-  if (openaiChoice === '1') { openaiPlan = 'plus'; }
-  else if (openaiChoice === '2') { openaiPlan = 'pro'; }
-  else if (openaiChoice === '3') { openaiPlan = 'pro200'; }
-  else if (openaiChoice === '4') {
-    openaiPlan = 'api';
-    const key = (await ask('Paste your OpenAI API key: ')).trim();
-    if (key) {
-      process.env.OPENAI_API_KEY = key;
-      console.log('✓ OpenAI API key set for this session');
-    }
-  } else if (openaiChoice === '5') {
-    openaiEnabled = false;
-    openaiPlan = null;
-  } else {
-    openaiPlan = 'plus';
-  }
-
-  console.log('');
-
-  // --- Optimization mode ---
   console.log(separator('Optimization'));
   console.log('  (1) Save usage — prefer cheaper models');
   console.log('  (2) Balanced — best model per tier (recommended)');
   console.log('  (3) Quality first — always use best available');
   const modeChoice = (await ask('> ')).trim();
+  existingProfile.mode = ({ '1': 'cost-saver', '3': 'quality-first' })[modeChoice] || 'balanced';
 
-  let mode = 'balanced';
-  if (modeChoice === '1') { mode = 'cost-saver'; }
-  else if (modeChoice === '3') { mode = 'quality-first'; }
+  // Team setup
+  console.log('');
+  console.log('  Team auth: label subscriptions and set expiry for auto-refresh.');
+  console.log('  When a subscription expires, dual-brain will prompt re-login automatically.');
+  console.log('');
+  console.log('  [Enter] Skip   [t] Set up team auth');
+  const teamChoice = (await ask('  Choice: ')).trim().toLowerCase();
+  if (teamChoice === 't') {
+    for (const provider of ['claude', 'openai']) {
+      if (!existingProfile.providers[provider]?.enabled) continue;
+      const provLabel = provider === 'claude' ? 'Claude' : 'OpenAI';
+      const label = (await ask(`  ${provLabel} label (e.g. "Josh's account"): `)).trim();
+      if (label) existingProfile.providers[provider].label = label;
+      const expiryStr = (await ask(`  ${provLabel} expiry YYYY-MM-DD (auto-refreshes when expired, or Enter to skip): `)).trim();
+      if (expiryStr && /^\d{4}-\d{2}-\d{2}$/.test(expiryStr)) {
+        existingProfile.providers[provider].expiresAt = new Date(expiryStr).toISOString();
+      }
+    }
+  }
 
-  // --- Build and save profile ---
-  const existingProfile = loadProfile(cwd);
-  const profile = {
-    ...existingProfile,
-    mode,
-    providers: {
-      claude: {
-        enabled: claudeEnabled,
-        plan: claudePlan || 'pro',
-      },
-      openai: {
-        enabled: openaiEnabled,
-        plan: openaiPlan || 'plus',
-      },
-    },
-  };
-  saveProfile(profile, { cwd });
+  const enabledCount = Object.values(existingProfile.providers).filter(p => p.enabled).length;
+  existingProfile.mode = enabledCount >= 2 ? existingProfile.mode || 'auto' : claudeReady ? 'solo-claude' : 'solo-openai';
 
-  // --- Detect environment for summary ---
-  const env = detectEnvironment();
-  const auth = await detectAuth();
+  saveProfile(existingProfile, { cwd });
 
-  const summaryLines = [
-    `Mode: ${mode}`,
-    claudeEnabled
-      ? `Claude: ${claudePlan} plan ${auth.claude.found ? badge('connected') : badge('missing')}`
-      : 'Claude: disabled',
-    openaiEnabled
-      ? `OpenAI: ${openaiPlan} plan ${auth.openai.found ? badge('connected') : badge('missing')}`
-      : 'OpenAI: disabled',
-    env.isReplit ? '🌀 Replit environment detected' : '',
-  ].filter(Boolean);
+  // Summary
+  const summaryLines = [];
+  for (const [key, prov] of Object.entries(existingProfile.providers)) {
+    const planLabel = key === 'claude'
+      ? (CLAUDE_PLAN_LABELS[prov.plan] ?? prov.plan)
+      : (OPENAI_PLAN_LABELS[prov.plan] ?? prov.plan);
+    summaryLines.push(`${key === 'claude' ? 'Claude' : 'OpenAI'}: ${prov.enabled ? planLabel : 'disabled'}${prov.label ? ` [${prov.label}]` : ''}`);
+  }
+  summaryLines.push(`Mode: ${existingProfile.mode}`);
 
   console.log('');
   console.log(box('Setup Complete', summaryLines));
   console.log('');
 
   await cmdInstall(cwd);
-
   return { next: 'main' };
 }
 
@@ -719,13 +743,49 @@ async function mainScreen(rl, ask) {
   const profile = loadProfile(cwd);
   const auth = await detectAuth();
 
-  const claudePlan = profile?.providers?.claude?.plan ?? 'Pro';
-  const openaiPlan = profile?.providers?.openai?.plan ?? 'Plus';
-  const claudeStatus = auth.claude.found ? `Claude: ${claudePlan} ✓` : `Claude: missing`;
-  const openaiStatus = auth.openai.found ? `OpenAI: ${openaiPlan} ✓` : `OpenAI: missing`;
+  const claudeSub = profile?.providers?.claude;
+  const openaiSub = profile?.providers?.openai;
+  const claudePlan = claudeSub?.plan ?? 'Pro';
+  const openaiPlan = openaiSub?.plan ?? 'Plus';
+
+  // Check subscription expiry
+  const now = Date.now();
+  const claudeExpired = claudeSub?.expiresAt && Date.parse(claudeSub.expiresAt) < now;
+  const openaiExpired = openaiSub?.expiresAt && Date.parse(openaiSub.expiresAt) < now;
+
+  let claudeStatus = auth.claude.found ? `Claude: ${claudePlan} ✓` : `Claude: not logged in`;
+  let openaiStatus = auth.openai.found ? `OpenAI: ${openaiPlan} ✓` : `OpenAI: not logged in`;
+  if (claudeExpired) claudeStatus = `Claude: ${claudePlan} ⚠ expired`;
+  if (openaiExpired) openaiStatus = `OpenAI: ${openaiPlan} ⚠ expired`;
 
   console.log(`\ndual-brain v${version}`);
-  console.log(`${claudeStatus}  ·  ${openaiStatus}\n`);
+  console.log(`${claudeStatus}  ·  ${openaiStatus}`);
+
+  // Auto-refresh expired subscriptions
+  if (claudeExpired || openaiExpired) {
+    const { spawnSync } = await import('node:child_process');
+    const expired = [];
+    if (claudeExpired) expired.push('Claude');
+    if (openaiExpired) expired.push('OpenAI');
+    console.log(`\n  ${expired.join(' & ')} subscription expired. Re-authenticating...`);
+    if (claudeExpired) {
+      const r = spawnSync('claude', ['login'], { stdio: 'inherit', timeout: 30000 });
+      if (r.status === 0) {
+        claudeSub.expiresAt = null;
+        saveProfile(profile, { cwd });
+        console.log('  ✓ Claude re-authenticated');
+      }
+    }
+    if (openaiExpired) {
+      const r = spawnSync('codex', ['login'], { stdio: 'inherit', timeout: 30000 });
+      if (r.status === 0) {
+        openaiSub.expiresAt = null;
+        saveProfile(profile, { cwd });
+        console.log('  ✓ OpenAI re-authenticated');
+      }
+    }
+  }
+  console.log('');
 
   const recentSessions = importReplitSessions(cwd).slice(0, 5);
 
@@ -854,15 +914,24 @@ async function settingsScreen(rl, ask) {
 
   const modeLabel = (m) => m === profile.mode ? `${m} (active)` : m;
 
+  const claudeSub = profile?.providers?.claude;
+  const openaiSub = profile?.providers?.openai;
+  const claudePlanLabel = claudeSub?.enabled
+    ? (CLAUDE_PLAN_LABELS[claudeSub.plan] ?? claudeSub.plan ?? 'n/a')
+    : 'disabled';
+  const openaiPlanLabel = openaiSub?.enabled
+    ? (OPENAI_PLAN_LABELS[openaiSub.plan] ?? openaiSub.plan ?? 'n/a')
+    : 'disabled';
+
   const settingsLines = [
     `Mode:`,
     `  [1] ${modeLabel('cost-saver')}`,
     `  [2] ${modeLabel('balanced')}`,
     `  [3] ${modeLabel('quality-first')}`,
     '',
-    `Auth:`,
-    `  Claude: ${auth.claude.found ? `connected (${auth.claude.source})` : 'missing'}`,
-    `  OpenAI: ${auth.openai.found ? `connected (${auth.openai.source})` : 'missing'}`,
+    `Subscriptions:`,
+    `  Claude: ${auth.claude.found ? 'logged in' : 'not logged in'} — ${claudePlanLabel}${claudeSub?.label ? ` [${claudeSub.label}]` : ''}`,
+    `  OpenAI: ${auth.openai.found ? 'logged in' : 'not logged in'} — ${openaiPlanLabel}${openaiSub?.label ? ` [${openaiSub.label}]` : ''}`,
     '',
     `Enforcement: ${guardCount}/4 guards active`,
   ];
@@ -871,12 +940,12 @@ async function settingsScreen(rl, ask) {
   console.log(box('Settings', settingsLines));
   console.log('');
   console.log(menu([
-    { key: '1', label: 'Switch to cost-saver',   section: 'Mode' },
-    { key: '2', label: 'Switch to balanced',      section: 'Mode' },
-    { key: '3', label: 'Switch to quality-first', section: 'Mode' },
-    { key: 'a', label: 'Add API key',             section: 'Auth' },
-    { key: 'i', label: 'Reinstall hooks',         section: 'Enforcement' },
-    { key: 'b', label: 'Back',                    section: '' },
+    { key: '1', label: 'Switch to cost-saver',       section: 'Mode' },
+    { key: '2', label: 'Switch to balanced',          section: 'Mode' },
+    { key: '3', label: 'Switch to quality-first',     section: 'Mode' },
+    { key: 'a', label: 'Manage subscriptions',        section: 'Subscriptions' },
+    { key: 'i', label: 'Reinstall hooks',             section: 'Enforcement' },
+    { key: 'b', label: 'Back',                        section: '' },
   ]));
   console.log('');
 
@@ -891,8 +960,7 @@ async function settingsScreen(rl, ask) {
   }
 
   if (choice === 'a') {
-    await setupAuth(rl);
-    return { next: 'settings' };
+    return { next: 'subscriptions' };
   }
 
   if (choice === 'i') {
@@ -905,63 +973,173 @@ async function settingsScreen(rl, ask) {
   return { next: 'settings' };
 }
 
+// ─── Screen: subscriptionsScreen ─────────────────────────────────────────────
+
+async function subscriptionsScreen(rl, ask) {
+  const cwd = process.cwd();
+  const profile = loadProfile(cwd);
+  const auth    = await detectAuth();
+  const plans   = detectPlans();
+
+  const claudeSub = profile?.providers?.claude;
+  const openaiSub = profile?.providers?.openai;
+
+  const claudePlanLabel = claudeSub?.enabled
+    ? (CLAUDE_PLAN_LABELS[claudeSub.plan] ?? claudeSub.plan ?? 'n/a')
+    : 'disabled';
+  const openaiPlanLabel = openaiSub?.enabled
+    ? (OPENAI_PLAN_LABELS[openaiSub.plan] ?? openaiSub.plan ?? 'n/a')
+    : 'disabled';
+
+  const subLines = [
+    `Claude:  ${auth.claude.found ? 'logged in' : 'not logged in'} — ${claudePlanLabel}`,
+    claudeSub?.label ? `         label: ${claudeSub.label}` : '',
+    claudeSub?.expiresAt ? `         expires: ${claudeSub.expiresAt.slice(0, 10)}` : '',
+    '',
+    `OpenAI:  ${auth.openai.found ? 'logged in' : 'not logged in'} — ${openaiPlanLabel}`,
+    openaiSub?.label ? `         label: ${openaiSub.label}` : '',
+    openaiSub?.expiresAt ? `         expires: ${openaiSub.expiresAt.slice(0, 10)}` : '',
+  ].filter(line => line !== '');
+
+  console.log('');
+  console.log(box('Subscriptions', subLines));
+  console.log('');
+  console.log(menu([
+    { key: 'd', label: 'Re-detect from CLI',   section: '' },
+    { key: 'c', label: 'Set Claude plan tier', section: '' },
+    { key: 'o', label: 'Set OpenAI plan tier', section: '' },
+    { key: 't', label: 'Set team label/expiry',section: '' },
+    { key: 'b', label: 'Back to settings',     section: '' },
+  ]));
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === 'd') {
+    // Re-detect from CLI config files
+    if (plans.claude && claudeSub) {
+      profile.providers.claude.plan = plans.claude;
+      console.log(`  Detected Claude: ${CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude}`);
+    }
+    if (plans.openai && openaiSub) {
+      profile.providers.openai.plan = plans.openai;
+      console.log(`  Detected OpenAI: ${OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai}`);
+    }
+    saveProfile(profile, { cwd });
+    return { next: 'subscriptions' };
+  }
+
+  if (choice === 'c') {
+    console.log('');
+    console.log('  Claude plan:');
+    console.log('  (1) Pro ($20/mo)');
+    console.log('  (2) Max x5 ($100/mo)');
+    console.log('  (3) Max x20 ($200/mo)');
+    const c = (await ask('  > ')).trim();
+    const planMap = { '1': 'pro', '2': 'max5', '3': 'max20' };
+    if (planMap[c]) {
+      if (!profile.providers.claude) profile.providers.claude = { enabled: true };
+      profile.providers.claude.plan = planMap[c];
+      profile.providers.claude.enabled = true;
+      saveProfile(profile, { cwd });
+      console.log(`  Claude plan set to: ${CLAUDE_PLAN_LABELS[planMap[c]]}`);
+    }
+    return { next: 'subscriptions' };
+  }
+
+  if (choice === 'o') {
+    console.log('');
+    console.log('  OpenAI plan:');
+    console.log('  (1) Plus ($20/mo)');
+    console.log('  (2) Pro ($100/mo)');
+    console.log('  (3) Pro ($200/mo higher limits)');
+    const c = (await ask('  > ')).trim();
+    const planMap = { '1': 'plus', '2': 'pro', '3': 'pro200' };
+    if (planMap[c]) {
+      if (!profile.providers.openai) profile.providers.openai = { enabled: true };
+      profile.providers.openai.plan = planMap[c];
+      profile.providers.openai.enabled = true;
+      saveProfile(profile, { cwd });
+      console.log(`  OpenAI plan set to: ${OPENAI_PLAN_LABELS[planMap[c]]}`);
+    }
+    return { next: 'subscriptions' };
+  }
+
+  if (choice === 't') {
+    // Team label/expiry for each provider
+    for (const provider of ['claude', 'openai']) {
+      const prov = profile.providers[provider];
+      if (!prov?.enabled) continue;
+      const provLabel = provider === 'claude' ? 'Claude' : 'OpenAI';
+      const currentLabel = prov.label || '';
+      const label = (await ask(`  ${provLabel} label [${currentLabel || 'none'}]: `)).trim();
+      if (label) prov.label = label;
+      const currentExpiry = prov.expiresAt ? prov.expiresAt.slice(0, 10) : '';
+      const expiryStr = (await ask(`  ${provLabel} expiry YYYY-MM-DD [${currentExpiry || 'none'}]: `)).trim();
+      if (expiryStr && /^\d{4}-\d{2}-\d{2}$/.test(expiryStr)) {
+        prov.expiresAt = new Date(expiryStr).toISOString();
+      } else if (expiryStr === '-') {
+        delete prov.expiresAt;
+        delete prov.label;
+      }
+    }
+    saveProfile(profile, { cwd });
+    console.log('  Team config saved.');
+    return { next: 'subscriptions' };
+  }
+
+  if (choice === 'b' || choice === 'back') { return { next: 'settings' }; }
+
+  return { next: 'subscriptions' };
+}
+
 // ─── Screen: dashboardScreen (kept for internal reference, unreachable) ───────
 
 async function dashboardScreen(rl, ask) {
   return { next: 'main' };
 }
 
-// ─── Screen: authScreen ───────────────────────────────────────────────────────
+// ─── Screen: authScreen — subscription status view ───────────────────────────
 
 async function authScreen(rl, ask) {
+  const cwd  = process.cwd();
   const auth = await detectAuth();
+  const profile = loadProfile(cwd);
+
+  const claudeSub = profile?.providers?.claude;
+  const openaiSub = profile?.providers?.openai;
+  const claudePlanLabel = claudeSub?.enabled
+    ? (CLAUDE_PLAN_LABELS[claudeSub.plan] ?? claudeSub.plan ?? 'n/a')
+    : 'disabled';
+  const openaiPlanLabel = openaiSub?.enabled
+    ? (OPENAI_PLAN_LABELS[openaiSub.plan] ?? openaiSub.plan ?? 'n/a')
+    : 'disabled';
 
   const authLines = [
     'Claude:',
+    auth.claude.found
+      ? `  logged in via ${auth.claude.source}`
+      : `  not logged in — run: claude login`,
+    `  plan: ${claudePlanLabel}${claudeSub?.label ? ` [${claudeSub.label}]` : ''}`,
+    '',
+    'OpenAI:',
+    auth.openai.found
+      ? `  logged in via ${auth.openai.source}`
+      : `  not logged in — run: codex login`,
+    `  plan: ${openaiPlanLabel}${openaiSub?.label ? ` [${openaiSub.label}]` : ''}`,
   ];
 
-  if (auth.claude.found) {
-    authLines.push(`  source: ${auth.claude.source}  ${badge('connected')}`);
-    authLines.push(`  key:    ${auth.claude.masked}`);
-  } else {
-    authLines.push(`  not configured  ${badge('missing')}`);
-  }
-
-  authLines.push('');
-  authLines.push('OpenAI:');
-
-  if (auth.openai.found) {
-    authLines.push(`  source: ${auth.openai.source}  ${badge('connected')}`);
-    authLines.push(`  key:    ${auth.openai.masked}`);
-  } else {
-    authLines.push(`  not configured  ${badge('missing')}`);
-  }
-
-  console.log(box('🔑 Auth Management', authLines));
+  console.log(box('Subscription Status', authLines));
   console.log('');
   console.log(menu([
-    { key: 'a', label: 'Add API key',        section: '' },
-    { key: 't', label: 'Test keys',          section: '' },
-    { key: 'b', label: 'Back to dashboard',  section: '' },
+    { key: 'a', label: 'Manage subscriptions', section: '' },
+    { key: 'b', label: 'Back to dashboard',    section: '' },
   ]));
   console.log('');
 
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
 
-  if (choice === 'a') {
-    await setupAuth(rl);
-    return { next: 'auth' }; // refresh
-  }
-
-  if (choice === 't') {
-    console.log('\n  Testing auth...');
-    const authNow = await detectAuth();
-    console.log(`  Claude: ${authNow.claude.found ? 'OK — ' + authNow.claude.source : 'NOT FOUND'}`);
-    console.log(`  OpenAI: ${authNow.openai.found ? 'OK — ' + authNow.openai.source : 'NOT FOUND'}`);
-    await ask('\n  Press Enter to continue...');
-    return { next: 'auth' };
-  }
-
+  if (choice === 'a') { return { next: 'subscriptions' }; }
   if (choice === 'b' || choice === 'back') { return { next: 'dashboard' }; }
 
   return { next: 'auth' };
@@ -1031,7 +1209,6 @@ async function diagnosticsScreen(rl, ask) {
   const cwd = process.cwd();
   const { spawnSync: _spawnSync } = await import('child_process');
   const { readdirSync } = await import('node:fs');
-  const { detectPlans } = await import('../src/profile.mjs');
 
   // ── Version info ──────────────────────────────────────────────────────────
   const version = readVersion();
@@ -1044,20 +1221,18 @@ async function diagnosticsScreen(rl, ask) {
 
   function _providerBadge(name) {
     const entries = Object.entries(healthStates).filter(([k]) => k.startsWith(`${name}:`));
-    if (entries.length === 0) return '✅ healthy';
+    if (entries.length === 0) return 'healthy';
     const statuses = entries.map(([, v]) => v.status);
-    if (statuses.includes('hot'))      return '🔴 hot';
-    if (statuses.includes('degraded')) return '⚠️  degraded';
-    if (statuses.includes('probing'))  return '⚠️  probing';
-    return '✅ healthy';
+    if (statuses.includes('hot'))      return 'hot';
+    if (statuses.includes('degraded')) return 'degraded';
+    if (statuses.includes('probing'))  return 'probing';
+    return 'healthy';
   }
 
-  const claudeStatus  = auth.claude.found ? _providerBadge('claude') : '❌ no auth';
-  const openaiStatus  = auth.openai.found ? _providerBadge('openai') : '❌ no auth';
-  const claudePlanStr = plans.claude ? `Max ${plans.claude}` : (auth.claude.masked ?? 'unknown');
-  const openaiPlanStr = plans.openai ? `Pro ${plans.openai}` : (auth.openai.masked ?? 'unknown');
-  const claudeAuthStr = auth.claude.masked ?? 'not configured';
-  const openaiAuthStr = auth.openai.masked ?? 'not configured';
+  const claudeHealthBadge = auth.claude.found ? _providerBadge('claude') : 'not logged in';
+  const openaiHealthBadge = auth.openai.found ? _providerBadge('openai') : 'not logged in';
+  const claudePlanStr     = plans.claude ? (CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude) : 'unknown';
+  const openaiPlanStr     = plans.openai ? (OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai) : 'unknown';
 
   // ── Enforcement checks ────────────────────────────────────────────────────
   const hooksDir           = join(cwd, '.claude', 'hooks');
@@ -1158,7 +1333,6 @@ async function diagnosticsScreen(rl, ask) {
   // ── Render ────────────────────────────────────────────────────────────────
   const W = 56;
   const hbar = '═'.repeat(W);
-  // Pad a string to exactly W visible columns (for box rows without leading ║  prefix)
   const padRow = (s) => {
     const plain = s.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
     let vlen = 0;
@@ -1173,36 +1347,36 @@ async function diagnosticsScreen(rl, ask) {
 
   const output = [
     `╔${hbar}╗`,
-    hrow('🔧 Diagnostics'),
+    hrow('Diagnostics'),
     `╠${hbar}╣`,
     hrow(`dual-brain v${version}`),
     hrow(`Node.js ${nodeVersion}`),
     `╚${hbar}╝`,
     '',
-    separator('Provider Health'),
-    `  ${claudeStatus.padEnd(14)} Claude    ${claudePlanStr.padEnd(16)} ${claudeAuthStr}`,
-    `  ${openaiStatus.padEnd(14)} OpenAI    ${openaiPlanStr.padEnd(16)} ${openaiAuthStr}`,
+    separator('Provider Status'),
+    `  Claude: ${claudeHealthBadge.padEnd(14)} ${claudePlanStr}`,
+    `  OpenAI: ${openaiHealthBadge.padEnd(14)} ${openaiPlanStr}`,
     '',
     separator('Enforcement'),
-    `  ${headGuardExists   ? '✅' : '❌'} head-guard.mjs     ${headGuardExists   ? 'installed' : 'missing — run: dual-brain install'}`,
-    `  ${enforceTierExists ? '✅' : '❌'} enforce-tier.mjs   ${enforceTierExists ? 'installed' : 'missing — run: dual-brain install'}`,
-    `  ${guardCount === 4  ? '✅' : '⚠️ '} settings.json      ${guardCount}/4 guards registered${guardCount < 4 ? ' — run: dual-brain install' : ''}`,
-    `  ${hookifyCount > 0  ? '✅' : '⚠️ '} hookify rules      ${hookifyCount} rules${hookifyCount > 0 ? ' (check: ls .claude/hookify.*.md)' : ' — none found'}`,
+    `  ${headGuardExists   ? 'ok' : 'MISSING'} head-guard.mjs     ${headGuardExists   ? 'installed' : 'run: dual-brain install'}`,
+    `  ${enforceTierExists ? 'ok' : 'MISSING'} enforce-tier.mjs   ${enforceTierExists ? 'installed' : 'run: dual-brain install'}`,
+    `  ${guardCount === 4  ? 'ok' : 'PARTIAL'} settings.json      ${guardCount}/4 guards registered${guardCount < 4 ? ' — run: dual-brain install' : ''}`,
+    `  ${hookifyCount > 0  ? 'ok' : 'WARN   '} hookify rules      ${hookifyCount} rules${hookifyCount > 0 ? '' : ' — none found'}`,
     '',
     separator('Replit Tools'),
-    `  ${hasReplitTools ? '✅' : '❌'} replit-tools        ${hasReplitTools ? 'detected' : 'not detected'}`,
+    `  ${hasReplitTools ? 'ok' : 'n/a'} replit-tools        ${hasReplitTools ? 'detected' : 'not detected'}`,
   ];
 
   if (hasReplitTools) {
     if (credsFresh === null) {
-      output.push('  ⚠️  Claude auth         credentials file missing');
+      output.push('  WARN  Claude auth         credentials file missing');
     } else if (credsFresh) {
-      output.push(`  ✅ Claude auth         fresh (expires: ${credsExpiry})`);
+      output.push(`  ok    Claude auth         fresh (expires: ${credsExpiry})`);
     } else {
-      output.push(`  ❌ Claude auth         expired (${credsExpiry}) — run [r] Refresh auth`);
+      output.push(`  ERROR Claude auth         expired (${credsExpiry}) — run [r] Refresh auth`);
     }
-    output.push(`  ✅ Session archive     ${historyCount} entries`);
-    output.push(`  ${sessionManagerExists ? '✅' : '⚠️ '} Session manager     ${sessionManagerExists ? 'available' : 'not found'}`);
+    output.push(`  ok    Session archive     ${historyCount} entries`);
+    output.push(`  ${sessionManagerExists ? 'ok' : 'WARN '} Session manager     ${sessionManagerExists ? 'available' : 'not found'}`);
   } else {
     output.push('  ─── (not available)');
   }
@@ -1210,14 +1384,14 @@ async function diagnosticsScreen(rl, ask) {
   output.push('');
   output.push(separator('Quality'));
   if (testError) {
-    output.push(`  ❌ Tests               error: ${testError}`);
+    output.push(`  ERROR Tests               error: ${testError}`);
   } else if (testPass !== null) {
-    output.push(`  ${testPass === testTotal ? '✅' : '❌'} Tests               ${testPass}/${testTotal} passing`);
+    output.push(`  ${testPass === testTotal ? 'ok   ' : 'FAIL '} Tests               ${testPass}/${testTotal} passing`);
   }
   if (healthError) {
-    output.push(`  ❌ Health check        error: ${healthError}`);
+    output.push(`  ERROR Health check        error: ${healthError}`);
   } else if (healthPass !== null) {
-    output.push(`  ${healthPass === healthTotal ? '✅' : '⚠️ '} Health check        ${healthPass}/${healthTotal} passing`);
+    output.push(`  ${healthPass === healthTotal ? 'ok   ' : 'WARN '} Health check        ${healthPass}/${healthTotal} passing`);
   }
   output.push('');
 
@@ -1309,10 +1483,8 @@ async function replScreen(rl, ask) {
         printHelp();
       } else if (line === 'status') {
         await cmdStatus([]);
-      } else if (line === 'auth setup' || line === 'auth-setup') {
-        await cmdAuthSetup(rl);
       } else if (line === 'auth') {
-        await cmdAuth([], rl);
+        await cmdAuth([]);
       } else if (line.startsWith('go ')) {
         await cmdGo(line.slice(3).trim().split(/\s+/));
       } else if (line.startsWith('remember ')) {
@@ -1403,6 +1575,7 @@ const SCREENS = {
   main:             mainScreen,
   'new-session':    newSessionScreen,
   settings:         settingsScreen,
+  subscriptions:    subscriptionsScreen,
   dashboard:        dashboardScreen,
   auth:             authScreen,
   profile:          profileScreen,
@@ -1481,8 +1654,6 @@ async function main() {
   // One-shot commands — run and exit
   if (cmd === 'install')  { await cmdInstall(); return; }
   if (cmd === 'auth') {
-    const sub = args[1];
-    if (sub === 'setup') { await cmdAuthSetup(); return; }
     await cmdAuth(args.slice(1));
     return;
   }
@@ -1492,6 +1663,21 @@ async function main() {
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
   if (cmd === 'remember') { cmdRemember(args[1]); return; }
   if (cmd === 'forget')   { cmdForget(args[1]); return; }
+
+  if (cmd === 'shell-hook') {
+    // Output a bash snippet users can add to their .bashrc or source directly.
+    const hook = `
+# dual-brain shell integration
+# Source this file or add to .bashrc
+if command -v dual-brain &>/dev/null; then
+  alias db='dual-brain'
+  alias dbgo='dual-brain go'
+  alias dbstat='dual-brain status'
+fi
+`.trim();
+    console.log(hook);
+    return;
+  }
 
   process.stderr.write(`Unknown command: ${cmd}\nRun "dual-brain --help" for usage.\n`);
   process.exit(1);

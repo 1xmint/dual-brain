@@ -1463,6 +1463,36 @@ async function main() {
   }
 
   const actions = install(env.workspace, env, mode);
+
+  // Write a standalone shell-hook.sh so users can source it from .bashrc.
+  // Non-interactive installs (npm postinstall) just print the hint; interactive
+  // installs also write the file so it's ready to source.
+  const shellHookSrc = join(__dirname, 'shell-hook.sh');
+  const shellHookDst = join(env.workspace, '.dualbrain', 'shell-hook.sh');
+  try {
+    mkdirSync(join(env.workspace, '.dualbrain'), { recursive: true });
+    if (existsSync(shellHookSrc)) {
+      cpSync(shellHookSrc, shellHookDst);
+      actions.push('✓ .dualbrain/shell-hook.sh (source from .bashrc to auto-launch)');
+    }
+  } catch { /* non-fatal — shell hook is optional */ }
+
+  // On Replit, print a one-liner hint for the shell hook if .bashrc doesn't have it yet.
+  if (env.isReplit) {
+    let bashrcHasDualBrain = false;
+    const bashrcPath = join(process.env.HOME || '', '.bashrc');
+    try {
+      bashrcHasDualBrain = readFileSync(bashrcPath, 'utf8').includes('dual-brain');
+    } catch { /* .bashrc may not exist */ }
+
+    if (!bashrcHasDualBrain) {
+      actions.push('');
+      actions.push('Shell hook (optional — shows dual-brain on new terminal):');
+      actions.push('  dual-brain shell-hook >> ~/.bashrc');
+      actions.push('  # or: source .dualbrain/shell-hook.sh');
+    }
+  }
+
   printReport(env, mode, actions);
 
   // After install, launch the session manager (interactive TTY only)

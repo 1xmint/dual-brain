@@ -103,6 +103,7 @@
     "playbooks/*.json",
     "plugin.json",
     "skills/*.md",
-    "agents/*.md"
+    "agents/*.md",
+    "shell-hook.sh"
   ]
 }
