@@ -60,6 +60,12 @@ export function createPipelineRun(trigger = '', prompt = '') {
     // Phase 5: Outcome
     outcome: null,
 
+    // Ledger + calibration
+    taskId: null,           // ledger task ID for this run
+    openTasks: [],          // pending tasks from ledger
+    calibration: null,      // user calibration state
+    adaptation: null,       // behavior adaptation from calibration
+
     completedAt: null,
   };
 }
@@ -650,6 +656,55 @@ export async function runPipeline(trigger, prompt, options = {}) {
       // intelligence module not available — continue without it (degraded)
     }
 
+    // Ledger: check open tasks + create task for this run
+    try {
+      const { getOpenTasks, createTask, reconcile } = await import('./ledger.mjs');
+      const cwd = options.cwd || process.cwd();
+
+      // Check for stale tasks on session start
+      run.openTasks = getOpenTasks(cwd);
+      const staleTasks = reconcile(cwd);
+
+      // Create a ledger task for this pipeline run
+      const task = createTask({
+        intent: prompt,
+        owner: 'head',
+        priority: run.projectBrief?.recentFailures?.length > 0 ? 'high' : 'medium',
+        files: options.files || []
+      }, cwd);
+      run.taskId = task.id;
+    } catch (e) {
+      // ledger not available — continue degraded
+    }
+
+    // Append open tasks to situation brief if any exist
+    if (run.openTasks.length > 0) {
+      const preview = run.openTasks.slice(0, 3).map(t => t.intent).join(', ');
+      const pendingLine = `PENDING TASKS: ${run.openTasks.length} open (${preview})`;
+      run.situationBrief = run.situationBrief
+        ? `${run.situationBrief}\n${pendingLine}`
+        : pendingLine;
+    }
+
+    // Calibration: analyze user input and adapt
+    try {
+      const { analyzeInput, getAdaptation, detectCorrection, updateCalibration } = await import('./calibration.mjs');
+      const { getProjectState, updateProject } = await import('./living-docs.mjs');
+      const cwd = options.cwd || process.cwd();
+
+      const projectState = getProjectState(cwd);
+      const currentCal = projectState?.project?.userCalibration || { specificity: 3, corrections: 3, autonomy: 3, interactions: 0 };
+      const isCorrection = detectCorrection(prompt);
+
+      run.calibration = updateCalibration(currentCal, prompt, isCorrection);
+      run.adaptation = getAdaptation(run.calibration);
+
+      // Persist updated calibration
+      updateProject({ userCalibration: run.calibration }, cwd);
+    } catch (e) {
+      // calibration not available — continue degraded
+    }
+
     // ── Phase 1: Context ──────────────────────────────────────────────────────
 
     // Build context pack
@@ -757,7 +812,47 @@ export async function runPipeline(trigger, prompt, options = {}) {
       verbose,
       profile: run.context.profile,
       situationBrief: run.situationBrief,
+      adaptation: run.adaptation,
     });
+
+    // Update ledger task with result
+    if (run.taskId) {
+      try {
+        const { updateTask, failTask } = await import('./ledger.mjs');
+        const cwd = options.cwd || process.cwd();
+
+        if (run.result && !run.result.error) {
+          updateTask(run.taskId, {
+            status: 'done',
+            result: typeof run.result === 'string' ? run.result : JSON.stringify(run.result).slice(0, 500),
+            proof: run.verification ? 'Pipeline verification passed' : 'Execution completed',
+            files: run.result.filesChanged || run.plan?.targetFiles || []
+          }, cwd);
+        } else {
+          failTask(run.taskId, run.result?.error || 'Pipeline execution failed', cwd);
+        }
+      } catch (e) {
+        // ledger update failed — non-blocking
+      }
+    }
+
+    // Record action in living docs
+    try {
+      const { appendAction } = await import('./living-docs.mjs');
+      const cwd = options.cwd || process.cwd();
+
+      appendAction({
+        type: trigger || 'task',
+        intent: prompt,
+        status: (run.result && !run.result.error) ? 'done' : 'failed',
+        owner: 'head',
+        files: run.result?.filesChanged || run.plan?.targetFiles || [],
+        proof: run.verification ? JSON.stringify(run.verification).slice(0, 200) : null,
+        result: typeof run.result === 'string' ? run.result.slice(0, 300) : null
+      }, cwd);
+    } catch (e) {
+      // living docs not available — non-blocking
+    }
 
     // ── Phase 4: Verification ─────────────────────────────────────────────────
 

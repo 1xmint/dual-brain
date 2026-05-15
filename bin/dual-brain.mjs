@@ -54,6 +54,14 @@ async function getFailureMem() {
   return _failureMem;
 }
 
+let _livingDocs = null;
+async function getLivingDocs() {
+  if (!_livingDocs) {
+    try { _livingDocs = await import('../src/living-docs.mjs'); } catch { _livingDocs = {}; }
+  }
+  return _livingDocs;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -355,6 +363,12 @@ async function cmdGo(args, opts = {}) {
   const cwd = process.cwd();
   await ensureProfile(cwd);
 
+  // ── Living docs: ensure .dual-brain/ exists on session start ─────────────
+  try {
+    const ld = await getLivingDocs();
+    if (ld.initLivingDocs) ld.initLivingDocs(cwd);
+  } catch { /* non-fatal */ }
+
   if (verbose) console.log('\nDispatching...');
 
   // ── Failure memory: check history before dispatching ──────────────────────
@@ -408,6 +422,16 @@ async function cmdGo(args, opts = {}) {
       nextAction:   null,
     }, cwd);
 
+    // ── Living docs: record completed session action ───────────────────────
+    try {
+      const ld = await getLivingDocs();
+      if (ld.appendAction) ld.appendAction({
+        type: 'task', intent: prompt, status: 'completed',
+        owner: plan?._decision?.provider ?? 'claude',
+        files, result: result.consensus || 'dual-brain complete',
+      }, cwd);
+    } catch { /* non-fatal */ }
+
     // Clear failure memory on success
     if (failureMem.clearFailures) {
       try { await failureMem.clearFailures(prompt, cwd); } catch { /* non-fatal */ }
@@ -458,6 +482,17 @@ async function cmdGo(args, opts = {}) {
       provider:     plan?._decision?.provider ?? 'claude',
       nextAction:   null,
     }, cwd);
+
+    // ── Living docs: record completed session action ───────────────────────
+    try {
+      const ld = await getLivingDocs();
+      if (ld.appendAction) ld.appendAction({
+        type: 'task', intent: prompt, status: succeeded ? 'completed' : 'failed',
+        owner: plan?._decision?.provider ?? 'claude',
+        files: result.filesChanged || files,
+        result: result.summary || (succeeded ? 'completed' : `exit ${result.exitCode}`),
+      }, cwd);
+    } catch { /* non-fatal */ }
 
     if (!succeeded) {
       // Record failure memory
@@ -1007,14 +1042,14 @@ async function welcomeScreen(rl, ask) {
   }
   console.log('');
 
-  // --- Detect data-tools / replit-tools sessions ---
+  // --- Detect replit-tools sessions ---
   const env = detectEnvironment();
   const existingSessions = importReplitSessions(cwd);
   if (env.hasReplitTools) {
-    detectedLines.push(`  data-tools detected`);
+    detectedLines.push(`  replit-tools detected`);
   }
   if (existingSessions.length > 0) {
-    detectedLines.push(`  ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} found from data-tools`);
+    detectedLines.push(`  ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} found from replit-tools`);
   }
 
   // --- Detect replit-tools ---
@@ -1054,7 +1089,7 @@ async function welcomeScreen(rl, ask) {
   console.log('  [Enter] Save and go');
   console.log('  [c]     Customize work style');
   if (existingSessions.length > 0) {
-    console.log(`  [i]     Import ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} from data-tools`);
+    console.log(`  [i]     Import ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} from replit-tools`);
   }
   if (!rt.installed) {
     console.log('');
@@ -1066,7 +1101,7 @@ async function welcomeScreen(rl, ask) {
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
 
   if (choice === 'i' && existingSessions.length > 0) {
-    console.log(`\n  Importing ${existingSessions.length} sessions from data-tools...\n`);
+    console.log(`\n  Importing ${existingSessions.length} sessions from replit-tools...\n`);
     const recent = existingSessions.slice(0, 5);
     for (const sess of recent) {
       console.log(`  ${sess.age.padEnd(6)}  ${sess.name}`);
@@ -1572,7 +1607,7 @@ async function mainScreen(rl, ask) {
     return ageMs >= 7 * 86400000;
   }).length;
 
-  // Detect data-tools version
+  // Detect replit-tools version
   const rtMain    = detectReplitTools(cwd);
   const dtVersion = (rtMain.installed && rtMain.version) ? rtMain.version : null;
 
@@ -1834,7 +1869,7 @@ async function mainScreen(rl, ask) {
   }
 
   // ── Box 5 — Input bar ──────────────────────────────────────────────────
-  const actionsContent = '> type anything...   [s] settings  [/] search  [q] quit';
+  const actionsContent = '> type anything...   [s] settings  [t] team  [q] quit';
   const actionsRow     = row(actionsContent);
 
   // ── Print the full 5-box layout ───────────────────────────────────────────
@@ -1949,7 +1984,7 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        const singleKeySet = new Set(['n', 's', 'q', '/', 'i']);
+        const singleKeySet = new Set(['n', 's', 't', 'q', '/', 'i']);
         if (singleKeySet.has(lower)) {
           cleanup();
           process.stdout.write('\n');
@@ -2055,6 +2090,7 @@ async function mainScreen(rl, ask) {
   }
 
   if (choice === 's') { return { next: 'settings' }; }
+  if (choice === 't') { return { next: 'team' }; }
   if (choice === 'i') { return { next: 'import-picker' }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
@@ -2079,7 +2115,7 @@ async function newSessionScreen(rl, ask) {
 async function importPickerScreen() {
   const cwd = process.cwd();
 
-  // Load all available sessions from data-tools
+  // Load all available sessions from replit-tools
   const allSessions = importReplitSessions(cwd);
 
   // Load existing session meta to filter already-imported ones
@@ -2125,9 +2161,9 @@ async function importPickerScreen() {
   if (allSessions.length === 0) {
     process.stdout.write('\n');
     process.stdout.write(top + '\n');
-    process.stdout.write(row('Import from data-tools') + '\n');
+    process.stdout.write(row('Import from replit-tools') + '\n');
     process.stdout.write(sep + '\n');
-    process.stdout.write(row('No data-tools sessions found.') + '\n');
+    process.stdout.write(row('No replit-tools sessions found.') + '\n');
     process.stdout.write(row('Install replit-tools: npm i -g replit-tools') + '\n');
     process.stdout.write(sep + '\n');
     process.stdout.write(row('Press any key to go back...') + '\n');
@@ -2139,7 +2175,7 @@ async function importPickerScreen() {
   if (candidates.length === 0) {
     process.stdout.write('\n');
     process.stdout.write(top + '\n');
-    process.stdout.write(row('Import from data-tools') + '\n');
+    process.stdout.write(row('Import from replit-tools') + '\n');
     process.stdout.write(sep + '\n');
     process.stdout.write(row(`All ${allSessions.length} sessions already imported.`) + '\n');
     process.stdout.write(sep + '\n');
@@ -2162,7 +2198,7 @@ async function importPickerScreen() {
   const renderPicker = () => {
     process.stdout.write('\x1b[2J\x1b[H'); // clear screen
 
-    const headerTitle = 'Import from data-tools';
+    const headerTitle = 'Import from replit-tools';
     const footerLine  = '↑↓ Navigate  Space Toggle  Enter Import  q Back';
 
     process.stdout.write('\n');
@@ -2299,7 +2335,7 @@ async function importPickerScreen() {
   }
   saveSessionMeta(updatedMeta, cwd);
 
-  process.stdout.write(`✓ Imported ${importCount} session${importCount !== 1 ? 's' : ''} from data-tools\n\n`);
+  process.stdout.write(`✓ Imported ${importCount} session${importCount !== 1 ? 's' : ''} from replit-tools\n\n`);
 
   return { next: 'main' };
 }
@@ -2561,22 +2597,60 @@ async function settingsScreen(rl, ask) {
     'balanced':      '⚖️  Balanced',
     'quality-first': '🔥 Full Power',
   };
-  const workStyleLabel = WORK_STYLE_DISPLAY[currentBias] || '⚖️  Balanced';
+
+  // Work style current markers
+  const _stIsFast = ['cost-saver', 'auto', 'solo-claude', 'solo-openai'].includes(currentBias);
+  const _stIsBal  = currentBias === 'balanced';
+  const _stIsFull = currentBias === 'quality-first';
+  const _stMark   = (active) => active ? ' ← current' : '';
+
+  // Provider status dots
+  const _stAuth       = await detectAuth();
+  const _stGDOT       = '\x1b[32m●\x1b[0m';
+  const _stRDOT       = '\x1b[31m●\x1b[0m';
+  const _stClDot      = _stAuth.claude.found ? _stGDOT : _stRDOT;
+  const _stOaDot      = _stAuth.openai.found ? _stGDOT : _stRDOT;
+  const _stClStatus   = _stAuth.claude.found ? 'connected' : 'not connected';
+  const _stOaStatus   = _stAuth.openai.found ? 'connected' : 'not connected';
+
+  // Calibration from project.json
+  let _stCal       = { specificity: 3, corrections: 3, autonomy: 3 };
+  let _stLevel     = 'intermediate';
+  let _stStyle     = 'normal';
+  try {
+    const _stLd  = await import('../src/living-docs.mjs');
+    const _stCm  = await import('../src/calibration.mjs');
+    const _stPs  = _stLd.getProjectState(cwd);
+    if (_stPs?.project?.userCalibration) _stCal = _stPs.project.userCalibration;
+    const _stAd  = _stCm.getAdaptation(_stCal);
+    _stLevel = _stAd.userLevel;
+    _stStyle = _stAd.responseStyle;
+  } catch { /* non-fatal */ }
+
+  const _stS = typeof _stCal.specificity === 'number' ? _stCal.specificity.toFixed(1) : String(_stCal.specificity ?? 3);
+  const _stC = typeof _stCal.corrections === 'number' ? _stCal.corrections.toFixed(1) : String(_stCal.corrections ?? 3);
+  const _stA = typeof _stCal.autonomy    === 'number' ? _stCal.autonomy.toFixed(1)    : String(_stCal.autonomy    ?? 3);
 
   const lines = [
     top,
     row('Settings'),
     sep,
-    row(`[w] Work Style: ${workStyleLabel}`),
-    row('[m] Manage subscriptions'),
-    row('[e] Manage sessions'),
-    row('[i] Import from replit-tools'),
-    row('[d] Switch to data-tools'),
-    row('[?] Help & shortcuts'),
-    row('[x] Diagnostics'),
+    row('Work Style'),
+    row(`  [1] Fast — speed over caution${_stMark(_stIsFast)}`),
+    row(`  [2] Balanced — smart routing, reviews on important${_stMark(_stIsBal)}`),
+    row(`  [3] Full Power — dual-brain everything, max quality${_stMark(_stIsFull)}`),
+    sep,
+    row('Providers'),
+    row(`  Claude: ${_stClDot} ${_stClStatus}`),
+    row(`  OpenAI: ${_stOaDot} ${_stOaStatus}`),
+    sep,
+    row('User Calibration'),
+    row(`  Specificity: ${_stS}  Corrections: ${_stC}  Autonomy: ${_stA}`),
+    row(`  Level: ${_stLevel} · Style: ${_stStyle}`),
+    sep,
+    row('[1-3] change style  [r] reset calibration  [b] back'),
+    row('[m] subscriptions  [e] sessions  [x] diagnostics'),
     ...(settingsPRs.length > 0 ? [row(`[p] PR triage (${settingsPRs.length} open)`)] : []),
-    row(''),
-    row('[Esc/b] Back to dashboard'),
     bot,
   ];
   process.stdout.write('\n' + lines.join('\n') + '\n\n');
@@ -2584,45 +2658,10 @@ async function settingsScreen(rl, ask) {
   const raw    = (await ask('  Choice: ')).trim();
   const choice = raw.toLowerCase();
 
-  if (choice === 'w') {
-    // Work style picker
-    const wsTop = `  ┌${'─'.repeat(51)}┐`;
-    const wsSep = `  ├${'─'.repeat(51)}┤`;
-    const wsBot = `  └${'─'.repeat(51)}┘`;
-    const wsPad = (s) => {
-      const plain = s.replace(/\x1b\[[0-9;]*m/g, '');
-      let vlen = 0;
-      for (const ch of plain) {
-        const cp = ch.codePointAt(0);
-        if (
-          (cp >= 0x1f300 && cp <= 0x1faff) ||
-          (cp >= 0x2600  && cp <= 0x27bf)  ||
-          cp === 0xfe0f || cp === 0x20e3
-        ) { vlen += 2; } else { vlen += 1; }
-      }
-      return s + ' '.repeat(Math.max(0, 51 - vlen));
-    };
-    const wsRow = (s) => `  │ ${wsPad(s)}│`;
-
-    const isFast  = currentBias === 'cost-saver' || currentBias === 'auto' || currentBias === 'solo-claude' || currentBias === 'solo-openai';
-    const isBal   = currentBias === 'balanced';
-    const isFull  = currentBias === 'quality-first';
-
-    console.log('');
-    console.log(wsTop);
-    console.log(wsRow('Work Style'));
-    console.log(wsSep);
-    console.log(wsRow(`  1. ⚡ Fast      — quick, single model${isFast  ? '  ← current' : ''}`));
-    console.log(wsRow(`  2. ⚖️  Balanced  — smart routing${isBal   ? '  ← current' : ''}`));
-    console.log(wsRow(`  3. 🔥 Full Power — dual-brain everything${isFull  ? '  ← current' : ''}`));
-    console.log(wsSep);
-    console.log(wsRow('[Enter] Keep current'));
-    console.log(wsBot);
-    console.log('');
-
-    const wsChoice = (await ask('  Choice [1/2/3/Enter]: ')).trim();
-    const wsMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
-    const newBias = wsMap[wsChoice];
+  // Direct work style keys 1/2/3
+  if (choice === '1' || choice === '2' || choice === '3') {
+    const _stWsMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
+    const newBias  = _stWsMap[choice];
     if (newBias && newBias !== currentBias) {
       profile.bias = newBias;
       const enabledCount = [
@@ -2632,9 +2671,20 @@ async function settingsScreen(rl, ask) {
       if (enabledCount >= 2) profile.mode = newBias;
       saveProfile(profile, { cwd });
       const newLabel = WORK_STYLE_DISPLAY[newBias] || newBias;
-      console.log(`\n  ✓ Work style set to ${newLabel}\n`);
+      process.stdout.write(`\n  Work style set to ${newLabel}\n\n`);
       await ask('  Press Enter to continue...');
     }
+    return { next: 'settings' };
+  }
+
+  // Reset calibration to defaults
+  if (choice === 'r') {
+    try {
+      const _stLdReset = await import('../src/living-docs.mjs');
+      _stLdReset.updateProject({ userCalibration: { specificity: 3, corrections: 3, autonomy: 3 } }, cwd);
+      process.stdout.write('\n  Calibration reset to defaults.\n\n');
+      await ask('  Press Enter to continue...');
+    } catch { /* non-fatal */ }
     return { next: 'settings' };
   }
 
@@ -2656,7 +2706,7 @@ async function settingsScreen(rl, ask) {
     if (which.status === 0) {
       spawnSync('claude-menu', { stdio: 'inherit' });
     } else {
-      process.stdout.write('\n  data-tools not found — install with: npm i -g replit-tools\n\n');
+      process.stdout.write('\n  replit-tools not found — install with: npm i -g replit-tools\n\n');
       await ask('  Press Enter to continue...');
     }
     return { next: 'settings' };
@@ -2686,6 +2736,105 @@ async function settingsScreen(rl, ask) {
   if (choice === 'x') { return { next: 'diagnostics' }; }
 
   if (choice === 'b' || choice === 'back' || raw === '\x1b') { return { next: 'main' }; }
+
+  return { next: 'main' };
+}
+
+// ─── Screen: teamScreen ───────────────────────────────────────────────────────
+
+async function teamScreen(rl, ask) {
+  const cwd = process.cwd();
+
+  // Box layout matching dashboard
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 60);
+  const W     = boxW - 4;
+
+  const top = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot = `└${'─'.repeat(boxW - 2)}┘`;
+  const row = (content) => makeBoxRow(content, W);
+
+  // Load team from project.json
+  let team = [];
+  let sharedSessions = 0;
+  let teamDecisions = 0;
+  try {
+    const _tmLd = await import('../src/living-docs.mjs');
+    const _tmPs = _tmLd.getProjectState(cwd);
+    if (Array.isArray(_tmPs?.project?.team)) {
+      team = _tmPs.project.team;
+    }
+    // Count decisions with more than one participant as team decisions
+    if (Array.isArray(_tmPs?.recentDecisions)) {
+      teamDecisions = _tmPs.recentDecisions.filter(
+        d => Array.isArray(d?.participants) && d.participants.length > 1
+      ).length;
+    }
+  } catch { /* non-fatal */ }
+
+  // Fall back to git user if no team configured
+  let ownerName = '(you)';
+  if (team.length === 0) {
+    try {
+      const { execSync: _tmExec } = await import('node:child_process');
+      const gitUser = _tmExec('git config user.name 2>/dev/null', {
+        encoding: 'utf8', timeout: 2000, stdio: 'pipe',
+      }).trim();
+      if (gitUser) ownerName = gitUser;
+    } catch { /* non-fatal */ }
+  }
+
+  const memberRows = [];
+  if (team.length === 0) {
+    memberRows.push(row(`  ${ownerName} (owner)`));
+  } else {
+    for (const member of team) {
+      const role = member.role || 'member';
+      memberRows.push(row(`  ${member.name} (${role})`));
+    }
+  }
+
+  const lines = [
+    top,
+    row('Team'),
+    sep,
+    row('Members'),
+    ...memberRows,
+    sep,
+    row(`Shared Sessions: ${sharedSessions}`),
+    row(`Team decisions: ${teamDecisions}`),
+    sep,
+    row('[a] add member  [b] back'),
+    bot,
+  ];
+  process.stdout.write('\n' + lines.join('\n') + '\n\n');
+
+  const raw    = (await ask('  Choice: ')).trim();
+  const choice = raw.toLowerCase();
+
+  if (choice === 'a') {
+    const name = (await ask('  Member name: ')).trim();
+    if (name) {
+      try {
+        const _tmLdAdd = await import('../src/living-docs.mjs');
+        const _tmCur   = _tmLdAdd.getProjectState(cwd);
+        const _tmTeam  = Array.isArray(_tmCur?.project?.team) ? [..._tmCur.project.team] : [];
+        _tmTeam.push({ name, role: 'member', addedAt: new Date().toISOString() });
+        _tmLdAdd.updateProject({ team: _tmTeam }, cwd);
+        process.stdout.write(`\n  Added ${name} to team.\n\n`);
+        await ask('  Press Enter to continue...');
+      } catch {
+        process.stdout.write('\n  Could not save team member.\n\n');
+        await ask('  Press Enter to continue...');
+      }
+    }
+    return { next: 'team' };
+  }
+
+  if (choice === 'b' || choice === 'back' || choice === 'q' || raw === '\x1b') {
+    return { next: 'main' };
+  }
 
   return { next: 'main' };
 }
@@ -4027,6 +4176,7 @@ const SCREENS = {
   main:             mainScreen,
   'new-session':    newSessionScreen,
   settings:         settingsScreen,
+  team:             teamScreen,
   'import-picker':  importPickerScreen,
   'pr-triage':      prTriageScreen,
   subscriptions:    subscriptionsScreen,
