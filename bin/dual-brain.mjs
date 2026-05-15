@@ -683,16 +683,19 @@ function renderHeader(version, providerLines, dtVersion) {
   const sep    = `  ├${'─'.repeat(W)}┤`;
   const bottom = `  └${'─'.repeat(W)}┘`;
 
-  const title  = dtVersion ? `DATA Tools v${dtVersion}` : `DATA Tools`;
-  const subTitle = `🧠 Dual Brain v${version}`;
+  const title  = `🧠 Dual Brain v${version}`;
   const credit = `by Steve Moraco + dual-brain`;
+
+  const allProviderLines = [...providerLines];
+  if (dtVersion) {
+    allProviderLines.push(`📦 data-tools v${dtVersion} detected`);
+  }
 
   const lines = [top];
   lines.push(`  │ ${pad(title)}│`);
-  lines.push(`  │ ${pad(subTitle)}│`);
   lines.push(`  │ ${pad(credit)}│`);
   lines.push(sep);
-  for (const pl of providerLines) {
+  for (const pl of allProviderLines) {
     lines.push(`  │ ${pad(pl)}│`);
   }
   lines.push(bottom);
@@ -1037,13 +1040,7 @@ async function mainScreen(rl, ask) {
 
   const rtMain = detectReplitTools(cwd);
   const dtVersion = (rtMain.installed && rtMain.version) ? rtMain.version : null;
-  if (dtVersion) {
-    console.log(`📦 DATA Tools v${dtVersion}`);
-    console.log(`🧠 Dual Brain v${version}`);
-  } else {
-    console.log(`📦 DATA Tools`);
-    console.log(`🧠 Dual Brain v${version}`);
-  }
+  console.log(`🧠 Dual Brain v${version}`);
   const latestVersion = await checkForUpdates(version);
   if (latestVersion) {
     console.log(`  ⬆️  Update available: v${version} → v${latestVersion}`);
@@ -1054,6 +1051,9 @@ async function mainScreen(rl, ask) {
   // Provider status (outside the box)
   for (const line of headerLines) {
     console.log(`  ${line}`);
+  }
+  if (dtVersion) {
+    console.log(`  📦 data-tools v${dtVersion} detected`);
   }
 
   const sparkline = buildSparkline(cwd);
