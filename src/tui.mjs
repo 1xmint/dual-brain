@@ -4,6 +4,8 @@
  */
 
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 // ─── Unicode / ASCII mode ─────────────────────────────────────────────────────
 
@@ -172,7 +174,14 @@ export function menu(options, opts = {}) {
 // ─── Self-test ────────────────────────────────────────────────────────────────
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  console.log(box('🧠 Dual-Brain v7.0.2', [
+  // Read version dynamically from package.json
+  let selfTestVersion = '0.0.0';
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    selfTestVersion = JSON.parse(readFileSync(pkgPath, 'utf8')).version;
+  } catch { /* fallback to 0.0.0 */ }
+
+  console.log(box(`🧠 Dual-Brain v${selfTestVersion}`, [
     '🟢 Claude ✅  🟢 OpenAI ✅',
     '🌀 Replit + replit-tools',
   ]));

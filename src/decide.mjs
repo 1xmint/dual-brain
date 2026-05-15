@@ -449,6 +449,35 @@ export function parsePreferences(preferences) {
   return signals;
 }
 
+// ─── Internal: safety floor for critical-risk tasks ───────────────────────────
+
+/**
+ * Ensure critical-risk tasks are never handled by the cheapest (haiku/gpt-4.1-mini) model.
+ * Cost-saver mode is the main culprit; escalate silently but emit a stderr warning.
+ * @param {string} model
+ * @param {string} provider
+ * @param {string[]} available
+ * @param {'low'|'medium'|'high'|'critical'} risk
+ * @returns {string}
+ */
+function applyCriticalRiskFloor(model, provider, available, risk) {
+  if (risk !== 'critical') return model;
+
+  const cheapModels = { claude: 'haiku', openai: 'gpt-4.1-mini' };
+  const floorModels = { claude: 'sonnet', openai: 'gpt-4.1' };
+
+  if (model === cheapModels[provider]) {
+    const floor = floorModels[provider];
+    const escalated = available.includes(floor) ? floor : available[available.length - 1] ?? model;
+    process.stderr.write(
+      `[dual-brain] Warning: cost-saver selected ${model} for a critical-risk task. ` +
+      `Escalating to ${escalated} (safety floor).\n`
+    );
+    return escalated;
+  }
+  return model;
+}
+
 // ─── Exported: decideRoute ────────────────────────────────────────────────────
 
 /**
@@ -507,6 +536,9 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
 
   // Apply profile mode bias (cost-saver / quality-first / preferences) using patched profile
   model = applyProfileBias(model, profileWithEffectiveBias, provider, available[provider]);
+
+  // Safety floor: critical-risk tasks must never use haiku/gpt-4.1-mini even in cost-saver mode
+  model = applyCriticalRiskFloor(model, provider, available[provider], detection.risk);
 
   // Apply preferModel signal from preferences (override after all other picks)
   if (prefSignals.preferModel) {

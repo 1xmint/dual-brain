@@ -23,6 +23,7 @@ import { spawnSync } from 'child_process';
 import { appendFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { redact } from '../../src/redact.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
@@ -232,7 +233,7 @@ export async function dualThink({ question, context, files, round, claudePerspec
     };
   }
 
-  const prompt = buildGptPrompt({ question, context, files, round: effectiveRound, claudePerspective });
+  const prompt = redact(buildGptPrompt({ question, context, files, round: effectiveRound, claudePerspective }));
   const raw = runGptAnalysis(codexBin, prompt);
 
   logUsage({ durationMs: raw.durationMs, usage: raw.usage, success: raw.success });

@@ -23,7 +23,7 @@
  */
 
 import { createInterface } from 'readline';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
 
@@ -348,7 +348,7 @@ function saveAuthKey(provider, key, opts = {}) {
   const cwd = opts.cwd || process.cwd();
   const authFile = AUTH_FILE(cwd);
   const dir = dirname(authFile);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const auth = loadAuthKeys(cwd);
   if (!Array.isArray(auth[provider])) auth[provider] = [];
@@ -370,6 +370,7 @@ function saveAuthKey(provider, key, opts = {}) {
   });
 
   writeFileSync(authFile, JSON.stringify(auth, null, 2));
+  chmodSync(authFile, 0o600);
 
   // Inject highest-priority valid key into process.env for this session
   const active = getActiveKey(provider, cwd);
@@ -388,13 +389,14 @@ function saveAuthKey(provider, key, opts = {}) {
 function removeAuthKey(provider, index, cwd) {
   const authFile = AUTH_FILE(cwd);
   const dir = dirname(authFile);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const auth = loadAuthKeys(cwd);
   if (!Array.isArray(auth[provider])) return;
 
   auth[provider].splice(index, 1);
   writeFileSync(authFile, JSON.stringify(auth, null, 2));
+  chmodSync(authFile, 0o600);
 }
 
 /**
@@ -406,13 +408,14 @@ function removeAuthKey(provider, index, cwd) {
 function disableKey(provider, index, cwd) {
   const authFile = AUTH_FILE(cwd);
   const dir = dirname(authFile);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const auth = loadAuthKeys(cwd);
   if (!Array.isArray(auth[provider]) || !auth[provider][index]) return;
 
   auth[provider][index].enabled = false;
   writeFileSync(authFile, JSON.stringify(auth, null, 2));
+  chmodSync(authFile, 0o600);
 }
 
 /**

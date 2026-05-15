@@ -122,9 +122,10 @@ export function clearSession(cwd = process.cwd()) {
  * @param {object|null} session — from loadSession()
  * @param {object}      repo    — from detectRepo() / loadRepoCache()
  * @param {object}      health  — from getHealth()  (shape: { states: {}, session: {} })
+ * @param {object}      [profile] — optional profile for enabled-state checks
  * @returns {string}
  */
-export function formatSessionCard(session, repo, health) {
+export function formatSessionCard(session, repo, health, profile) {
   const lines = [];
 
   // Line 1: Repo identity
@@ -157,8 +158,11 @@ export function formatSessionCard(session, repo, health) {
     lines.push(`Branch: ${repo.branch}${dirtyNote}`);
   }
 
-  // Line 4: Health summary
+  // Line 4: Health summary — only show enabled providers
   const { states = {} } = health || {};
+  const claudeProviderEnabled = profile?.providers?.claude?.enabled !== false;
+  const openaiProviderEnabled = profile?.providers?.openai?.enabled !== false;
+
   function providerStatus(name) {
     const entries = Object.entries(states).filter(([k]) => k.startsWith(`${name}:`));
     if (entries.length === 0) return 'healthy';
@@ -168,11 +172,21 @@ export function formatSessionCard(session, repo, health) {
     if (statuses.includes('probing'))  return 'probing';
     return 'healthy';
   }
-  const claudeStatus = providerStatus('claude');
-  const openaiStatus = providerStatus('openai');
-  const claudeLabel = claudeStatus === 'healthy' ? 'Claude healthy' : `Claude ${claudeStatus}`;
-  const openaiLabel = openaiStatus === 'healthy' ? 'OpenAI healthy' : `OpenAI ${openaiStatus}`;
-  lines.push(`Health: ${claudeLabel}, ${openaiLabel}`);
+
+  const healthParts = [];
+  if (claudeProviderEnabled) {
+    const claudeStatus = providerStatus('claude');
+    healthParts.push(claudeStatus === 'healthy' ? 'Claude healthy' : `Claude ${claudeStatus}`);
+  } else {
+    healthParts.push('Claude disabled');
+  }
+  if (openaiProviderEnabled) {
+    const openaiStatus = providerStatus('openai');
+    healthParts.push(openaiStatus === 'healthy' ? 'OpenAI healthy' : `OpenAI ${openaiStatus}`);
+  } else {
+    healthParts.push('OpenAI disabled');
+  }
+  lines.push(`Health: ${healthParts.join(', ')}`);
 
   // Line 5: Last task summary (only if session exists)
   if (session) {
@@ -193,6 +207,9 @@ export function formatSessionCard(session, repo, health) {
       lines.push(`Last: ${parts.join(', ')}`);
     }
   }
+
+  // Tip line: always show a call-to-action so non-TTY output is actionable
+  lines.push(`Tip: run "dual-brain --help" or "dual-brain go \\"task\\""`);
 
   return lines.join('\n');
 }

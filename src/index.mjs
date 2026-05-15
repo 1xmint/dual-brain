@@ -8,7 +8,7 @@
 
 export { loadProfile, saveProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel, detectAuth, detectEnvironment, setupAuth, getActiveKey, removeAuthKey, disableKey, rotateToNextKey } from './profile.mjs';
 export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths } from './detect.mjs';
-export { decideRoute, getModelCapabilities, getAvailableModels, estimateBudgetPressure, shouldDualBrain, explainDecision } from './decide.mjs';
+export { decideRoute, getModelCapabilities, getAvailableModels, shouldDualBrain, explainDecision } from './decide.mjs';
 export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain } from './dispatch.mjs';
 export { loadPlaybook, listPlaybooks, executePlaybook, createRunArtifact } from './playbook.mjs';
 export { getHealth, markHot, markDegraded, markHealthy, checkCooldown, getProviderScore, recordDispatch, getSessionStats, resetHealth, remainingCooldownMinutes } from './health.mjs';

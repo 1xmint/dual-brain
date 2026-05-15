@@ -283,7 +283,7 @@ async function handleRequest(msg) {
   } catch (err) {
     const code = err.code ?? -32000;
     const message = err.message ?? 'Internal error';
-    return errorResponse(id, code, message, err.stack);
+    return errorResponse(id, code, message);
   }
 }
 

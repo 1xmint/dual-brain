@@ -82,8 +82,9 @@ Options:
 /**
  * Print a compact auth status table to stdout.
  * @param {{ claude: object, openai: object }} auth  Result from detectAuth()
+ * @param {object} [profile]  Optional loaded profile to cross-check enabled state
  */
-function printAuthTable(auth) {
+function printAuthTable(auth, profile) {
   const W = 55; // inner width (wide enough for source labels)
   const hbar = '═'.repeat(W);
   const pad = (s) => {
@@ -91,15 +92,21 @@ function printAuthTable(auth) {
     return s + ' '.repeat(Math.max(0, W - visible.length));
   };
 
+  const claudeDisabled = profile?.providers?.claude?.enabled === false;
+  const openaiDisabled = profile?.providers?.openai?.enabled === false;
+
+  const claudeDisabledNote = claudeDisabled ? ' (auth ok, but disabled in profile)' : '';
+  const openaiDisabledNote = openaiDisabled ? ' (auth ok, but disabled in profile)' : '';
+
   const claudeLine1 = auth.claude.found
-    ? `  Claude:  ✓ found via ${auth.claude.source}`
+    ? `  Claude:  ✓ found via ${auth.claude.source}${claudeDisabledNote}`
     : `  Claude:  ✗ not found`;
   const claudeLine2 = auth.claude.found
     ? `           ${auth.claude.masked}`
     : `           run: dual-brain auth setup`;
 
   const openaiLine1 = auth.openai.found
-    ? `  OpenAI:  ✓ found via ${auth.openai.source}`
+    ? `  OpenAI:  ✓ found via ${auth.openai.source}${openaiDisabledNote}`
     : `  OpenAI:  ✗ not found`;
   const openaiLine2 = auth.openai.found
     ? `           ${auth.openai.masked}`
@@ -122,7 +129,7 @@ async function cmdInit(rl) {
 
   // --- Step 1: Auth preflight ---
   const auth = await detectAuth();
-  printAuthTable(auth);
+  printAuthTable(auth, loadProfile(cwd));
 
   const noneFound = !auth.claude.found && !auth.openai.found;
   if (noneFound) {
@@ -166,7 +173,8 @@ async function cmdAuth(subArgs = [], rl) {
   }
 
   const auth = await detectAuth();
-  printAuthTable(auth);
+  const profile = loadProfile(process.cwd());
+  printAuthTable(auth, profile);
 
   // If anything is missing, point to setup command
   if (!auth.claude.found || !auth.openai.found) {
@@ -339,10 +347,20 @@ async function cmdStatus(args = []) {
   const totalTokens = Object.values(sessionStats).reduce((s, v) => s + v.tokens, 0);
   console.log(`\nSession: ${totalCalls} dispatch${totalCalls !== 1 ? 'es' : ''}, ${totalTokens} tokens observed`);
 
-  // Models
+  // Models — only list enabled providers
   console.log('\nAvailable models:');
-  if (available.claude.length) console.log(`  Claude : ${available.claude.join(', ')}`);
-  if (available.openai.length) console.log(`  OpenAI : ${available.openai.join(', ')}`);
+  const claudeEnabled = profile?.providers?.claude?.enabled !== false;
+  const openaiEnabled = profile?.providers?.openai?.enabled !== false;
+  if (claudeEnabled && available.claude.length) {
+    console.log(`  Claude : ${available.claude.join(', ')}`);
+  } else if (!claudeEnabled) {
+    console.log(`  Claude : (disabled — run "dual-brain init" to enable)`);
+  }
+  if (openaiEnabled && available.openai.length) {
+    console.log(`  OpenAI : ${available.openai.join(', ')}`);
+  } else if (!openaiEnabled) {
+    console.log(`  OpenAI : (disabled — run "dual-brain init" to enable)`);
+  }
 
   // Head model
   console.log(`\nHead model : ${getHeadModel(profile)}`);
@@ -680,8 +698,15 @@ async function dashboardScreen(rl, ask) {
   const env = detectEnvironment();
 
   // Build status lines for box
-  const claudeStatus = auth.claude.found ? `🟢 Claude ${badge('connected')}` : `🔴 Claude ${badge('missing')}`;
-  const openaiStatus = auth.openai.found ? `🟢 OpenAI ${badge('connected')}` : `🔴 OpenAI ${badge('missing')}`;
+  // If auth is found but provider is disabled in profile, show warning instead of green
+  const claudeProviderEnabled = profile?.providers?.claude?.enabled !== false;
+  const openaiProviderEnabled = profile?.providers?.openai?.enabled !== false;
+  const claudeStatus = auth.claude.found
+    ? (claudeProviderEnabled ? `🟢 Claude ${badge('connected')}` : `⚠️  Claude ${badge('warning')} disabled`)
+    : `🔴 Claude ${badge('missing')}`;
+  const openaiStatus = auth.openai.found
+    ? (openaiProviderEnabled ? `🟢 OpenAI ${badge('connected')}` : `⚠️  OpenAI ${badge('warning')} disabled`)
+    : `🔴 OpenAI ${badge('missing')}`;
   const envLabel = env.hasReplitTools ? 'Replit + replit-tools' : env.isReplit ? 'Replit' : 'local';
 
   // Enforcement check
