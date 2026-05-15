@@ -1498,10 +1498,19 @@ function buildProviderStatusLine(profile, auth) {
     'solo-claude':   '⚡ Fast',
     'solo-openai':   '⚡ Fast',
   };
+  const WORK_STYLE_TIPS = {
+    'auto':          'adapts routing based on task risk',
+    'cost-saver':    'cheaper models, skips GPT for non-critical',
+    'balanced':      'smart routing, reviews on important changes',
+    'quality-first': 'dual-brain for medium+ risk, stricter reviews',
+    'solo-claude':   'Claude only, no GPT dispatch',
+    'solo-openai':   'OpenAI only, no Claude dispatch',
+  };
   const bias  = profile?.bias || profile?.mode || 'balanced';
   const label = WORK_STYLE_LABELS[bias] || '⚖️  Balanced';
+  const tip   = WORK_STYLE_TIPS[bias]   || 'smart routing, reviews on important changes';
 
-  return `${claudeDot} Claude  ${openaiDot} OpenAI  ${label}`;
+  return `${claudeDot} Claude  ${openaiDot} OpenAI  ${label}[2m — ${tip}[0m`;
 }
 
 /**
@@ -1509,7 +1518,11 @@ function buildProviderStatusLine(profile, auth) {
  * Returns a string like: "│ content padded to W │"
  */
 function makeBoxRow(content, W) {
-  const plain = content.replace(/\x1b\[[0-9;]*m/g, '');
+  // Strip ANSI codes, then strip zero-width variation selectors (U+FE0F etc.)
+  // so that emoji like ⚖️ (U+2696+U+FE0F) don't inflate the measured length.
+  const plain = content
+    .replace(/\x1b\[[0-9;]*m/g, '')  // ANSI color codes
+    .replace(/[\uFE00-\uFE0F]/g, ''); // variation selectors (zero-width)
   const padding = Math.max(0, W - plain.length);
   return `│ ${content}${' '.repeat(padding)} │`;
 }
@@ -1793,32 +1806,39 @@ async function mainScreen(rl, ask) {
         badgeVisible.push('[stale]'.length);
       }
       const msgCount    = sess.messageCount ?? sess.promptCount ?? 0;
-      const msgBadge    = `\x1b[2m(${msgCount})\x1b[0m`;
-      const msgBadgeW   = `(${msgCount})`.length;
+      // Human-readable: "4 tasks" instead of "(4)"
+      const taskLabel   = msgCount === 1 ? '1 task' : `${msgCount} tasks`;
+      const taskBadge   = `\x1b[2m${taskLabel}\x1b[0m`;
+      const taskBadgeW  = taskLabel.length;
 
       const badgeStr = badges.join('');
       const badgesW  = badgeVisible.reduce((s, n) => s + n, 0);
 
-      // Layout: "{num}  {name...}{badges}  {age}  {msg}"
+      // Layout: "{num}  {name...}{badges}  {age}  {tasks}"
+      // Use basename for name — strip full paths for readability
+      const displayName = rawName.startsWith('/')
+        ? rawName.split('/').filter(Boolean).pop() || rawName
+        : rawName;
+
       const numStr  = String(i + 1);
       const ageStr  = sess.age || '';
-      // Available for name: W minus fixed chrome, badge widths, and msg badge
-      const nameMax = W - numStr.length - 2 - badgesW - 2 - ageStr.length - 2 - msgBadgeW;
-      const truncName = rawName.length > nameMax
-        ? rawName.slice(0, Math.max(0, nameMax - 3)) + '...'
-        : rawName.padEnd(nameMax);
-      const content = `${numStr}  ${truncName}${badgeStr}  ${ageStr}  ${msgBadge}`;
+      // Available for name: W minus fixed chrome, badge widths, and task badge
+      const nameMax = W - numStr.length - 2 - badgesW - 2 - ageStr.length - 2 - taskBadgeW;
+      const truncName = displayName.length > nameMax
+        ? displayName.slice(0, Math.max(0, nameMax - 3)) + '...'
+        : displayName.padEnd(nameMax);
+      const content = `${numStr}  ${truncName}${badgeStr}  ${ageStr}  ${taskBadge}`;
       sessionRows.push(row(content));
     });
   }
 
-  // ── Actions bar ───────────────────────────────────────────────────────────
-  const actionsBase    = '↵ Resume  n New  / Search  i Import  s Settings  q Quit';
-  const actionsContent = openPRs.length > 0 ? `${actionsBase}  p PRs` : actionsBase;
+  // ── Actions bar — four product verbs first, then navigation ────────────────
+  const actionsContent = 'd Do  p Plan  r Review  s Ship  │  n New  / Search  q Quit';
   const actionsRow     = row(actionsContent);
 
   // ── Print the full box ────────────────────────────────────────────────────
   // Include action cards between status and sessions (with separators only when non-empty)
+  const poweredByRow = row('\x1b[2mPowered by data-tools · Steve Moraco\x1b[0m');
   const lines = [
     top,
     ...statusRows,
@@ -1827,6 +1847,8 @@ async function mainScreen(rl, ask) {
     ...sessionRows,
     sep,
     actionsRow,
+    sep,
+    poweredByRow,
     bot,
   ];
   // ── Stale session hint ──────────────────────────────────────────────────
@@ -1834,8 +1856,7 @@ async function mainScreen(rl, ask) {
     process.stdout.write(`\x1b[2m${staleCount} stale sessions (>7d) — press s → archive to clean up\x1b[0m\n`);
   }
 
-  process.stdout.write(lines.join('\n') + '\n');
-  process.stdout.write(`\x1b[2mPowered by data-tools · Steve Moraco\x1b[0m\n\n`);
+  process.stdout.write(lines.join('\n') + '\n\n');
 
   // ── Key handling ──────────────────────────────────────────────────────────
   // Use raw keypress mode so we can show a live type-to-start buffer.
@@ -1922,8 +1943,7 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        const singleKeySet = new Set(['n', 's', 'q', '/', 'i']);
-        if (lower === 'p' && openPRs.length > 0) singleKeySet.add('p');
+        const singleKeySet = new Set(['n', 's', 'q', '/', 'i', 'd', 'p', 'r']);
         if (singleKeySet.has(lower)) {
           cleanup();
           process.stdout.write('\n');
@@ -1992,6 +2012,37 @@ async function mainScreen(rl, ask) {
 
   if (choice === 'n') { return { next: 'new-session' }; }
 
+  // Four product verbs
+  if (choice === 'd') {
+    // "Do" — prompt user for a task description, then dispatch
+    const prompt = (await ask('  What do you want to do? ')).trim();
+    if (!prompt) return { next: 'main' };
+    return { next: 'go', prompt };
+  }
+
+  if (choice === 'p') {
+    // "Plan" — dry-run routing for a task
+    const prompt = (await ask('  Describe the task to plan: ')).trim();
+    if (!prompt) return { next: 'main' };
+    return { next: 'go', prompt, dryRun: true };
+  }
+
+  if (choice === 'r') {
+    // "Review" — dual-brain review current diff
+    const { spawnSync } = await import('node:child_process');
+    process.stdout.write('\n  Running dual-brain review...\n\n');
+    spawnSync('node', ['.claude/hooks/dual-brain-review.mjs'], { stdio: 'inherit', cwd });
+    return { next: 'main' };
+  }
+
+  if (choice === 's') {
+    // "Ship" — run quality gate then prompt for commit/PR
+    const { spawnSync } = await import('node:child_process');
+    process.stdout.write('\n  Running quality gate + ship flow...\n\n');
+    spawnSync('node', ['.claude/hooks/quality-gate.mjs'], { stdio: 'inherit', cwd });
+    return { next: 'main' };
+  }
+
   if (choice === '/') {
     const query = (await ask('  Search: ')).trim();
     if (!query) return { next: 'main' };
@@ -2028,9 +2079,7 @@ async function mainScreen(rl, ask) {
     return { next: 'main' };
   }
 
-  if (choice === 's') { return { next: 'settings' }; }
   if (choice === 'i') { return { next: 'import-picker' }; }
-  if (choice === 'p' && openPRs.length > 0) { return { next: 'pr-triage', openPRs }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
   return { next: 'main' };
