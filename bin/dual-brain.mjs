@@ -1241,13 +1241,7 @@ function detectInterruptedWork(sessions, cwd) {
   };
 }
 
-// ─── Budget sparkline helpers ─────────────────────────────────────────────────
-
-/** Token quotas per plan (5-hour window aggregate). Mirrors src/decide.mjs SUB_QUOTAS. */
-const _SPARKLINE_QUOTAS = {
-  claude: { '$20': 402_500, '$100': 1_638_000, '$200': 4_120_000 },
-  openai: { '$20': 400_000, '$100': 1_050_000, '$200': 1_900_000 },
-};
+// ─── Provider status helpers ───────────────────────────────────────────────────
 
 const _PLAN_PRICE_MAP = {
   pro: '$20', max5: '$100', max20: '$200',
@@ -1255,93 +1249,14 @@ const _PLAN_PRICE_MAP = {
 };
 
 /**
- * Read 5-hour usage entries from .dualbrain/usage/ logs.
- * @param {string} cwd
- * @returns {Array<object>}
- */
-function _readFiveHrUsage(cwd) {
-  const FIVE_HRS_MS = 5 * 60 * 60 * 1000;
-  const now    = Date.now();
-  const cutoff = now - FIVE_HRS_MS;
-  const usageDir = join(cwd, '.dualbrain', 'usage');
-  const entries = [];
-  for (let i = 0; i <= 1; i++) {
-    const date = new Date(now - i * 86_400_000).toISOString().slice(0, 10);
-    const file = join(usageDir, `usage-${date}.jsonl`);
-    if (!existsSync(file)) continue;
-    let raw;
-    try { raw = readFileSync(file, 'utf8'); } catch { continue; }
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue;
-      let rec;
-      try { rec = JSON.parse(line); } catch { continue; }
-      const ts = Date.parse(rec.timestamp);
-      if (!isNaN(ts) && ts >= cutoff) entries.push(rec);
-    }
-  }
-  return entries;
-}
-
-/**
- * Build a 5-char sparkline bar: \u2593\u2593\u2593\u2591\u2591 where \u2593 = used quota.
- * @param {number} used  tokens used
- * @param {number} quota total token quota
- * @returns {string}
- */
-function _sparkBar(used, quota) {
-  if (!quota || quota <= 0) return '\u2591\u2591\u2591\u2591\u2591';
-  const filled = Math.min(5, Math.round((used / quota) * 5));
-  return '\u2593'.repeat(filled) + '\u2591'.repeat(5 - filled);
-}
-
-/**
- * Return per-sub usage bar strings for a provider.
- * @param {string} provKey  'claude' | 'openai'
- * @param {object} profile
- * @param {Array<object>} fiveHrEntries
- * @returns {string}  e.g. "$100 \u2593\u2593\u2591\u2591\u2591  $100 \u2593\u2591\u2591\u2591\u2591"
- */
-function _buildSubBars(provKey, profile, fiveHrEntries) {
-  const providerCfg = profile?.providers?.[provKey];
-  if (!providerCfg) return '';
-
-  const rawSubs = providerCfg.subs?.length
-    ? providerCfg.subs
-    : providerCfg.plan
-      ? [{ plan: providerCfg.plan }]
-      : [];
-  if (rawSubs.length === 0) return '';
-
-  let totalUsed = 0;
-  for (const e of fiveHrEntries) {
-    if (e.provider !== provKey) continue;
-    const inp = e.input_tokens ?? 0;
-    const out = e.output_tokens ?? 0;
-    totalUsed += inp + out > 0 ? inp + out : 8_000;
-  }
-  const perSub = rawSubs.length > 1 ? Math.round(totalUsed / rawSubs.length) : totalUsed;
-
-  return rawSubs.map(s => {
-    const planKey   = _PLAN_PRICE_MAP[s.plan] || s.plan || '$100';
-    const quota     = _SPARKLINE_QUOTAS[provKey]?.[planKey] ?? 1_000_000;
-    const sparkline = _sparkBar(perSub, quota);
-    return `${planKey} ${sparkline}`;
-  }).join('  ');
-}
-
-/**
  * Build a provider status string for the dashboard status line.
- * Shows per-sub usage sparkline bars: "\u25cf Claude $100 \u2593\u2593\u2591\u2591\u2591  \u25cf OpenAI $100 \u2593\u2591\u2591\u2591\u2591"
+ * Shows: "● Claude $100  ● OpenAI $100"
  * Uses ANSI color codes for the dots (no emoji width issues).
  */
 function buildProviderStatusLine(profile, auth) {
-  const GREEN = '\x1b[32m\u25cf\x1b[0m';
-  const RED   = '\x1b[31m\u25cf\x1b[0m';
+  const GREEN = '[32m●[0m';
+  const RED   = '[31m●[0m';
   const now   = Date.now();
-  const cwd   = process.cwd();
-
-  let fiveHrEntries = [];
-  try { fiveHrEntries = _readFiveHrUsage(cwd); } catch {}
 
   function providerSegment(provKey, displayName) {
     const sub    = profile?.providers?.[provKey];
@@ -1351,11 +1266,18 @@ function buildProviderStatusLine(profile, auth) {
     const expired = sub?.expiresAt && Date.parse(sub.expiresAt) < now;
     if (expired)  return `${RED} ${displayName}: expired`;
 
-    const dot  = GREEN;
-    const bars = _buildSubBars(provKey, profile, fiveHrEntries);
-    return bars
-      ? `${dot} ${displayName} ${bars}`
-      : `${dot} ${displayName}: connected`;
+    const rawSubs = sub?.subs?.length
+      ? sub.subs
+      : sub?.plan
+        ? [{ plan: sub.plan }]
+        : [];
+    const planLabel = rawSubs.length > 0
+      ? rawSubs.map(s => _PLAN_PRICE_MAP[s.plan] || s.plan || '$100').join(' + ')
+      : null;
+
+    return planLabel
+      ? `${GREEN} ${displayName} ${planLabel}`
+      : `${GREEN} ${displayName}: connected`;
   }
 
   const parts = [];

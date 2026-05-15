@@ -3,7 +3,7 @@
 import { classifyRisk, extractPaths } from './risk-classifier.mjs';
 import { resolveDependencies } from './plan-generator.mjs';
 import { dispatchGptTask } from './gpt-work-dispatcher.mjs';
-import { getProviderStatus, chooseProvider, estimateWaveCost, estimateTokensForTask } from './budget-balancer.mjs';
+import { getProviderStatus, chooseProvider, estimateTokensForTask } from './budget-balancer.mjs';
 import { recordDecision, recordOutcome } from './decision-ledger.mjs';
 import { classifyTask, selectModelEffort } from './task-classifier.mjs';
 import { getCapabilities, getDispatchConfig, recommendEffort } from './model-registry.mjs';
@@ -507,11 +507,12 @@ function routeTasks(tasks) {
     // Use task-classifier for capability-aware model+effort selection
     const profile = classifyTask(task.description, { files });
     const estimatedTokens = estimateTokensForTask({ tier, effort: profile.effort, fileCount: files.length });
+    // Derive rough pressure from session call imbalance (0=balanced, 1=all one provider)
+    const totalSessionCalls = (status.claude?.calls?.total ?? 0) + (status.openai?.calls?.total ?? 0);
+    const claudeShare = totalSessionCalls > 0 ? (status.claude?.calls?.total ?? 0) / totalSessionCalls : 0.5;
+    const sessionImbalance = Math.abs(claudeShare - 0.5) * 2; // 0=balanced, 1=fully one-sided
     const selection = selectModelEffort(profile, {
-      budgetPressure: Math.max(
-        status.claude?.[tier]?.effectivePressure ?? 0,
-        status.openai?.[tier]?.effectivePressure ?? 0,
-      ) / 100,
+      budgetPressure: sessionImbalance * 0.5, // scale to [0, 0.5] — soft signal only
       estimatedTokens,
       isIterating: (task.retryCount || 0) > 0,
     });
@@ -1227,20 +1228,23 @@ async function orchestrate(utterance, opts = {}) {
     saveManifest(manifest);
     printDispatchTable(manifest);
 
-    // Pre-dispatch spend estimate
+    // Pre-dispatch token estimate (indicative only — no subscription quota math)
     const allTasks = manifest.waves.flatMap(w => w.tasks);
-    const costEstimate = estimateWaveCost(allTasks);
-    if (costEstimate.impact.claude || costEstimate.impact.openai) {
-      console.log('\n--- Pre-dispatch cost estimate ---');
-      for (const [prov, est] of Object.entries(costEstimate.impact)) {
-        const label = prov === 'claude' ? 'Claude' : 'OpenAI';
-        console.log(`  ${label}: ~${(est.estimatedTokens / 1000).toFixed(1)}K tokens (${est.pctOfBudget}% of 5hr budget, ${(est.remaining / 1000).toFixed(1)}K remaining)`);
-        if (est.wouldExceed) {
-          console.log(`  WARNING: Estimated usage EXCEEDS remaining ${label} budget!`);
-        }
+    const tokensByProvider = { claude: 0, openai: 0 };
+    for (const task of allTasks) {
+      const prov = task.provider || 'claude';
+      if (tokensByProvider[prov] !== undefined) {
+        tokensByProvider[prov] += estimateTokensForTask({ tier: task.tier, effort: task.effort, files: task.files });
       }
-      console.log('');
     }
+    console.log('\n--- Pre-dispatch token estimate ---');
+    for (const [prov, toks] of Object.entries(tokensByProvider)) {
+      if (toks > 0) {
+        const label = prov === 'claude' ? 'Claude' : 'OpenAI';
+        console.log(`  ${label}: ~${(toks / 1000).toFixed(1)}K tokens estimated`);
+      }
+    }
+    console.log('');
 
     if (opts.dryRun) {
       manifest.status = 'dry-run';
@@ -1251,7 +1255,6 @@ async function orchestrate(utterance, opts = {}) {
     // Auto-confirm in non-interactive mode (--yes flag or piped input)
     if (!opts.confirmed && !opts.yes) {
       manifest.status = 'awaiting-confirmation';
-      manifest.costEstimate = costEstimate;
       saveManifest(refreshCounts(manifest));
       console.log(`Dispatch plan ready. Execute with: node hooks/wave-orchestrator.mjs --resume ${manifest.manifestId}`);
       console.log('Or pass --yes to skip confirmation.');
@@ -1275,17 +1278,17 @@ async function orchestrate(utterance, opts = {}) {
       const wave = manifest.waves[i];
       if (wave.status === 'completed') continue;
 
-      // Per-wave spend check
-      const waveCost = estimateWaveCost(wave.tasks);
-      for (const [prov, est] of Object.entries(waveCost.impact)) {
-        if (est.wouldExceed) {
-          console.error(`[SPEND CAP] Wave ${wave.waveId} would exceed ${prov} budget (${(est.estimatedTokens / 1000).toFixed(1)}K estimated, ${(est.remaining / 1000).toFixed(1)}K remaining). Pausing.`);
-          manifest.status = 'paused';
-          manifest.pauseReason = `spend_cap:${prov}`;
-          saveManifest(refreshCounts(manifest));
-          console.error(`Resume with: node hooks/wave-orchestrator.mjs --resume ${manifest.manifestId}`);
-          return manifest;
+      // Per-wave token estimate (informational — no quota enforcement since quota is unknowable)
+      const waveTokens = { claude: 0, openai: 0 };
+      for (const task of wave.tasks) {
+        const prov = task.provider || 'claude';
+        if (waveTokens[prov] !== undefined) {
+          waveTokens[prov] += estimateTokensForTask({ tier: task.tier, effort: task.effort, files: task.files });
         }
+      }
+      const waveTotalK = Object.values(waveTokens).reduce((s, v) => s + v, 0) / 1000;
+      if (waveTotalK > 0) {
+        console.log(`[wave ${wave.waveId}] Estimated ~${waveTotalK.toFixed(1)}K tokens across providers`);
       }
 
       wave.checkpoint = gitCheckpoint(manifest, wave.waveId);

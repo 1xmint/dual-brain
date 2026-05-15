@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * budget-balancer.mjs — Core budget balancing module for the Dual-Brain Orchestrator.
+ * budget-balancer.mjs — Session-level provider balance tracker for the Dual-Brain Orchestrator.
  *
- * Tracks rolling usage pressure across Claude and OpenAI providers and recommends
- * which provider should handle incoming work.
+ * Tracks relative usage of Claude vs OpenAI within the current session (5-hour window)
+ * and recommends which provider to use next based on imbalance — not fake subscription math.
  *
  * Exported API:
- *   getProviderStatus()          → current pressure per provider/tier
+ *   getProviderStatus()          → session call counts and lean direction per provider/tier
  *   chooseProvider(taskProfile)  → recommended provider + model + rationale
  *   recordUsageEvent(event)      → append a usage event to today's log
  *
@@ -28,49 +28,12 @@ const ORCHESTRATOR_CONFIG = join(__dirname, "..", "orchestrator.json");
 // ---------------------------------------------------------------------------
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-
-/**
- * Subscription tier definitions with real token budgets.
- * Token limits are per-model-class per rolling window.
- * Sources: Anthropic pricing page, OpenAI subscription docs (May 2025).
- * These are best-effort estimates — providers adjust limits dynamically.
- */
-const SUBSCRIPTION_TIERS = {
-  claude: {
-    "$20":  { label: "Claude Pro $20",     fiveHr: { think: 22_000,  execute: 80_000,   search: 300_000 },   weekly: { think: 150_000,   execute: 600_000,   search: 2_000_000 } },
-    "$100": { label: "Claude Max x5",     fiveHr: { think: 88_000,  execute: 350_000,  search: 1_200_000 }, weekly: { think: 600_000,   execute: 2_500_000, search: 8_000_000 } },
-    "$200": { label: "Claude Max x20",    fiveHr: { think: 220_000, execute: 900_000,  search: 3_000_000 }, weekly: { think: 1_500_000, execute: 6_000_000, search: 20_000_000 } },
-  },
-  openai: {
-    "$20":  { label: "ChatGPT Plus $20",  fiveHr: { think: 20_000,  execute: 80_000,   search: 300_000 },   weekly: { think: 140_000,   execute: 560_000,   search: 2_000_000 } },
-    "$100": { label: "ChatGPT Pro $100", fiveHr: { think: 50_000,  execute: 200_000,  search: 800_000 },   weekly: { think: 350_000,   execute: 1_400_000, search: 5_000_000 } },
-    "$200": { label: "ChatGPT Pro $200", fiveHr: { think: 100_000, execute: 400_000,  search: 1_500_000 }, weekly: { think: 700_000,   execute: 2_800_000, search: 10_000_000 } },
-  },
-};
 
 /** Fallback tokens-per-call when usage log has no real token data for an entry */
 const TOKENS_PER_CALL_FALLBACK = {
   search:  2_500,
   execute: 8_000,
   think:  15_000,
-};
-
-function getSubscriptionBudgets(config) {
-  const claudePlan = config?.subscriptions?.claude?.plan || "$100";
-  const openaiPlan = config?.subscriptions?.openai?.plan || "$20";
-  const claudeTier = SUBSCRIPTION_TIERS.claude[claudePlan] || SUBSCRIPTION_TIERS.claude["$100"];
-  const openaiTier = SUBSCRIPTION_TIERS.openai[openaiPlan] || SUBSCRIPTION_TIERS.openai["$20"];
-  return {
-    claude: { fiveHr: claudeTier.fiveHr, weekly: claudeTier.weekly, label: claudeTier.label },
-    openai: { fiveHr: openaiTier.fiveHr, weekly: openaiTier.weekly, label: openaiTier.label },
-  };
-}
-
-const DEFAULT_THRESHOLDS = {
-  warm:      0.55,
-  hot:       0.75,
-  throttled: 0.90,
 };
 
 /** Default model mapping when orchestrator.json is missing provider config */
@@ -89,12 +52,6 @@ function loadConfig() {
   } catch {
     return {};
   }
-}
-
-function getThresholds(config, provider) {
-  return (
-    config?.providers?.[provider]?.pressure_thresholds || DEFAULT_THRESHOLDS
-  );
 }
 
 function getProviderModels(config, provider) {
@@ -212,30 +169,22 @@ function readEntriesInWindow(windowMs) {
   return entries;
 }
 
-function readRecentEntries() {
-  return readEntriesInWindow(FIVE_HOURS_MS);
-}
-
 // ---------------------------------------------------------------------------
-// Exported: getProviderStatus()
+// Session usage aggregation
 // ---------------------------------------------------------------------------
 
 /**
- * Sum actual tokens from usage entries for a provider/tier.
- * Uses real input_tokens + output_tokens when available, falls back to estimate.
+ * Count calls and tokens per provider/tier from usage entries.
+ * Returns raw counts only — no percentage math against unknowable quota.
  */
-function sumTokens(entries) {
-  const tokens = {
-    claude: { think: 0, execute: 0, search: 0 },
-    openai: { think: 0, execute: 0, search: 0 },
-  };
+function aggregateUsage(entries) {
   const calls = {
-    claude: { think: 0, execute: 0, search: 0 },
-    openai: { think: 0, execute: 0, search: 0 },
+    claude: { think: 0, execute: 0, search: 0, total: 0 },
+    openai: { think: 0, execute: 0, search: 0, total: 0 },
   };
-  const realTokenCalls = {
-    claude: { think: 0, execute: 0, search: 0 },
-    openai: { think: 0, execute: 0, search: 0 },
+  const tokens = {
+    claude: { think: 0, execute: 0, search: 0, total: 0 },
+    openai: { think: 0, execute: 0, search: 0, total: 0 },
   };
 
   for (const entry of entries) {
@@ -250,85 +199,61 @@ function sumTokens(entries) {
       }
     }
 
-    if (!provider || !tier || !tokens[provider] || tokens[provider][tier] === undefined) continue;
+    if (!provider || !calls[provider]) continue;
+    const t = (tier && calls[provider][tier] !== undefined) ? tier : null;
 
-    calls[provider][tier]++;
+    calls[provider].total++;
+    if (t) calls[provider][t]++;
 
     const inp = entry.input_tokens;
     const out = entry.output_tokens;
-    if (inp != null && out != null && (inp > 0 || out > 0)) {
-      tokens[provider][tier] += inp + out;
-      realTokenCalls[provider][tier]++;
-    } else {
-      tokens[provider][tier] += TOKENS_PER_CALL_FALLBACK[tier] || 8_000;
-    }
+    const tokCount = (inp != null && out != null && (inp > 0 || out > 0))
+      ? inp + out
+      : TOKENS_PER_CALL_FALLBACK[t] || 8_000;
+
+    tokens[provider].total += tokCount;
+    if (t) tokens[provider][t] += tokCount;
   }
 
-  return { tokens, calls, realTokenCalls };
+  return { calls, tokens };
 }
 
 /**
- * Compute rolling pressure for each provider/tier using actual token sums
- * against real subscription budgets. Returns both 5hr and weekly pressure.
+ * Determine lean direction: which provider has been used more this session.
+ * Returns "claude", "openai", or "balanced".
+ */
+function sessionLean(calls) {
+  const c = calls.claude.total;
+  const o = calls.openai.total;
+  const total = c + o;
+  if (total === 0) return "balanced";
+  const claudeShare = c / total;
+  if (claudeShare > 0.65) return "claude";
+  if (claudeShare < 0.35) return "openai";
+  return "balanced";
+}
+
+// ---------------------------------------------------------------------------
+// Exported: getProviderStatus()
+// ---------------------------------------------------------------------------
+
+/**
+ * Return session-level usage summary per provider/tier.
+ * No subscription quota math — just raw counts from the 5-hour window.
  *
- * @returns {object} Status keyed by provider → tier → { pressure, weeklyPressure, state, calls, tokens, budget, weeklyBudget }
+ * @returns {object} { claude: { calls, tokens, lean }, openai: { calls, tokens, lean }, sessionLean }
  */
 function getProviderStatus() {
-  const config = loadConfig();
-  const budgets = getSubscriptionBudgets(config);
+  const entries = readEntriesInWindow(FIVE_HOURS_MS);
+  const { calls, tokens } = aggregateUsage(entries);
+  const lean = sessionLean(calls);
 
-  const fiveHrEntries = readEntriesInWindow(FIVE_HOURS_MS);
-  const weeklyEntries = readEntriesInWindow(SEVEN_DAYS_MS);
-
-  const fiveHr = sumTokens(fiveHrEntries);
-  const weekly = sumTokens(weeklyEntries);
-
-  const status = {};
-
-  for (const provider of ["claude", "openai"]) {
-    const thresholds = getThresholds(config, provider);
-    status[provider] = {};
-
-    for (const tier of ["think", "execute", "search"]) {
-      const tokensUsed = fiveHr.tokens[provider][tier];
-      const budget = budgets[provider].fiveHr[tier];
-      const pressure = budget > 0 ? tokensUsed / budget : 0;
-
-      const weeklyTokens = weekly.tokens[provider][tier];
-      const weeklyBudget = budgets[provider].weekly[tier];
-      const weeklyPressure = weeklyBudget > 0 ? weeklyTokens / weeklyBudget : 0;
-
-      const effectivePressure = Math.max(pressure, weeklyPressure);
-
-      let state;
-      if (effectivePressure >= (thresholds.throttled ?? DEFAULT_THRESHOLDS.throttled)) {
-        state = "throttled";
-      } else if (effectivePressure >= (thresholds.hot ?? DEFAULT_THRESHOLDS.hot)) {
-        state = "hot";
-      } else if (effectivePressure >= (thresholds.warm ?? DEFAULT_THRESHOLDS.warm)) {
-        state = "warm";
-      } else {
-        state = "healthy";
-      }
-
-      status[provider][tier] = {
-        pressure,
-        weeklyPressure,
-        effectivePressure,
-        state,
-        calls: fiveHr.calls[provider][tier],
-        tokens: tokensUsed,
-        budget,
-        weeklyTokens,
-        weeklyBudget,
-        realTokenCalls: fiveHr.realTokenCalls[provider][tier],
-      };
-    }
-
-    status[provider]._label = budgets[provider].label;
-  }
-
-  return status;
+  return {
+    claude: { calls: calls.claude, tokens: tokens.claude },
+    openai: { calls: calls.openai, tokens: tokens.openai },
+    sessionLean: lean,
+    totalCalls: calls.claude.total + calls.openai.total,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +261,8 @@ function getProviderStatus() {
 // ---------------------------------------------------------------------------
 
 /**
- * Recommend a provider for an incoming task.
+ * Recommend a provider for an incoming task based on session imbalance,
+ * task characteristics, and profile bias.
  *
  * @param {object} taskProfile
  * @param {string} taskProfile.tier                  - search | execute | think
@@ -367,34 +293,39 @@ function chooseProvider(taskProfile = {}) {
     }
   } catch {}
 
-  const PRESSURE_PENALTY = {
-    healthy:   0,
-    warm:     15,
-    hot:      40,
-    throttled: 100,
-  };
+  const claudeCalls = status.claude.calls.total;
+  const openaiCalls = status.openai.calls.total;
+  const totalCalls  = claudeCalls + openaiCalls;
 
   const scores = {};
 
   for (const provider of ["claude", "openai"]) {
-    const tierStatus = status[provider]?.[tier] || { effectivePressure: 0, state: "healthy" };
-    const otherProvider = provider === "claude" ? "openai" : "claude";
-    const otherTierStatus = status[otherProvider]?.[tier] || { effectivePressure: 0, state: "healthy" };
-
     let score = 50;
 
+    // Context coupling: Claude handles tightly-coupled context better
     if (provider === "claude") {
       if (contextCoupling === "high")   score += 20;
       else if (contextCoupling === "medium") score += 10;
     } else {
+      // OpenAI better for isolated tasks
       if (isolation === "high")   score += 20;
       else if (isolation === "medium") score += 10;
     }
 
-    score -= PRESSURE_PENALTY[tierStatus.state] ?? 0;
+    // Session imbalance: reward the underused provider
+    if (totalCalls >= 4) {
+      const thisShare = provider === "claude"
+        ? claudeCalls / totalCalls
+        : openaiCalls / totalCalls;
+      // If heavily overused (>65% share), penalise; if underused (<35%), reward
+      if (thisShare > 0.65) score -= 20;
+      else if (thisShare < 0.35) score += 15;
+    }
 
+    // Profile bias applies to openai (positive = prefer openai more)
     if (provider === 'openai') score += profileBias;
 
+    // Penalise OpenAI for short tasks (startup overhead not worth it)
     if (provider === "openai") {
       let minTaskMs = 180_000;
       try {
@@ -416,31 +347,7 @@ function chooseProvider(taskProfile = {}) {
       }
     }
 
-    if (
-      tierStatus.effectivePressure < 0.3 &&
-      otherTierStatus.effectivePressure > 0.5
-    ) {
-      score += 20;
-    }
-
     scores[provider] = Math.round(score);
-  }
-
-  // Both-providers-throttled hard stop
-  const claudeState = status.claude?.[tier]?.state;
-  const openaiState = status.openai?.[tier]?.state;
-  if (claudeState === 'throttled' && openaiState === 'throttled') {
-    const claudeP = status.claude[tier].effectivePressure;
-    const openaiP = status.openai[tier].effectivePressure;
-    const lessThrottled = claudeP <= openaiP ? 'claude' : 'openai';
-    const m = getProviderModels(config, lessThrottled);
-    return {
-      provider: lessThrottled,
-      model: m?.[tier] || DEFAULT_MODELS[lessThrottled][tier],
-      reason: `BOTH PROVIDERS THROTTLED (claude ${Math.round(claudeP * 100)}%, openai ${Math.round(openaiP * 100)}%). Using ${lessThrottled} as least-throttled. Consider waiting or downgrading tier.`,
-      scores,
-      bothThrottled: true,
-    };
   }
 
   const winner = scores.claude >= scores.openai ? "claude" : "openai";
@@ -451,12 +358,11 @@ function chooseProvider(taskProfile = {}) {
 
   // Gate model by subscription tier
   if (!isModelAvailable(model, winner, config)) {
-    const downgraded = downgradeModel(model, winner, config);
-    model = downgraded;
+    model = downgradeModel(model, winner, config);
   }
 
-  const ws = status[winner]?.[tier] || {};
-  const ls = status[loser]?.[tier] || {};
+  const winnerCalls = winner === "claude" ? claudeCalls : openaiCalls;
+  const loserCalls  = winner === "claude" ? openaiCalls : claudeCalls;
 
   let reasonParts = [];
   if (winner === "claude" && contextCoupling !== "low") {
@@ -465,13 +371,8 @@ function chooseProvider(taskProfile = {}) {
   if (winner === "openai" && isolation !== "low") {
     reasonParts.push(`isolated task`);
   }
-  const wp = (ws.effectivePressure ?? 0);
-  const lp = (ls.effectivePressure ?? 0);
-  if (wp < lp) {
-    reasonParts.push(`${winner} ${Math.round(wp * 100)}% vs ${loser} ${Math.round(lp * 100)}%`);
-  }
-  if (ws.weeklyPressure > ws.pressure) {
-    reasonParts.push(`weekly limit is binding (${Math.round(ws.weeklyPressure * 100)}%)`);
+  if (totalCalls >= 4 && winnerCalls < loserCalls) {
+    reasonParts.push(`${winner} less used this session (${winnerCalls} vs ${loserCalls} calls)`);
   }
   if (!reasonParts.length) {
     reasonParts.push(`${winner} scored ${scores[winner]} vs ${scores[loser]}`);
@@ -483,40 +384,6 @@ function chooseProvider(taskProfile = {}) {
     reason: reasonParts.join(", "),
     scores,
   };
-}
-
-// ---------------------------------------------------------------------------
-// Exported: estimateWaveCost(tasks)
-// ---------------------------------------------------------------------------
-
-function estimateWaveCost(tasks) {
-  const config = loadConfig();
-  const budgets = getSubscriptionBudgets(config);
-  const status = getProviderStatus();
-
-  let totalTokens = { claude: 0, openai: 0 };
-  for (const task of tasks) {
-    const provider = task.provider || 'claude';
-    const tier = task.tier || 'execute';
-    const estimate = TOKENS_PER_CALL_FALLBACK[tier] || 8_000;
-    totalTokens[provider] += estimate;
-  }
-
-  const impact = {};
-  for (const provider of ['claude', 'openai']) {
-    if (totalTokens[provider] === 0) continue;
-    const tierStatus = status[provider]?.execute || {};
-    const remaining = Math.max(0, (tierStatus.budget || 0) - (tierStatus.tokens || 0));
-    const pctOfBudget = tierStatus.budget > 0 ? (totalTokens[provider] / tierStatus.budget) * 100 : 0;
-    impact[provider] = {
-      estimatedTokens: totalTokens[provider],
-      remaining,
-      pctOfBudget: Math.round(pctOfBudget * 10) / 10,
-      wouldExceed: totalTokens[provider] > remaining,
-    };
-  }
-
-  return { totalTokens, impact, taskCount: tasks.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -570,21 +437,8 @@ function recordUsageEvent(event = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// CLI rendering helpers
+// CLI rendering
 // ---------------------------------------------------------------------------
-
-function pressureBar(pressure, width = 10) {
-  const filled = Math.min(width, Math.round(pressure * width));
-  return "█".repeat(filled) + "░".repeat(width - filled);
-}
-
-function stateLabel(state) {
-  return state.padEnd(8);
-}
-
-function formatPercent(pressure) {
-  return String(Math.round(pressure * 100)).padStart(3) + "%";
-}
 
 function formatTokens(n) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -592,68 +446,51 @@ function formatTokens(n) {
   return String(n);
 }
 
-function printStatusTable(status) {
+function printStatus(status, rec) {
   const LINE_WIDTH = 62;
   const border = "═".repeat(LINE_WIDTH - 2);
-  const blank  = " ".repeat(LINE_WIDTH - 4);
 
   const h = (text) => {
     const padded = ` ${text}`.padEnd(LINE_WIDTH - 4);
     return `║ ${padded} ║`;
   };
 
-  const row = (label, tier) => {
-    const s = status[label]?.[tier] || { effectivePressure: 0, pressure: 0, state: "healthy", tokens: 0, budget: 0 };
-    const bar = pressureBar(s.effectivePressure);
-    const pct = formatPercent(s.effectivePressure);
-    const lbl = stateLabel(s.state);
-    const used = formatTokens(s.tokens || 0);
-    const cap = formatTokens(s.budget || 0);
-    const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1);
-    const line = `  ${tierLabel.padEnd(7)}: ${bar} ${pct} ${lbl} ${used}/${cap}`;
-    return h(line);
+  const providerRow = (provider) => {
+    const s = status[provider];
+    const total = s.calls.total;
+    const toks  = formatTokens(s.tokens.total);
+    const breakdown = ["think", "execute", "search"]
+      .filter(t => s.calls[t] > 0)
+      .map(t => `${t}: ${s.calls[t]}`)
+      .join(", ");
+    const label = provider === "claude" ? "Claude" : "OpenAI";
+    const detail = breakdown ? ` (${breakdown})` : "";
+    return h(`  ${label.padEnd(7)}: ${total} calls, ~${toks} tokens${detail}`);
   };
 
-  const weeklyRow = (label, tier) => {
-    const s = status[label]?.[tier] || {};
-    if (!s.weeklyPressure || s.weeklyPressure <= 0) return null;
-    const pct = Math.round((s.weeklyPressure || 0) * 100);
-    const used = formatTokens(s.weeklyTokens || 0);
-    const cap = formatTokens(s.weeklyBudget || 0);
-    return h(`          weekly: ${pct}% (${used}/${cap})`);
-  };
+  const lean = status.sessionLean;
+  const leanText = lean === "balanced"
+    ? "Balanced — either provider fine"
+    : `Leaning on ${lean} — consider routing more to ${lean === "claude" ? "OpenAI" : "Claude"}`;
 
-  const claudeLabel = status.claude?._label || "Claude Max $100";
-  const openaiLabel = status.openai?._label || "ChatGPT Plus $20";
-
-  const rec = chooseProvider({ tier: "execute", estimatedDurationMs: 300_000, isolation: "high", contextCoupling: "low" });
   const recText = `Route execution to ${rec.provider === "openai" ? "OpenAI" : "Claude"}`;
 
   const lines = [
     `╔${border}╗`,
     h("           Provider Balance Status"),
-    h("           (token-based, real limits)"),
+    h("           (session-relative, last 5 hours)"),
     `╠${border}╣`,
-    h(claudeLabel),
-    row("claude", "think"),
-    weeklyRow("claude", "think"),
-    row("claude", "execute"),
-    weeklyRow("claude", "execute"),
-    row("claude", "search"),
-    h(blank),
-    h(openaiLabel),
-    row("openai", "think"),
-    weeklyRow("openai", "think"),
-    row("openai", "execute"),
-    weeklyRow("openai", "execute"),
-    row("openai", "search"),
+    h("Session usage:"),
+    providerRow("claude"),
+    providerRow("openai"),
     `╠${border}╣`,
+    h(`Session lean: ${leanText}`),
     h(`Recommendation: ${recText}`),
     h(`Reason: ${rec.reason}`),
     `╚${border}╝`,
   ];
 
-  console.log(lines.filter(Boolean).join("\n"));
+  console.log(lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +499,8 @@ function printStatusTable(status) {
 
 async function main() {
   const status = getProviderStatus();
-  printStatusTable(status);
+  const rec = chooseProvider({ tier: "execute", estimatedDurationMs: 300_000, isolation: "high", contextCoupling: "low" });
+  printStatus(status, rec);
 }
 
 // Run as CLI only when invoked directly
@@ -676,4 +514,4 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
-export { getProviderStatus, chooseProvider, recordUsageEvent, getSubscriptionBudgets, estimateWaveCost, estimateTokensForTask, isModelAvailable, downgradeModel, SUBSCRIPTION_TIERS };
+export { getProviderStatus, chooseProvider, recordUsageEvent, estimateTokensForTask, isModelAvailable, downgradeModel, classifyModel };
