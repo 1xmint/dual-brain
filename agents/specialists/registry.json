@@ -51,6 +51,16 @@
       },
       "tier_bias": "think",
       "description": "Auth, crypto, OWASP top 10, threat modeling, secure code review"
+    },
+    "doctor": {
+      "name": "Doctor",
+      "prompt_file": "doctor.md",
+      "triggers": {
+        "extensions": [],
+        "keywords": ["doctor", "health", "diagnose", "diagnosis", "checkup", "check up", "drift", "completeness", "broken", "regression", "audit health", "package health", "health check", "health report", "manifest", "health-manifest"]
+      },
+      "tier_bias": "think",
+      "description": "Diagnostic specialist for dual-brain package health, drift detection, and completeness audits"
     }
   },
   "fallback": "generic",

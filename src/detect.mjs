@@ -369,6 +369,7 @@ const DEFAULT_SPECIALISTS = {
   html:       { triggers: { extensions: ['.html', '.css', '.scss', '.svg'], keywords: ['html', 'css', 'accessibility', 'a11y', 'aria', 'responsive', 'tailwind'] } },
   linux:      { triggers: { extensions: ['.sh', '.bash', '.conf', '.service', '.dockerfile'], keywords: ['linux', 'bash', 'shell', 'systemd', 'nginx', 'docker', 'ssh', 'deploy'] } },
   security:   { triggers: { extensions: [], keywords: ['auth', 'oauth', 'jwt', 'credential', 'secret', 'encrypt', 'vulnerability', 'vulnerabilities', 'audit', 'owasp', 'xss', 'csrf'] }, tier_bias: 'think' },
+  doctor:     { triggers: { extensions: [], keywords: ['doctor', 'health', 'diagnose', 'diagnosis', 'checkup', 'drift', 'completeness', 'broken', 'regression', 'audit health', 'package health', 'health check', 'health report', 'health-manifest'] }, tier_bias: 'think' },
 };
 
 function loadSpecialistRegistry() {

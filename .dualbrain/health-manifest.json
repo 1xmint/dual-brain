@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "id": "cli.version",
+      "name": "CLI prints version",
+      "domain": "cli",
+      "severity": "high",
+      "weight": 5,
+      "verification": { "type": "command", "cmd": "node bin/dual-brain.mjs --version" },
+      "expect": "prints version string",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "cli.help",
+      "name": "CLI help output",
+      "domain": "cli",
+      "severity": "medium",
+      "weight": 3,
+      "verification": { "type": "command", "cmd": "node bin/dual-brain.mjs --help" },
+      "expect": "shows available commands without error",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "onboarding.one-question",
+      "name": "Onboarding asks exactly one question",
+      "domain": "ux",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "manual", "check": "First run shows capability detection + work style picker only" },
+      "expect": "no subscription questions, no model picker, done in 5 seconds",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "kernel.context-pack",
+      "name": "Context pack builds without error",
+      "domain": "kernel",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/context.mjs').then(async m => { const p = await m.buildContextPack('test', [], process.cwd()); console.log(p.intent ? 'OK' : 'FAIL'); })\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "kernel.pipeline",
+      "name": "Pipeline module loads",
+      "domain": "kernel",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/pipeline.mjs').then(m => console.log(typeof m.runPipeline === 'function' ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "kernel.outcome",
+      "name": "Outcome recording module loads",
+      "domain": "kernel",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/outcome.mjs').then(m => console.log(typeof m.recordOutcome === 'function' ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "kernel.observer",
+      "name": "Observer returns observations",
+      "domain": "kernel",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/observer.mjs').then(async m => { const r = await m.getQuickState(process.cwd()); console.log(Array.isArray(r.observations) ? 'OK' : 'FAIL'); })\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "kernel.nextstep",
+      "name": "Next-step module loads",
+      "domain": "kernel",
+      "severity": "medium",
+      "weight": 5,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/nextstep.mjs').then(m => console.log(typeof m.suggestNextSteps === 'function' ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "routing.detect",
+      "name": "Task detection with reasoning depth",
+      "domain": "routing",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/detect.mjs').then(m => { const r = m.detectTask('fix a bug', ['src/detect.mjs']); console.log(r.tier && r.risk && r.reasoningDepth ? 'OK' : 'FAIL'); })\"" },
+      "expect": "prints OK with tier, risk, and reasoningDepth",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "routing.work-styles",
+      "name": "Work styles loaded correctly",
+      "domain": "routing",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/decide.mjs').then(m => console.log(m.WORK_STYLES && m.WORK_STYLES.balanced ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "routing.no-fake-budget",
+      "name": "No fake subscription detection in routing",
+      "domain": "honesty",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/decide.mjs').then(m => console.log(typeof m.getBudgetPolicy === 'undefined' && typeof m.getOptimalSub === 'undefined' ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK — fake budget functions removed",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "honesty.doctor-claims",
+      "name": "Doctor finds zero claim violations",
+      "domain": "honesty",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/doctor.mjs').then(async m => { const r = await m.scanClaims(process.cwd()); console.log(r.length === 0 ? 'OK' : 'FAIL:' + r.length); })\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "honesty.decisions-exist",
+      "name": "Decision artifacts exist for sensitive areas",
+      "domain": "honesty",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/doctor.mjs').then(async m => { const r = await m.checkDecisions(process.cwd()); const missing = r.filter(d => d.status === 'missing'); console.log(missing.length <= 2 ? 'OK' : 'FAIL:' + missing.length); })\"" },
+      "expect": "at most 2 missing (task-detection, dispatch-logic)",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "profile.capabilities",
+      "name": "Capability detection works",
+      "domain": "profile",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/profile.mjs').then(async m => { const c = await m.detectCapabilities(process.cwd()); console.log(typeof c.claude === 'object' ? 'OK' : 'FAIL'); })\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "profile.no-plan-detection",
+      "name": "No fake plan tier detection",
+      "domain": "honesty",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/profile.mjs').then(m => console.log(typeof m.detectPlans !== 'function' || m.detectPlans.toString().includes('deprecated') ? 'OK' : 'FAIL'))\"" },
+      "expect": "detectPlans is removed or deprecated stub",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "session.import",
+      "name": "Session import loads",
+      "domain": "session",
+      "severity": "medium",
+      "weight": 5,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/session.mjs').then(m => console.log(typeof m.importSessions === 'function' ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "session.search",
+      "name": "Session search works",
+      "domain": "session",
+      "severity": "medium",
+      "weight": 5,
+      "verification": { "type": "command", "cmd": "node -e \"import('./src/session.mjs').then(m => console.log(typeof m.searchSessions === 'function' ? 'OK' : 'FAIL'))\"" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "dual-brain.think",
+      "name": "Dual-brain think hook loads",
+      "domain": "collaboration",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -c .claude/hooks/dual-brain-think.mjs && echo OK" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "dual-brain.review",
+      "name": "Dual-brain review hook loads",
+      "domain": "collaboration",
+      "severity": "high",
+      "weight": 8,
+      "verification": { "type": "command", "cmd": "node -c .claude/hooks/dual-brain-review.mjs && echo OK" },
+      "expect": "prints OK",
+      "status": "untested",
+      "lastChecked": null
+    },
+    {
+      "id": "enforcement.head-guard",
+      "name": "Head-guard blocks source reads",
+      "domain": "enforcement",
+      "severity": "critical",
+      "weight": 10,
+      "verification": { "type": "command", "cmd": "echo '{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"src/detect.mjs\"}}' | node .claude/hooks/head-guard.mjs 2>/dev/null; echo EXIT:$?" },
+      "expect": "exits non-zero (blocked)",
+      "status": "untested",
+      "lastChecked": null
+    }
+  ]
+}
