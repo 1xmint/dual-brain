@@ -387,8 +387,6 @@ function loadProfile(cwd) {
     if (!profile.providers[provider]) continue;
     const stored = profile.providers[provider].plan;
     if (stored !== detectedPlan) {
-      const providerName = provider === 'claude' ? 'Claude' : 'OpenAI';
-      process.stderr.write(`[dual-brain] ${providerName}: plan updated to ${detectedPlan} (from auth config)\n`);
       profile.providers[provider].plan = detectedPlan;
     }
   }
