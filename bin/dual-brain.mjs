@@ -838,8 +838,7 @@ async function mainScreen(rl, ask) {
   }
   menuOpts.push({ key: 'e', label: 'Manage sessions',       section: 'Sessions' });
   menuOpts.push({ key: 'd', label: 'Switch to data-tools',  section: 'Tools' });
-  menuOpts.push({ key: 'j', label: 'Login to Claude',       section: 'Auth' });
-  menuOpts.push({ key: 'k', label: 'Login to Codex',        section: 'Auth' });
+  menuOpts.push({ key: 'm', label: 'Manage subscriptions',  section: 'Subscriptions' });
   menuOpts.push({ key: 's', label: 'Settings',              section: '' });
   menuOpts.push({ key: 'q', label: 'Exit',                  section: '' });
   console.log(menu(menuOpts));
@@ -885,17 +884,7 @@ async function mainScreen(rl, ask) {
     return { next: 'main' };
   }
 
-  if (choice === 'j') {
-    const { spawnSync } = await import('node:child_process');
-    spawnSync('claude', ['login'], { stdio: 'inherit' });
-    return { next: 'main' };
-  }
-
-  if (choice === 'k') {
-    const { spawnSync } = await import('node:child_process');
-    spawnSync('codex', ['login'], { stdio: 'inherit' });
-    return { next: 'main' };
-  }
+  if (choice === 'm') { return { next: 'subscriptions' }; }
 
   if (choice === 's') { return { next: 'settings' }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
@@ -1014,116 +1003,103 @@ async function settingsScreen(rl, ask) {
 // ─── Screen: subscriptionsScreen ─────────────────────────────────────────────
 
 async function subscriptionsScreen(rl, ask) {
+  console.clear();
   const cwd = process.cwd();
   const profile = loadProfile(cwd);
   const auth    = await detectAuth();
   const plans   = detectPlans();
 
-  const claudeSub = profile?.providers?.claude;
-  const openaiSub = profile?.providers?.openai;
+  // Build status lines
+  const lines = [];
+  if (auth.claude.found) {
+    const plan = plans.claude?.label || plans.claude?.plan || 'unknown plan';
+    const sub = profile?.providers?.claude;
+    const label = sub?.label ? ` [${sub.label}]` : '';
+    const d = sub?.expiresAt ? daysUntil(sub.expiresAt) : null;
+    const expiry = d !== null ? ` (${d < 0 ? 'expired' : d === 0 ? 'today' : `${d}d left`})` : '';
+    lines.push(`  ✅ Claude: ${plan}${label}${expiry}`);
+  } else {
+    lines.push(`  ⚠️  Claude: not linked`);
+  }
+  if (auth.openai.found) {
+    const plan = plans.openai?.label || plans.openai?.plan || 'unknown plan';
+    const sub = profile?.providers?.openai;
+    const label = sub?.label ? ` [${sub.label}]` : '';
+    const d = sub?.expiresAt ? daysUntil(sub.expiresAt) : null;
+    const expiry = d !== null ? ` (${d < 0 ? 'expired' : d === 0 ? 'today' : `${d}d left`})` : '';
+    lines.push(`  ✅ OpenAI: ${plan}${label}${expiry}`);
+  } else {
+    lines.push(`  ⚠️  OpenAI: not linked`);
+  }
 
-  const claudePlanLabel = claudeSub?.enabled
-    ? (CLAUDE_PLAN_LABELS[claudeSub.plan] ?? claudeSub.plan ?? 'n/a')
-    : 'disabled';
-  const openaiPlanLabel = openaiSub?.enabled
-    ? (OPENAI_PLAN_LABELS[openaiSub.plan] ?? openaiSub.plan ?? 'n/a')
-    : 'disabled';
-
-  const subLines = [
-    `Claude:  ${auth.claude.found ? 'logged in' : 'not logged in'} — ${claudePlanLabel}`,
-    claudeSub?.label ? `         label: ${claudeSub.label}` : '',
-    claudeSub?.expiresAt ? `         expires: ${claudeSub.expiresAt.slice(0, 10)}` : '',
-    '',
-    `OpenAI:  ${auth.openai.found ? 'logged in' : 'not logged in'} — ${openaiPlanLabel}`,
-    openaiSub?.label ? `         label: ${openaiSub.label}` : '',
-    openaiSub?.expiresAt ? `         expires: ${openaiSub.expiresAt.slice(0, 10)}` : '',
-  ].filter(line => line !== '');
-
+  console.log(box('Subscriptions', lines));
   console.log('');
-  console.log(box('Subscriptions', subLines));
-  console.log('');
-  console.log(menu([
-    { key: 'd', label: 'Re-detect from CLI',   section: '' },
-    { key: 'c', label: 'Set Claude plan tier', section: '' },
-    { key: 'o', label: 'Set OpenAI plan tier', section: '' },
-    { key: 't', label: 'Set team label/expiry',section: '' },
-    { key: 'b', label: 'Back to settings',     section: '' },
-  ]));
+
+  const menuOpts = [
+    { key: '1', label: 'Add Claude sub', section: 'Link' },
+    { key: '2', label: 'Add Codex sub',  section: 'Link' },
+    { key: 'b', label: 'Back to home',   section: '' },
+  ];
+  console.log(menu(menuOpts));
   console.log('');
 
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
 
-  if (choice === 'd') {
-    // Re-detect from CLI config files
-    if (plans.claude && claudeSub) {
-      profile.providers.claude.plan = plans.claude;
-      console.log(`  Detected Claude: ${CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude}`);
-    }
-    if (plans.openai && openaiSub) {
-      profile.providers.openai.plan = plans.openai;
-      console.log(`  Detected OpenAI: ${OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai}`);
-    }
-    saveProfile(profile, { cwd });
-    return { next: 'subscriptions' };
-  }
-
-  if (choice === 'c') {
-    console.log('');
-    console.log('  Claude plan:');
-    console.log('  (1) Pro ($20/mo)');
-    console.log('  (2) Max x5 ($100/mo)');
-    console.log('  (3) Max x20 ($200/mo)');
-    const c = (await ask('  > ')).trim();
-    const planMap = { '1': 'pro', '2': 'max5', '3': 'max20' };
-    if (planMap[c]) {
+  if (choice === '1') {
+    console.log('\n  Linking Claude subscription...');
+    console.log('  A browser window will open — paste the code below when prompted.\n');
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync('claude', ['login'], { stdio: 'inherit', timeout: 60000 });
+    if (r.status === 0) {
+      console.log('\n  ✅ Claude linked successfully!\n');
+      const label = (await ask("  Label (e.g. \"Josh's $100 sub\", or Enter to skip): ")).trim();
+      const expiry = await askExpiry(ask, 'Claude');
+      const newPlans = detectPlans();
+      const plan = newPlans.claude?.plan || 'pro';
+      if (!profile.providers) profile.providers = {};
       if (!profile.providers.claude) profile.providers.claude = { enabled: true };
-      profile.providers.claude.plan = planMap[c];
+      profile.providers.claude.plan = plan;
       profile.providers.claude.enabled = true;
+      if (label) profile.providers.claude.label = label;
+      if (expiry) profile.providers.claude.expiresAt = expiry;
       saveProfile(profile, { cwd });
-      console.log(`  Claude plan set to: ${CLAUDE_PLAN_LABELS[planMap[c]]}`);
+      console.log('  ✓ Saved\n');
+      await ask('  Press Enter to continue...');
+    } else {
+      console.log('\n  ❌ Claude login failed or was cancelled.\n');
+      await ask('  Press Enter to continue...');
     }
     return { next: 'subscriptions' };
   }
 
-  if (choice === 'o') {
-    console.log('');
-    console.log('  OpenAI plan:');
-    console.log('  (1) Plus ($20/mo)');
-    console.log('  (2) Pro ($100/mo)');
-    console.log('  (3) Pro ($200/mo higher limits)');
-    const c = (await ask('  > ')).trim();
-    const planMap = { '1': 'plus', '2': 'pro', '3': 'pro200' };
-    if (planMap[c]) {
+  if (choice === '2') {
+    console.log('\n  Linking Codex subscription...');
+    console.log('  A browser window will open — paste the code below when prompted.\n');
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync('codex', ['login'], { stdio: 'inherit', timeout: 60000 });
+    if (r.status === 0) {
+      console.log('\n  ✅ Codex linked successfully!\n');
+      const label = (await ask('  Label (e.g. "Team Codex Pro", or Enter to skip): ')).trim();
+      const expiry = await askExpiry(ask, 'Codex');
+      const newPlans = detectPlans();
+      const plan = newPlans.openai?.plan || 'plus';
+      if (!profile.providers) profile.providers = {};
       if (!profile.providers.openai) profile.providers.openai = { enabled: true };
-      profile.providers.openai.plan = planMap[c];
+      profile.providers.openai.plan = plan;
       profile.providers.openai.enabled = true;
+      if (label) profile.providers.openai.label = label;
+      if (expiry) profile.providers.openai.expiresAt = expiry;
       saveProfile(profile, { cwd });
-      console.log(`  OpenAI plan set to: ${OPENAI_PLAN_LABELS[planMap[c]]}`);
+      console.log('  ✓ Saved\n');
+      await ask('  Press Enter to continue...');
+    } else {
+      console.log('\n  ❌ Codex login failed or was cancelled.\n');
+      await ask('  Press Enter to continue...');
     }
     return { next: 'subscriptions' };
   }
 
-  if (choice === 't') {
-    // Team label/expiry for each provider
-    for (const provider of ['claude', 'openai']) {
-      const prov = profile.providers[provider];
-      if (!prov?.enabled) continue;
-      const provLabel = provider === 'claude' ? 'Claude' : 'OpenAI';
-      const currentLabel = prov.label || '';
-      const label = (await ask(`  ${provLabel} label [${currentLabel || 'none'}]: `)).trim();
-      if (label === '-') { delete prov.label; }
-      else if (label) { prov.label = label; }
-      const expiry = await askExpiry(ask, provLabel);
-      if (expiry) { prov.expiresAt = expiry; }
-    }
-    saveProfile(profile, { cwd });
-    console.log('  Team config saved.');
-    return { next: 'subscriptions' };
-  }
-
-  if (choice === 'b' || choice === 'back') { return { next: 'settings' }; }
-
-  return { next: 'subscriptions' };
+  return { next: 'main' };
 }
 
 // ─── Screen: dashboardScreen (kept for internal reference, unreachable) ───────
