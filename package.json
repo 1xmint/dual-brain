@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "6.2.0",
+  "version": "7.0.0",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -50,6 +50,8 @@
     "bin/*.mjs",
     "hooks/*.mjs",
     "hooks/*.sh",
+    "mcp-server/*.mjs",
+    "mcp-server/README.md",
     "install.mjs",
     "orchestrator.json",
     "hookify.*.local.md",
@@ -58,6 +60,9 @@
     "CLAUDE.md",
     "README.md",
     "LICENSE",
-    "playbooks/*.json"
+    "playbooks/*.json",
+    "plugin.json",
+    "skills/*.md",
+    "agents/*.md"
   ]
 }

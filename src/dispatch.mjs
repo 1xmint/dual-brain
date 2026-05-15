@@ -4,10 +4,11 @@
 // CLI: node src/dispatch.mjs --dry-run --provider claude --model sonnet --prompt "fix the bug"
 //      node src/dispatch.mjs --detect-runtime
 // Exports: dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain,
-//          validateDispatch, checkWorktreeClean, getRetryBudget
+//          validateDispatch, checkWorktreeClean, getRetryBudget,
+//          isInsideClaude, buildNativeDispatch, normalizeResult
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, appendFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -45,6 +46,196 @@ function medianDuration(provider, model) {
 
 // Rate-limit error keywords
 const RATE_LIMIT_PATTERNS = /rate.?limit|quota|capacity|too many requests|overloaded|throttl/i;
+
+// ─── Native Claude Code detection ────────────────────────────────────────────
+
+/**
+ * Detect whether we are running inside Claude Code (as a subagent or tool call).
+ * Checks the CLAUDE_CODE env var or the presence of .claude/settings.json in the project root.
+ * @returns {boolean}
+ */
+function isInsideClaude() {
+  if (process.env.CLAUDE_CODE) return true;
+  // Walk up from __dirname (src/) to find .claude/settings.json in project root
+  const projectRoot = join(__dirname, '..');
+  return existsSync(join(projectRoot, '.claude', 'settings.json'));
+}
+
+// ─── Tier defaults for maxTurns ──────────────────────────────────────────────
+
+const TIER_MAX_TURNS = { search: 5, execute: 15, think: 10 };
+
+// ─── Agent model mapper ───────────────────────────────────────────────────────
+
+/**
+ * Map a model alias or model ID to the canonical agent model name (haiku|sonnet|opus).
+ * Falls back to tier-based defaults when no match is found.
+ * @param {string} modelAlias  Short alias or full model ID
+ * @param {string} [tier]      Tier fallback ('search'|'execute'|'think')
+ * @returns {'haiku'|'sonnet'|'opus'}
+ */
+function mapToAgentModel(modelAlias, tier) {
+  if (!modelAlias) {
+    const tierDefaults = { search: 'haiku', execute: 'sonnet', think: 'opus' };
+    return tierDefaults[tier] ?? 'sonnet';
+  }
+  const lower = String(modelAlias).toLowerCase();
+  if (lower === 'haiku' || lower.startsWith('claude-3-haiku') || lower.includes('haiku')) return 'haiku';
+  if (lower === 'opus'  || lower.startsWith('claude-opus')   || lower.includes('opus'))  return 'opus';
+  if (lower === 'sonnet'|| lower.startsWith('claude-sonnet') || lower.includes('sonnet')) return 'sonnet';
+  // Tier-based fallback
+  const tierDefaults = { search: 'haiku', execute: 'sonnet', think: 'opus' };
+  return tierDefaults[tier] ?? 'sonnet';
+}
+
+// ─── Native dispatch builder ──────────────────────────────────────────────────
+
+/**
+ * Build a structured native Agent tool call descriptor instead of a shell command.
+ * The caller (CLI or plugin) is responsible for invoking the Agent tool with this object.
+ *
+ * @param {object} decision  Routing decision from decide.mjs
+ * @param {string} prompt    Task prompt (already redacted)
+ * @param {object} [options] Optional extras: worktree, maxTurns
+ * @returns {{
+ *   type: 'native-agent',
+ *   description: string,
+ *   model: 'haiku'|'sonnet'|'opus',
+ *   prompt: string,
+ *   isolation: string|undefined,
+ *   maxTurns: number,
+ *   disallowedTools: string[],
+ *   background: boolean
+ * }}
+ */
+function buildNativeDispatch(decision, prompt, options = {}) {
+  const tier  = decision.tier  ?? 'execute';
+  const model = mapToAgentModel(decision.model, tier);
+
+  return {
+    type:        'native-agent',
+    description: `dual-brain ${tier}: ${String(prompt).slice(0, 50)}`,
+    model,
+    prompt,
+    isolation:      options.worktree ? 'worktree' : undefined,
+    maxTurns:       options.maxTurns ?? TIER_MAX_TURNS[tier] ?? 15,
+    disallowedTools: tier === 'search' ? ['Edit', 'Write', 'NotebookEdit'] : [],
+    background:     false,
+  };
+}
+
+// ─── Result normalizer ────────────────────────────────────────────────────────
+
+/**
+ * Normalize a raw result from either a native Agent call or subprocess stdout
+ * into a common result shape.
+ *
+ * @param {object|string} rawResult  Raw result from agent or subprocess
+ * @param {'native-agent'|'subprocess'} dispatchType
+ * @returns {{
+ *   status: 'success'|'failure'|'partial',
+ *   provider: string,
+ *   model: string,
+ *   tier: string,
+ *   filesChanged: string[],
+ *   filesFound: string[],
+ *   testsRun: number,
+ *   edgeCases: string[],
+ *   tokensUsed: { input: number, output: number },
+ *   errors: string[],
+ *   rawOutput: string
+ * }}
+ */
+function normalizeResult(rawResult, dispatchType) {
+  const raw = rawResult ?? {};
+
+  // Determine raw output string regardless of dispatch type
+  let rawOutput = '';
+  if (typeof raw === 'string') {
+    rawOutput = raw;
+  } else if (typeof raw.stdout === 'string') {
+    rawOutput = raw.stdout;
+  } else if (typeof raw.output === 'string') {
+    rawOutput = raw.output;
+  } else if (typeof raw.result === 'string') {
+    rawOutput = raw.result;
+  } else {
+    try { rawOutput = JSON.stringify(raw); } catch { rawOutput = String(raw); }
+  }
+
+  // Determine status
+  let status = 'success';
+  if (dispatchType === 'subprocess') {
+    const exitCode = typeof raw.exitCode === 'number' ? raw.exitCode : (raw.code ?? null);
+    if (exitCode !== null) {
+      status = exitCode === 0 ? 'success' : 'failure';
+    } else if (raw.status === 'failed' || raw.status === 'error') {
+      status = 'failure';
+    } else if (raw.status === 'partial') {
+      status = 'partial';
+    }
+  } else {
+    // native-agent
+    if (raw.status === 'failed' || raw.status === 'error' || raw.error) {
+      status = 'failure';
+    } else if (raw.status === 'partial') {
+      status = 'partial';
+    }
+  }
+
+  // Extract fields from raw
+  const provider = raw.provider ?? (dispatchType === 'native-agent' ? 'claude' : 'unknown');
+  const model    = raw.model    ?? (raw.agentModel ?? 'unknown');
+  const tier     = raw.tier     ?? 'execute';
+
+  // Files changed / found — best-effort extraction from raw output
+  const filesChangedSet = new Set();
+  const filesFoundSet   = new Set();
+  if (Array.isArray(raw.filesChanged)) raw.filesChanged.forEach(f => filesChangedSet.add(f));
+  if (Array.isArray(raw.filesFound))   raw.filesFound.forEach(f => filesFoundSet.add(f));
+
+  // Scan rawOutput for file hints
+  const changeMatches = rawOutput.matchAll(/(?:changed|edited|wrote|created|modified)\s+([^\s,]+\.[a-z]{1,6})/gi);
+  for (const m of changeMatches) filesChangedSet.add(m[1]);
+  const foundMatches = rawOutput.matchAll(/(?:found|located|in)\s+([^\s,]+\.[a-z]{1,6})/gi);
+  for (const m of foundMatches) filesFoundSet.add(m[1]);
+
+  // Tests run
+  let testsRun = raw.testsRun ?? 0;
+  if (testsRun === 0) {
+    const testMatch = rawOutput.match(/(\d+)\s+(?:tests?|specs?)\s+(?:passed|run|ran)/i);
+    if (testMatch) testsRun = parseInt(testMatch[1], 10);
+  }
+
+  // Edge cases
+  const edgeCases = Array.isArray(raw.edgeCases) ? raw.edgeCases : [];
+
+  // Token usage
+  const tokensUsed = {
+    input:  raw.tokensUsed?.input  ?? raw.usage?.inputTokens  ?? raw.usage?.input_tokens  ?? 0,
+    output: raw.tokensUsed?.output ?? raw.usage?.outputTokens ?? raw.usage?.output_tokens ?? 0,
+  };
+
+  // Errors
+  const errors = [];
+  if (Array.isArray(raw.errors)) errors.push(...raw.errors);
+  if (typeof raw.error === 'string' && raw.error) errors.push(raw.error);
+  if (typeof raw.stderr === 'string' && raw.stderr) errors.push(raw.stderr.slice(0, 200));
+
+  return {
+    status,
+    provider,
+    model,
+    tier,
+    filesChanged: [...filesChangedSet],
+    filesFound:   [...filesFoundSet],
+    testsRun,
+    edgeCases,
+    tokensUsed,
+    errors,
+    rawOutput: rawOutput.slice(0, 2000),
+  };
+}
 
 // ─── Runtime detection (cached) ───────────────────────────────────────────────
 
@@ -441,6 +632,34 @@ async function dispatch(input = {}) {
     }
   }
 
+  // ── Native Claude Code dispatch ──────────────────────────────────────────────
+  // When running inside Claude Code AND the provider is claude, return a
+  // structured native-agent descriptor instead of spawning a subprocess.
+  // The caller (CLI or plugin) is responsible for actually invoking the Agent tool.
+  if (isInsideClaude() && effectiveProvider === 'claude') {
+    const nativeDescriptor = buildNativeDispatch(
+      effectiveDecision,
+      prompt,
+      { worktree: input.worktree, maxTurns: input.maxTurns },
+    );
+    if (dryRun) {
+      return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, command: null, nativeDispatch: nativeDescriptor, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
+    }
+    _recordDispatchBudget(prompt);
+    return {
+      status:        'native-agent',
+      provider:      effectiveProvider,
+      model:         effectiveModel,
+      command:       null,
+      nativeDispatch: nativeDescriptor,
+      exitCode:      null,
+      summary:       `[native] ${nativeDescriptor.description}`,
+      durationMs:    0,
+      usage:         null,
+      error:         null,
+    };
+  }
+
   const command = buildCommand(effectiveDecision, prompt, files, cwd);
 
   if (dryRun) {
@@ -584,4 +803,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   }
 }
 
-export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget };
+export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget, isInsideClaude, buildNativeDispatch, normalizeResult };

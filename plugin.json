@@ -1,0 +1,22 @@
+{
+  "name": "dual-brain",
+  "version": "7.0.0",
+  "description": "Dual-provider AI orchestration — smart routing between Claude and OpenAI",
+  "skills": [
+    { "name": "go", "description": "Route and dispatch a task", "file": "skills/go.md" },
+    { "name": "status", "description": "Show provider health and budget", "file": "skills/status.md" },
+    { "name": "think", "description": "Dual-brain architecture discussion", "file": "skills/think.md" },
+    { "name": "review", "description": "Dual-brain code review", "file": "skills/review.md" }
+  ],
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Edit|Write|NotebookEdit|Bash", "command": "node hooks/head-guard.mjs" },
+      { "matcher": "Agent", "command": "node hooks/enforce-tier.mjs" }
+    ]
+  },
+  "agents": [
+    { "name": "researcher", "file": "agents/researcher.md" },
+    { "name": "implementer", "file": "agents/implementer.md" },
+    { "name": "verifier", "file": "agents/verifier.md" }
+  ]
+}
