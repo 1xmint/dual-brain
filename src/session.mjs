@@ -523,12 +523,82 @@ export function getSessionMeta(cwd = process.cwd()) {
   try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return {}; }
 }
 
-function saveSessionMeta(meta, cwd = process.cwd()) {
+export function saveSessionMeta(meta, cwd = process.cwd()) {
   ensureDir(cwd);
   const p   = sessionMetaPath(cwd);
   const tmp = p + '.tmp.' + process.pid;
   writeFileSync(tmp, JSON.stringify(meta, null, 2) + '\n');
   renameSync(tmp, p);
+}
+
+// ─── Archive support ──────────────────────────────────────────────────────────
+
+const ARCHIVE_FILE = '.dualbrain/archive/sessions.json';
+
+function archivePath(cwd) {
+  return join(cwd ?? process.cwd(), ARCHIVE_FILE);
+}
+
+/**
+ * Archive a session — moves it from active sessions.json to archive/sessions.json.
+ * The session data stays in the index (searchable), just flagged as archived.
+ * Non-destructive and reversible.
+ *
+ * @param {string} sessionId
+ * @param {string} [cwd]
+ */
+export function archiveSession(sessionId, cwd = process.cwd()) {
+  // Load active sessions meta
+  const meta = getSessionMeta(cwd);
+  const existing = meta[sessionId] ?? {};
+
+  // Load or init archive
+  const ap = archivePath(cwd);
+  mkdirSync(dirname(ap), { recursive: true });
+  let archive = [];
+  try {
+    if (existsSync(ap)) archive = JSON.parse(readFileSync(ap, 'utf8'));
+  } catch { archive = []; }
+
+  // Avoid duplicates
+  if (!archive.some(s => s.id === sessionId)) {
+    archive.push({
+      ...existing,
+      id: sessionId,
+      archived: true,
+      archivedAt: new Date().toISOString(),
+    });
+    const tmp = ap + '.tmp.' + process.pid;
+    writeFileSync(tmp, JSON.stringify(archive, null, 2) + '\n');
+    renameSync(tmp, ap);
+  }
+
+  // Remove from active sessions.json
+  delete meta[sessionId];
+  saveSessionMeta(meta, cwd);
+
+  // Mark archived in the session index (best-effort)
+  try {
+    const indexPath = join(cwd ?? process.cwd(), '.dualbrain', 'session-index.json');
+    if (existsSync(indexPath)) {
+      const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+      if (index[sessionId]) {
+        index[sessionId].archived = true;
+        writeFileSync(indexPath, JSON.stringify(index, null, 2) + '\n');
+      }
+    }
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Return all archived sessions.
+ * @param {string} [cwd]
+ * @returns {Array<object>}
+ */
+export function getArchivedSessions(cwd = process.cwd()) {
+  const ap = archivePath(cwd);
+  if (!existsSync(ap)) return [];
+  try { return JSON.parse(readFileSync(ap, 'utf8')); } catch { return []; }
 }
 
 export function renameSession(sessionId, name, cwd = process.cwd()) {

@@ -29,7 +29,7 @@ import {
 import { dispatch, detectRuntime, dispatchDualBrain } from '../src/dispatch.mjs';
 
 import { loadRepoCache } from '../src/repo.mjs';
-import { loadSession, saveSession, formatSessionCard, importReplitSessions, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions } from '../src/session.mjs';
+import { loadSession, saveSession, formatSessionCard, importReplitSessions, getSessionMeta, saveSessionMeta, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions, archiveSession, getArchivedSessions } from '../src/session.mjs';
 
 import { box, bar, badge, menu, separator } from '../src/tui.mjs';
 
@@ -1094,7 +1094,12 @@ async function mainScreen(rl, ask) {
   } catch {}
 
   // Gather recent sessions
-  const recentSessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 3);
+  const allSessions    = enrichSessions(importReplitSessions(cwd), cwd);
+  const recentSessions = allSessions.slice(0, 3);
+  const staleCount     = allSessions.filter(s => {
+    const ageMs = s.lastActive ? Date.now() - new Date(s.lastActive).getTime() : 0;
+    return ageMs >= 7 * 86400000;
+  }).length;
 
   // Detect data-tools version
   const rtMain    = detectReplitTools(cwd);
@@ -1152,21 +1157,45 @@ async function mainScreen(rl, ask) {
           ? sess.project.replace(/^-/, '/').replace(/-/g, '/')
           : sess.id.slice(0, 8);
       }
-      // Layout: "{num}  {name...}  {age}"
+
+      // Build badges (ANSI color; track visible width separately)
+      const badges = [];
+      const badgeVisible = [];
+      if (sess.isActive) {
+        badges.push('\x1b[32m[active]\x1b[0m');
+        badgeVisible.push('[active]'.length);
+      }
+      if (sess.source === 'replit-tools' || sess.source === 'data-tools') {
+        badges.push('\x1b[36m[dt]\x1b[0m');
+        badgeVisible.push('[dt]'.length);
+      }
+      const ageMs = sess.lastActive ? Date.now() - new Date(sess.lastActive).getTime() : 0;
+      if (ageMs > 7 * 24 * 3600 * 1000) {
+        badges.push('\x1b[2m[stale]\x1b[0m');
+        badgeVisible.push('[stale]'.length);
+      }
+      const msgCount    = sess.messageCount ?? sess.promptCount ?? 0;
+      const msgBadge    = `\x1b[2m(${msgCount})\x1b[0m`;
+      const msgBadgeW   = `(${msgCount})`.length;
+
+      const badgeStr = badges.join('');
+      const badgesW  = badgeVisible.reduce((s, n) => s + n, 0);
+
+      // Layout: "{num}  {name...}{badges}  {age}  {msg}"
       const numStr  = String(i + 1);
       const ageStr  = sess.age || '';
-      // Available for name: W - numStr.length - 2 spaces - 2 spaces before age - ageStr.length
-      const nameMax = W - numStr.length - 2 - 2 - ageStr.length;
-      const name    = rawName.length > nameMax
-        ? rawName.slice(0, nameMax - 3) + '...'
+      // Available for name: W minus fixed chrome, badge widths, and msg badge
+      const nameMax = W - numStr.length - 2 - badgesW - 2 - ageStr.length - 2 - msgBadgeW;
+      const truncName = rawName.length > nameMax
+        ? rawName.slice(0, Math.max(0, nameMax - 3)) + '...'
         : rawName.padEnd(nameMax);
-      const content = `${numStr}  ${name}  ${ageStr}`;
+      const content = `${numStr}  ${truncName}${badgeStr}  ${ageStr}  ${msgBadge}`;
       sessionRows.push(row(content));
     });
   }
 
   // ── Actions bar ───────────────────────────────────────────────────────────
-  const actionsContent = '↵ Resume  n New  / Search  s Settings  q Quit';
+  const actionsContent = '↵ Resume  n New  / Search  i Import  s Settings  q Quit';
   const actionsRow     = row(actionsContent);
 
   // ── Print the full box ────────────────────────────────────────────────────
@@ -1179,6 +1208,11 @@ async function mainScreen(rl, ask) {
     actionsRow,
     bot,
   ];
+  // ── Stale session hint ──────────────────────────────────────────────────
+  if (staleCount >= 3) {
+    process.stdout.write(`\x1b[2m${staleCount} stale sessions (>7d) — press s → archive to clean up\x1b[0m\n`);
+  }
+
   process.stdout.write(lines.join('\n') + '\n');
   process.stdout.write(`\x1b[2mPowered by data-tools · Steve Moraco\x1b[0m\n\n`);
 
@@ -1267,7 +1301,7 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        if (lower === 'n' || lower === 's' || lower === 'q' || lower === '/') {
+        if (lower === 'n' || lower === 's' || lower === 'q' || lower === '/' || lower === 'i') {
           cleanup();
           process.stdout.write('\n');
           resolve(lower);
@@ -1372,6 +1406,7 @@ async function mainScreen(rl, ask) {
   }
 
   if (choice === 's') { return { next: 'settings' }; }
+  if (choice === 'i') { return { next: 'import-picker' }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
   return { next: 'main' };
@@ -1404,6 +1439,236 @@ async function newSessionScreen(rl, ask) {
   if (freshSessions.length > 0) {
     saveTerminalState(cwd, getTerminalId(), freshSessions[0].id, launchTool);
   }
+
+  return { next: 'main' };
+}
+
+// ─── Screen: importPickerScreen ──────────────────────────────────────────────
+
+async function importPickerScreen() {
+  const cwd = process.cwd();
+
+  // Load all available sessions from data-tools
+  const allSessions = importReplitSessions(cwd);
+
+  // Load existing session meta to filter already-imported ones
+  const meta = getSessionMeta(cwd);
+  const alreadyImported = new Set(
+    Object.entries(meta)
+      .filter(([, v]) => v.source === 'data-tools')
+      .map(([id]) => id)
+  );
+
+  // Filter out already-imported sessions
+  const candidates = allSessions.filter(s => !alreadyImported.has(s.id));
+
+  // ── Box layout ────────────────────────────────────────────────────────────
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 60);
+  const W     = boxW - 4;
+
+  const top = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot = `└${'─'.repeat(boxW - 2)}┘`;
+
+  const row = (content) => makeBoxRow(content, W);
+
+  // Helper: wait for any keypress (used in edge-case screens)
+  const waitKey = async () => {
+    const rl2 = await import('node:readline');
+    rl2.emitKeypressEvents(process.stdin);
+    await new Promise(resolve => {
+      const wasRaw2 = process.stdin.isRaw;
+      const canRaw2 = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+      if (canRaw2) process.stdin.setRawMode(true);
+      const onKey2 = () => {
+        process.stdin.removeListener('keypress', onKey2);
+        if (canRaw2) { try { process.stdin.setRawMode(wasRaw2 || false); } catch {} }
+        resolve();
+      };
+      process.stdin.once('keypress', onKey2);
+    });
+  };
+
+  // Handle edge cases
+  if (allSessions.length === 0) {
+    process.stdout.write('\n');
+    process.stdout.write(top + '\n');
+    process.stdout.write(row('Import from data-tools') + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row('No data-tools sessions found.') + '\n');
+    process.stdout.write(row('Install replit-tools: npm i -g replit-tools') + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row('Press any key to go back...') + '\n');
+    process.stdout.write(bot + '\n\n');
+    await waitKey();
+    return { next: 'main' };
+  }
+
+  if (candidates.length === 0) {
+    process.stdout.write('\n');
+    process.stdout.write(top + '\n');
+    process.stdout.write(row('Import from data-tools') + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row(`All ${allSessions.length} sessions already imported.`) + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row('Press any key to go back...') + '\n');
+    process.stdout.write(bot + '\n\n');
+    await waitKey();
+    return { next: 'main' };
+  }
+
+  // Pre-select sessions < 3 days old
+  const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+  const selected = new Set(
+    candidates
+      .filter(s => s.lastActive && (Date.now() - new Date(s.lastActive).getTime()) < threeDaysMs)
+      .map(s => s.id)
+  );
+
+  let cursor = 0;
+
+  const renderPicker = () => {
+    process.stdout.write('\x1b[2J\x1b[H'); // clear screen
+
+    const headerTitle = 'Import from data-tools';
+    const footerLine  = '↑↓ Navigate  Space Toggle  Enter Import  q Back';
+
+    process.stdout.write('\n');
+    process.stdout.write(top + '\n');
+    process.stdout.write(row(headerTitle) + '\n');
+    process.stdout.write(sep + '\n');
+
+    candidates.forEach((sess, i) => {
+      const isCursor   = i === cursor;
+      const isSelected = selected.has(sess.id);
+      const check      = isSelected ? '☑' : '☐';
+      const cursor_ch  = isCursor   ? '▸ ' : '  ';
+
+      // Format age compactly
+      const ageStr = sess.age || '';
+      // Message count
+      const msgCount = sess.promptCount ?? sess.messageCount ?? 0;
+      const msgStr   = `${msgCount} msgs`;
+
+      // Name: truncate to fit
+      // Layout: "cursor_ch(2) check(1) space(1) name  age  msgs"
+      // chrome = 2 + 1 + 1 + 2 + ageStr.length + 2 + msgStr.length = 8 + ageStr.length + msgStr.length
+      const chrome  = 2 + 1 + 1 + 2 + ageStr.length + 2 + msgStr.length;
+      const nameMax = Math.max(0, W - chrome);
+      let name = sess.name || sess.id.slice(0, 8);
+      if (name.length > nameMax) name = name.slice(0, nameMax - 3) + '...';
+      else name = name.padEnd(nameMax);
+
+      const line = `${cursor_ch}${check} ${name}  ${ageStr}  ${msgStr}`;
+      // Highlight cursor row with dim inverse
+      const renderedLine = isCursor
+        ? `\x1b[7m${cursor_ch}${check} ${name}  ${ageStr}  ${msgStr}\x1b[0m`
+        : line;
+      process.stdout.write(row(renderedLine) + '\n');
+    });
+
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row(footerLine) + '\n');
+    process.stdout.write(bot + '\n\n');
+  };
+
+  // Run the interactive picker
+  const readline = await import('node:readline');
+  readline.emitKeypressEvents(process.stdin);
+
+  const result = await new Promise((resolve) => {
+    const wasRaw = process.stdin.isRaw;
+    const canRaw = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+    if (canRaw) process.stdin.setRawMode(true);
+
+    const cleanup = () => {
+      process.stdin.removeListener('keypress', onKey);
+      if (canRaw) {
+        try { process.stdin.setRawMode(wasRaw || false); } catch {}
+      }
+    };
+
+    renderPicker();
+
+    const onKey = (str, key) => {
+      if (!key) return;
+      const name = key.name || '';
+      const seq  = key.sequence || str || '';
+
+      // Ctrl-C / Ctrl-D → exit to main
+      if (key.ctrl && (name === 'c' || name === 'd')) {
+        cleanup();
+        process.stdout.write('\n');
+        resolve({ action: 'back' });
+        return;
+      }
+
+      // q or Escape → back
+      if (name === 'escape' || (str && str.toLowerCase() === 'q')) {
+        cleanup();
+        process.stdout.write('\n');
+        resolve({ action: 'back' });
+        return;
+      }
+
+      // Arrow up
+      if (name === 'up') {
+        cursor = Math.max(0, cursor - 1);
+        renderPicker();
+        return;
+      }
+
+      // Arrow down
+      if (name === 'down') {
+        cursor = Math.min(candidates.length - 1, cursor + 1);
+        renderPicker();
+        return;
+      }
+
+      // Space → toggle selection
+      if (seq === ' ') {
+        const id = candidates[cursor].id;
+        if (selected.has(id)) selected.delete(id);
+        else selected.add(id);
+        renderPicker();
+        return;
+      }
+
+      // Enter → import
+      if (name === 'return' || name === 'enter' || seq === '\r' || seq === '\n') {
+        cleanup();
+        process.stdout.write('\n');
+        resolve({ action: 'import', ids: [...selected] });
+        return;
+      }
+    };
+
+    process.stdin.on('keypress', onKey);
+  });
+
+  if (result.action === 'back' || result.ids.length === 0) {
+    return { next: 'main' };
+  }
+
+  // Persist imported sessions to sessions.json
+  const updatedMeta = getSessionMeta(cwd);
+  const now = new Date().toISOString();
+  let importCount = 0;
+  for (const id of result.ids) {
+    const sess = candidates.find(s => s.id === id);
+    if (!sess) continue;
+    updatedMeta[id] = {
+      ...updatedMeta[id],
+      source:     'data-tools',
+      importedAt: now,
+      createdAt:  updatedMeta[id]?.createdAt ?? now,
+    };
+    importCount++;
+  }
+  saveSessionMeta(updatedMeta, cwd);
+
+  process.stdout.write(`✓ Imported ${importCount} session${importCount !== 1 ? 's' : ''} from data-tools\n\n`);
 
   return { next: 'main' };
 }
@@ -1447,15 +1712,7 @@ async function settingsScreen(rl, ask) {
   if (choice === 'e') { return { next: 'sessions' }; }
 
   if (choice === 'i') {
-    const sessions = importReplitSessions(cwd);
-    if (sessions.length === 0) {
-      process.stdout.write('\n  No replit-tools sessions found to import.\n\n');
-    } else {
-      process.stdout.write(`\n  Found ${sessions.length} sessions from replit-tools.\n`);
-      process.stdout.write('  Sessions are automatically available in the Recent list.\n\n');
-    }
-    await ask('  Press Enter to continue...');
-    return { next: 'settings' };
+    return { next: 'import-picker' };
   }
 
   if (choice === 'd') {
@@ -2439,45 +2696,216 @@ async function sessionDetailScreen(rl, ask, ctx = {}) {
 // ─── Screen: sessionsScreen ───────────────────────────────────────────────────
 
 const CATEGORIES = ['security', 'ui', 'refactor', 'bugfix', 'testing', 'devops', 'planning'];
+const STALE_DAYS = 7;
 
+/**
+ * Return a compact status badge string for a session row (plain text, no ANSI).
+ */
+function sessionBadge(sess) {
+  if (sess.isActive) return '[active]';
+  const ageMs = sess.lastActive ? Date.now() - new Date(sess.lastActive).getTime() : 0;
+  if (ageMs >= STALE_DAYS * 86400000) return '[stale]';
+  if (sess.tool === 'codex') return '[dt]';
+  return '';
+}
+
+/**
+ * Interactive full session list with arrow-key navigation.
+ * Enter = resume, x = archive, r = rename, q/Esc = back to dashboard.
+ */
 async function sessionsScreen(rl, ask) {
   const cwd = process.cwd();
-  const sessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 9);
 
-  console.log('');
-  console.log(separator('Session Manager'));
-  console.log('');
+  // Load all active sessions (no slice limit)
+  let sessions = enrichSessions(importReplitSessions(cwd), cwd);
+
+  // ── Box geometry ────────────────────────────────────────────────────────────
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 52);
+  const W     = boxW - 4;
+
+  const top = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot = `└${'─'.repeat(boxW - 2)}┘`;
 
   if (sessions.length === 0) {
-    console.log('  No sessions found.\n');
-    console.log('  [b] Back\n');
-    const choice = (await ask('  Choice: ')).trim().toLowerCase();
-    if (choice === 'b' || choice === 'back') return { next: 'main' };
-    return { next: 'sessions' };
+    process.stdout.write('\n' + top + '\n');
+    process.stdout.write(makeBoxRow('Sessions', W) + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(makeBoxRow('No sessions found.', W) + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(makeBoxRow('q Back', W) + '\n');
+    process.stdout.write(bot + '\n\n');
+    await ask('  Press Enter to continue...');
+    return { next: 'main' };
   }
 
-  sessions.forEach((sess, i) => {
-    const pin    = sess.pinned ? '📌 ' : '   ';
-    const active = sess.isActive ? ' ●' : '';
-    const cat    = sess.category ? `  [${sess.category}]` : '';
-    console.log(`  [${i + 1}] ${pin}${sess.age.padEnd(6)}  ${sess.name}${active}${cat}`);
+  /**
+   * Format one session row.
+   * Right side: badge(9) + age(4) + space + count(4) = 18 chars total.
+   */
+  function formatRow(sess, selected) {
+    const arrow    = selected ? '▸ ' : '  ';
+    const badge    = sessionBadge(sess);
+    const badgeStr = badge ? badge.padEnd(9) : '         ';
+    const age      = (sess.age || '').replace(/ ago$/, '').padStart(4);
+    const count    = `(${sess.promptCount ?? 0})`.padStart(4);
+    const right    = `${badgeStr}${age} ${count}`;
+    const nameMax  = W - 2 - right.length;
+    let name       = sess.name || sess.id.slice(0, 8);
+    if (name.length > nameMax) name = name.slice(0, nameMax - 3) + '...';
+    else name = name.padEnd(nameMax);
+    return makeBoxRow(`${arrow}${name}${right}`, W);
+  }
+
+  let cursor = 0;
+
+  function render() {
+    process.stdout.write('\x1b[2J\x1b[H');
+    process.stdout.write(top + '\n');
+    process.stdout.write(makeBoxRow('Sessions', W) + '\n');
+    process.stdout.write(sep + '\n');
+    for (let i = 0; i < sessions.length; i++) {
+      process.stdout.write(formatRow(sessions[i], i === cursor) + '\n');
+    }
+    process.stdout.write(sep + '\n');
+    process.stdout.write(makeBoxRow('↑↓ Navigate  Enter Resume  x Archive  r Rename', W) + '\n');
+    process.stdout.write(makeBoxRow('q Back', W) + '\n');
+    process.stdout.write(bot + '\n');
+  }
+
+  render();
+
+  const readline = await import('node:readline');
+  readline.emitKeypressEvents(process.stdin, rl);
+
+  const result = await new Promise((resolve) => {
+    const wasRaw = process.stdin.isRaw;
+    const canRaw = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+    if (canRaw) process.stdin.setRawMode(true);
+
+    const cleanup = () => {
+      process.stdin.removeListener('keypress', onKey);
+      if (canRaw) {
+        try { process.stdin.setRawMode(wasRaw || false); } catch {}
+      }
+    };
+
+    const onKey = async (str, key) => {
+      if (!key) return;
+      const kname = key.name || '';
+
+      // Ctrl-C / Ctrl-D → exit
+      if (key.ctrl && (kname === 'c' || kname === 'd')) {
+        cleanup();
+        process.stdout.write('\n');
+        resolve({ next: 'main' });
+        return;
+      }
+
+      // q / Escape → back
+      if (kname === 'q' || kname === 'escape' || str === 'q') {
+        cleanup();
+        process.stdout.write('\n');
+        resolve({ next: 'main' });
+        return;
+      }
+
+      // Arrow up
+      if (kname === 'up') {
+        cursor = Math.max(0, cursor - 1);
+        render();
+        return;
+      }
+
+      // Arrow down
+      if (kname === 'down') {
+        cursor = Math.min(sessions.length - 1, cursor + 1);
+        render();
+        return;
+      }
+
+      // Enter → resume highlighted session
+      if (kname === 'return' || kname === 'enter') {
+        const sess = sessions[cursor];
+        cleanup();
+        process.stdout.write('\n');
+        process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
+        const { spawnSync } = await import('node:child_process');
+        spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+        saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
+        resolve({ next: 'main' });
+        return;
+      }
+
+      // x → archive highlighted session (non-destructive)
+      if (str === 'x' || str === 'X') {
+        const sess = sessions[cursor];
+        archiveSession(sess.id, cwd);
+        sessions = sessions.filter(s => s.id !== sess.id);
+        if (sessions.length === 0) {
+          cleanup();
+          process.stdout.write('\n');
+          resolve({ next: 'main' });
+          return;
+        }
+        cursor = Math.min(cursor, sessions.length - 1);
+        render();
+        return;
+      }
+
+      // r → rename highlighted session
+      if (str === 'r' || str === 'R') {
+        const sess = sessions[cursor];
+        cleanup();
+
+        // Briefly collect a line of text
+        process.stdout.write('\n  New name: ');
+        const newName = await new Promise(res2 => {
+          let buf = '';
+          const onData = (chunk) => {
+            const s = chunk.toString();
+            for (const ch of s) {
+              if (ch === '\n' || ch === '\r') {
+                process.stdin.removeListener('data', onData);
+                process.stdout.write('\n');
+                res2(buf.trim());
+                return;
+              }
+              if (ch === '\x7f' || ch === '\b') {
+                if (buf.length > 0) {
+                  buf = buf.slice(0, -1);
+                  process.stdout.write('\b \b');
+                }
+              } else {
+                buf += ch;
+                process.stdout.write(ch);
+              }
+            }
+          };
+          process.stdin.on('data', onData);
+        });
+
+        if (newName) {
+          renameSession(sess.id, newName, cwd);
+          sessions[cursor] = { ...sess, name: newName };
+        }
+
+        // Re-enable raw mode and re-attach listener
+        if (canRaw) {
+          try { process.stdin.setRawMode(true); } catch {}
+        }
+        readline.emitKeypressEvents(process.stdin, rl);
+        process.stdin.on('keypress', onKey);
+        render();
+        return;
+      }
+    };
+
+    process.stdin.on('keypress', onKey);
   });
 
-  console.log('');
-  console.log('  [1-9] Select a session to manage');
-  console.log('  [b] Back');
-  console.log('');
-
-  const choice = (await ask('  Choice: ')).trim().toLowerCase();
-
-  if (choice === 'b' || choice === 'back') return { next: 'main' };
-
-  const numChoice = parseInt(choice, 10);
-  if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= sessions.length) {
-    return { next: 'session-manage', session: sessions[numChoice - 1] };
-  }
-
-  return { next: 'sessions' };
+  return result;
 }
 
 async function sessionManageScreen(rl, ask, ctx = {}) {
@@ -2568,6 +2996,7 @@ const SCREENS = {
   main:             mainScreen,
   'new-session':    newSessionScreen,
   settings:         settingsScreen,
+  'import-picker':  importPickerScreen,
   subscriptions:    subscriptionsScreen,
   dashboard:        dashboardScreen,
   auth:             authScreen,
