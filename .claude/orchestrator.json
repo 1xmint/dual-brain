@@ -29,26 +29,26 @@
     "openai": {
       "plan": "$100",
       "models": {
-        "gpt-5.5": {
+        "o3": {
           "tier": "think",
-          "input_per_mtok": 5,
-          "output_per_mtok": 30,
-          "context_window": 1000000,
-          "max_output": 128000
+          "input_per_mtok": 10,
+          "output_per_mtok": 40,
+          "context_window": 200000,
+          "max_output": 100000
         },
-        "gpt-5.4": {
+        "gpt-4o": {
           "tier": "execute",
           "input_per_mtok": 2.5,
-          "output_per_mtok": 15,
-          "context_window": 1000000,
-          "max_output": 128000
+          "output_per_mtok": 10,
+          "context_window": 128000,
+          "max_output": 16384
         },
-        "gpt-4.1-mini": {
+        "gpt-4o-mini": {
           "tier": "search",
-          "input_per_mtok": 0.4,
-          "output_per_mtok": 1.6,
-          "context_window": 1047576,
-          "max_output": 32768
+          "input_per_mtok": 0.15,
+          "output_per_mtok": 0.6,
+          "context_window": 128000,
+          "max_output": 16384
         }
       }
     }
@@ -99,43 +99,45 @@
       "best_for": "file lookups, grep, explore, read-only research, listing files",
       "avoid_for": "any task requiring edits, reasoning, or judgment"
     },
-    "gpt-5.5": {
-      "model_id": "gpt-5.5",
+    "o3": {
+      "model_id": "o3",
       "strengths": [
         "complex reasoning",
-        "fast interactive responses",
         "strong code review",
-        "independent perspective from Claude"
+        "independent perspective from Claude",
+        "superior problem solving"
       ],
       "weaknesses": [
+        "higher cost and latency",
         "different failure modes than Claude — feature not bug for dual-brain"
       ],
       "best_for": "independent code review (dual-brain), second opinions on architecture",
       "codex_compatible": true
     },
-    "gpt-5.4": {
-      "model_id": "gpt-5.4",
+    "gpt-4o": {
+      "model_id": "gpt-4o",
       "strengths": [
         "good speed/cost ratio",
-        "1M context",
-        "strong instruction following"
+        "128k context",
+        "strong instruction following",
+        "multimodal"
       ],
       "weaknesses": [
-        "less capable reasoning than gpt-5.5"
+        "less capable reasoning than o3"
       ],
       "best_for": "implementation and execution tasks via Codex",
       "codex_compatible": true
     },
-    "gpt-4.1-mini": {
-      "model_id": "gpt-4.1-mini",
+    "gpt-4o-mini": {
+      "model_id": "gpt-4o-mini",
       "strengths": [
         "extremely cheap",
         "good instruction following",
-        "1M context"
+        "128k context"
       ],
       "weaknesses": [
-        "32k max output",
-        "no reasoning chain"
+        "weaker reasoning",
+        "no extended thinking"
       ],
       "best_for": "cheap search/lookup tasks via Codex",
       "codex_compatible": true
@@ -296,9 +298,9 @@
       "subscription": "pro",
       "codex_command": "codex",
       "models": {
-        "think": "gpt-5.5",
-        "execute": "gpt-5.4",
-        "search": "gpt-4.1-mini"
+        "think": "o3",
+        "execute": "gpt-4o",
+        "search": "gpt-4o-mini"
       },
       "rolling_window_hours": 5,
       "pressure_thresholds": {

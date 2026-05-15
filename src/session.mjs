@@ -228,6 +228,7 @@ function isRealPrompt(text) {
   if (/^[✅❌📦🔗⚠️🚀🎉🔧📝]/.test(t)) return false;
   if (/Claude (history|binary|versions) symlink/.test(t)) return false;
   if (t.startsWith('# AGENTS.md')) return false;
+  if (t === 'login' || t === 'logout') return false;
   if (t.startsWith('/')) return false;
   if (t.startsWith('[Pasted')) return false;
   return true;
@@ -462,8 +463,8 @@ export function importReplitSessions(cwd = process.cwd()) {
 
   // Build session list
   for (const [id, sess] of bySession) {
-    // Skip sessions outside the recency window (timestamps are in seconds)
-    if (sess.lastTimestamp * 1000 < cutoff) continue;
+    // Skip sessions outside the recency window (timestamps are in ms)
+    if (sess.lastTimestamp < cutoff) continue;
     // Derive display name
     let name = sess.firstPrompt;
     if (!name) {
@@ -802,7 +803,8 @@ export function buildSessionIndex(cwd = process.cwd()) {
 
             // Track timestamps
             if (entry.timestamp) {
-              const ts = typeof entry.timestamp === 'number' ? entry.timestamp : Date.parse(entry.timestamp) / 1000;
+              const raw = typeof entry.timestamp === 'number' ? entry.timestamp : Date.parse(entry.timestamp);
+              const ts = raw > 1e12 ? raw / 1000 : raw;
               if (ts > lastTimestamp) lastTimestamp = ts;
             }
 

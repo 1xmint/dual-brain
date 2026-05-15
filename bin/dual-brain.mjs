@@ -391,27 +391,6 @@ async function cmdGo(args) {
     }, cwd);
   } else {
     result = await dispatch({ decision, prompt, files, cwd });
-    if (result.status === 'completed' && result.type === 'native-agent') {
-      const nd = result.nativeDispatch || {};
-      const promptPreview = (nd.prompt || prompt).slice(0, 100);
-      const promptSuffix  = (nd.prompt || prompt).length > 100 ? '...' : '';
-      console.log(`\nRouted: ${decision.provider}/${nd.model || decision.model} (${decision.tier})`);
-      console.log('To dispatch, use the Agent tool with:');
-      console.log(`  model: ${nd.model || decision.model}`);
-      console.log(`  prompt: ${promptPreview}${promptSuffix}`);
-      if (nd.isolation)  console.log(`  isolation: ${nd.isolation}`);
-      if (nd.maxTurns)   console.log(`  maxTurns: ${nd.maxTurns}`);
-      saveSession({
-        objective:    prompt,
-        branch:       null,
-        filesChanged: files,
-        commandsRun:  [`dual-brain go "${prompt}"`],
-        lastResult:   { status: 'success', summary: `native-agent routed to ${nd.model || decision.model}` },
-        provider:     decision.provider,
-        nextAction:   null,
-      }, cwd);
-      return;
-    }
     const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
     console.log(`\n${statusLine} in ${(result.durationMs / 1000).toFixed(1)}s`);
     if (result.summary) console.log(result.summary);

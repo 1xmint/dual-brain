@@ -520,9 +520,9 @@ function isSoloBrain(profile) {
 function getHeadModel(profile) {
   const providers = getAvailableProviders(profile);
   if (providers.length === 0) return 'sonnet';
-  if (providers.length === 1) return providers[0].name === 'openai' ? 'gpt-5.4' : 'sonnet';
+  if (providers.length === 1) return providers[0].name === 'openai' ? 'gpt-4o' : 'sonnet';
   const top = providers.reduce((a, b) => (b.rank > a.rank ? b : a));
-  return top.name === 'openai' ? 'gpt-5.4' : 'sonnet';
+  return top.name === 'openai' ? 'gpt-4o' : 'sonnet';
 }
 
 // ---------------------------------------------------------------------------

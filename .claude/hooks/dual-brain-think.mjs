@@ -20,7 +20,7 @@
  */
 
 import { spawnSync } from 'child_process';
-import { appendFileSync } from 'fs';
+import { appendFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { redact } from '../../src/redact.mjs';
@@ -193,7 +193,9 @@ function runGptAnalysis(codexBin, prompt) {
 // ---------------------------------------------------------------------------
 
 function logUsage({ durationMs, usage, success }) {
-  const logFile = join(__dirname, `usage-${new Date().toISOString().slice(0, 10)}.jsonl`);
+  const usageDir = join(__dirname, '..', '..', '.dualbrain', 'usage');
+  mkdirSync(usageDir, { recursive: true });
+  const logFile = join(usageDir, `usage-${new Date().toISOString().slice(0, 10)}.jsonl`);
   const entry = JSON.stringify({
     schema_version: 2,
     timestamp: new Date().toISOString(),

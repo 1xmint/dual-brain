@@ -18,7 +18,7 @@ import { redact } from './redact.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
 const TIER_TIMEOUT_MS = { search: 60_000, execute: 120_000, think: 180_000 };
-const CLAUDE_MODEL_IDS = { opus: 'claude-opus-4-5', sonnet: 'claude-sonnet-4-5', haiku: 'claude-haiku-4-5' };
+const CLAUDE_MODEL_IDS = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
 
 // ─── Median dispatch time tracker (in-process, for slow-response detection) ──
 // Rolling window of recent dispatch durations keyed by "provider:modelClass"
@@ -272,7 +272,7 @@ async function detectRuntime() {
 /** Valid CLI model flags per provider */
 const VALID_MODELS = {
   claude: ['opus', 'sonnet', 'haiku'],
-  openai: ['o4-mini', 'o3', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-5.2', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-5.5'],
+  openai: ['o4-mini', 'o3', 'o1', 'o1-mini', 'gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4-turbo'],
 };
 
 /** Safest default model for a given provider + tier */
@@ -507,14 +507,15 @@ function compressResult(rawOutput = '', maxLength = 300) {
 }
 
 // ─── Core runner ──────────────────────────────────────────────────────────────
-function runProcess(cmd, cwd, timeoutMs) {
+function runProcess(cmd, cwd, timeoutMs, env) {
   return new Promise((resolve) => {
     const [bin, ...args] = cmd;
     const start = Date.now();
     let stdout = '';
     let stderr = '';
 
-    const proc = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const spawnEnv = env ? { ...process.env, ...env } : undefined;
+    const proc = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) });
 
     proc.stdout.on('data', (d) => { stdout += d; });
     proc.stderr.on('data', (d) => { stderr += d; });
@@ -633,31 +634,91 @@ async function dispatch(input = {}) {
   }
 
   // ── Native Claude Code dispatch ──────────────────────────────────────────────
-  // When running inside Claude Code AND the provider is claude, return a
-  // structured native-agent descriptor instead of spawning a subprocess.
-  // The caller (CLI or plugin) is responsible for actually invoking the Agent tool.
+  // When running inside Claude Code AND the provider is claude, execute via the
+  // claude CLI directly (foreground subprocess) so results are captured and returned.
+  // DUAL_BRAIN_DISPATCH=1 is set so the enforce-tier hook allows this agent call.
   if (isInsideClaude() && effectiveProvider === 'claude') {
     const nativeDescriptor = buildNativeDispatch(
       effectiveDecision,
       prompt,
       { worktree: input.worktree, maxTurns: input.maxTurns },
     );
+
+    const command = buildCommand(effectiveDecision, prompt, files, cwd);
+
     if (dryRun) {
-      return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, command: null, nativeDispatch: nativeDescriptor, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
+      return {
+        status:        'dry-run',
+        provider:      effectiveProvider,
+        model:         effectiveModel,
+        command,
+        nativeDispatch: nativeDescriptor,
+        exitCode:      null,
+        summary:       null,
+        durationMs:    0,
+        usage:         null,
+        error:         null,
+      };
     }
+
     _recordDispatchBudget(prompt);
+
+    const dispatchEnv = { DUAL_BRAIN_DISPATCH: '1' };
+    const { exitCode, stdout, stderr, durationMs } = await runProcess(command, cwd, timeoutMs, dispatchEnv);
+
+    // Extract token usage from JSON output if available
+    let usage = null;
+    try {
+      const parsed = JSON.parse(stdout);
+      if (parsed?.usage) {
+        usage = { inputTokens: parsed.usage.input_tokens ?? 0, outputTokens: parsed.usage.output_tokens ?? 0 };
+      }
+    } catch {}
+
+    const success = exitCode === 0;
+    const errorText = (stderr || stdout).slice(0, 500);
+    const summary = success ? compressResult(stdout) : compressResult(stderr || stdout);
+
+    // ── Health tracking ────────────────────────────────────────────────────
+    if (success) {
+      recordDuration(effectiveProvider, effectiveModel, durationMs);
+      const median = medianDuration(effectiveProvider, effectiveModel);
+      if (median !== null && durationMs > median * 3) {
+        markDegraded(effectiveProvider, effectiveModel, cwd);
+      } else {
+        markHealthy(effectiveProvider, effectiveModel, cwd);
+      }
+      const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+      recordDispatch(effectiveProvider, effectiveModel, totalTokens, cwd);
+    } else {
+      if (RATE_LIMIT_PATTERNS.test(errorText)) {
+        markHot(effectiveProvider, effectiveModel, cwd);
+      }
+    }
+    // ── End health tracking ────────────────────────────────────────────────
+
+    recordUsage({
+      provider: effectiveProvider,
+      model:    effectiveModel,
+      tier,
+      durationMs,
+      inputTokens:  usage?.inputTokens  ?? null,
+      outputTokens: usage?.outputTokens ?? null,
+      success,
+    });
+
     return {
-      status:        'completed',
+      status:        success ? 'completed' : 'failed',
       type:          'native-agent',
       provider:      effectiveProvider,
       model:         effectiveModel,
-      command:       null,
+      command,
       nativeDispatch: nativeDescriptor,
-      exitCode:      0,
-      summary:       `Routed to ${effectiveProvider}/${effectiveModel} (${effectiveDecision.tier})`,
-      durationMs:    0,
-      usage:         null,
-      error:         null,
+      exitCode,
+      summary,
+      durationMs,
+      usage,
+      error: success ? null : errorText.slice(0, 200),
     };
   }
 
@@ -743,7 +804,7 @@ async function dispatchDualBrain(input = {}) {
   const tier = decision.tier ?? 'execute';
 
   const claudeDecision = { ...decision, provider: 'claude', model: decision.model ?? 'sonnet', tier };
-  const _oaiDefault = tier === 'think' ? 'gpt-5.5' : tier === 'search' ? 'o4-mini' : 'gpt-5.4';
+  const _oaiDefault = tier === 'think' ? 'o3' : tier === 'search' ? 'gpt-4o-mini' : 'gpt-4o';
   const openaiDecision = { ...decision, provider: 'openai', model: decision.openaiModel ?? _oaiDefault, tier };
 
   const validatedClaude = validateDispatch(claudeDecision, rt);

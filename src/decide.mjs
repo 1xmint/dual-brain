@@ -71,49 +71,31 @@ const MODEL_CAPABILITIES = {
     effortLevels: ['low', 'medium', 'high'],
     costTier: 'medium',
   },
-  'gpt-5.2': {
+  'gpt-4o': {
     provider: 'openai',
-    tierFit: ['search', 'execute'],
-    contextWindow: 200_000,
+    tierFit: ['execute', 'think'],
+    contextWindow: 128_000,
+    strengths: ['refactor', 'debug', 'code-generation', 'test', 'multimodal'],
+    weaknesses: ['cost vs mini'],
+    effortLevels: ['low', 'medium', 'high'],
     costTier: 'medium',
-    strengths: ['code-generation', 'analysis'],
-    weaknesses: [],
-    effortLevels: null,
   },
-  'gpt-5.4-mini': {
+  'gpt-4o-mini': {
     provider: 'openai',
     tierFit: ['search'],
-    contextWindow: 200_000,
-    costTier: 'low',
-    strengths: ['quick-tasks', 'search'],
+    contextWindow: 128_000,
+    costTier: 'cheap',
+    strengths: ['quick-tasks', 'search', 'classification'],
     weaknesses: ['complex-edits', 'architecture'],
     effortLevels: null,
   },
-  'gpt-5.3-codex': {
-    provider: 'openai',
-    tierFit: ['execute'],
-    contextWindow: 200_000,
-    costTier: 'medium',
-    strengths: ['code-generation', 'refactoring'],
-    weaknesses: ['architecture', 'security'],
-    effortLevels: null,
-  },
-  'gpt-5.4': {
-    provider: 'openai',
-    tierFit: ['execute', 'think'],
-    contextWindow: 1_050_000,
-    strengths: ['refactor', 'debug', 'code-generation', 'test'],
-    weaknesses: ['cost'],
-    effortLevels: ['low', 'medium', 'high', 'xhigh'],
-    costTier: 'medium',
-  },
-  'gpt-5.5': {
+  'o3': {
     provider: 'openai',
     tierFit: ['think'],
-    contextWindow: 1_000_000,
-    strengths: ['architecture', 'security', 'review', 'planning', 'complex-debug'],
+    contextWindow: 200_000,
+    strengths: ['architecture', 'security', 'review', 'planning', 'complex-debug', 'deep-reasoning'],
     weaknesses: ['cost', 'latency'],
-    effortLevels: ['low', 'medium', 'high', 'xhigh'],
+    effortLevels: ['low', 'medium', 'high'],
     costTier: 'expensive',
   },
 };
@@ -127,9 +109,9 @@ const CLAUDE_MODELS_BY_PLAN = {
 };
 
 const OPENAI_MODELS_BY_PLAN = {
-  '$20':  ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini'],
-  '$100': ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'],
-  '$200': ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'],
+  '$20':  ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o'],
+  '$100': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'],
+  '$200': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'],
 };
 
 // Token fallback estimates per tier (no real usage data)
@@ -188,9 +170,9 @@ function getHealthScores(tier, cwd) {
   const claudeClass = tier === 'search' ? 'haiku'
     : tier === 'think' ? 'opus'
     : 'sonnet';
-  const openaiClass = tier === 'search' ? 'gpt-4.1-mini'
-    : tier === 'think' ? 'gpt-5.5'
-    : 'gpt-5.4';
+  const openaiClass = tier === 'search' ? 'gpt-4o-mini'
+    : tier === 'think' ? 'o3'
+    : 'gpt-4o';
 
   // Trigger cooldown expiry check (transitions hot→probing automatically)
   checkCooldown('claude', claudeClass, cwd);
@@ -208,26 +190,35 @@ function getHealthScores(tier, cwd) {
  * Return true if both providers should analyze this task.
  * Requires: (critical risk OR architecture/security intent OR complex+high-risk)
  * AND profile has both providers available with dual mode enabled.
- * @param {{ intent?: string, risk?: string, complexity?: string }} detection
+ *
+ * designImpact bypasses the hasBothProviders check — it is a mandatory review
+ * gate, not optional collaboration. When only one provider is available the
+ * caller should check degradedDualBrain on the decision output.
+ * @param {{ intent?: string, risk?: string, complexity?: string, designImpact?: boolean }} detection
  * @param {object} profile
  * @returns {boolean}
  */
 export function shouldDualBrain(detection, profile) {
   const { intent = '', risk = 'low', complexity = 'simple', designImpact = false } = detection;
   const dualEnabled = profile?.dual_brain_enabled !== false;
+  if (!dualEnabled) return false;
+
   const hasBothProviders = !!(
     profile?.providers?.claude?.enabled &&
     profile?.providers?.claude?.plan &&
     profile?.providers?.openai?.enabled &&
     profile?.providers?.openai?.plan
   );
-  if (!dualEnabled || !hasBothProviders) return false;
 
-  const criticalRisk      = risk === 'critical';
-  const archOrSecurity    = ['architecture', 'security'].includes(intent);
-  const complexHighRisk   = complexity === 'complex' && risk === 'high';
+  if (designImpact) return true;
 
-  return criticalRisk || archOrSecurity || complexHighRisk || designImpact;
+  if (!hasBothProviders) return false;
+
+  const criticalRisk    = risk === 'critical';
+  const archOrSecurity  = ['architecture', 'security'].includes(intent);
+  const complexHighRisk = complexity === 'complex' && risk === 'high';
+
+  return criticalRisk || archOrSecurity || complexHighRisk;
 }
 
 // ─── Internal: select model for provider ─────────────────────────────────────
@@ -251,18 +242,18 @@ function pickOpenAIModel(detection, available) {
   const needsMini   = SEARCH_INTENTS.includes(intent) && effort === 'low';
   const needsCodex  = ['refactor', 'debug'].includes(intent) && complexity !== 'trivial';
 
-  const pref = needsTop    ? 'gpt-5.5'
-             : needsMini   ? 'gpt-4.1-mini'
-             : needsCodex  ? 'gpt-5.3-codex'
-             : 'gpt-5.4';
+  const pref = needsTop    ? 'o3'
+             : needsMini   ? 'gpt-4o-mini'
+             : needsCodex  ? 'gpt-4o'
+             : 'gpt-4o';
 
   // Walk down rank until we find an available model
-  const rank = ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'];
+  const rank = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
   const idx = rank.indexOf(pref);
   for (let i = idx; i >= 0; i--) {
     if (available.includes(rank[i])) return rank[i];
   }
-  return available[0] ?? 'gpt-4.1-mini';
+  return available[0] ?? 'gpt-4o-mini';
 }
 
 function applyHealthDowngrade(model, score, provider, available, isHighStakes) {
@@ -280,14 +271,14 @@ function applyHealthDowngrade(model, score, provider, available, isHighStakes) {
     }
     return available[0] ?? 'haiku';
   } else {
-    const oaiRank = ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'];
+    const oaiRank = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
     const idx = oaiRank.indexOf(model);
     const steps = score === 0 ? 2 : 1;
     const downIdx = Math.max(0, idx - steps);
     for (let i = downIdx; i <= idx; i++) {
       if (available.includes(oaiRank[i])) return oaiRank[i];
     }
-    return available[0] ?? 'gpt-4.1-mini';
+    return available[0] ?? 'gpt-4o-mini';
   }
 }
 
@@ -297,7 +288,7 @@ function applyProfileBias(model, profile, provider, available, tier) {
     // Prefer cheapest available that also fits the required tier
     const ranks = {
       claude: ['haiku', 'sonnet', 'opus'],
-      openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'],
+      openai: ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'],
     };
     for (const m of ranks[provider]) {
       if (!available.includes(m)) continue;
@@ -310,7 +301,7 @@ function applyProfileBias(model, profile, provider, available, tier) {
     // Prefer best available, keep current if already best
     const ranks = {
       claude: ['opus', 'sonnet', 'haiku'],
-      openai: ['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.2', 'gpt-4.1', 'gpt-4.1-mini'],
+      openai: ['o3', 'o4-mini', 'gpt-4o', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o-mini'],
     };
     for (const m of ranks[provider]) {
       if (available.includes(m)) return m;
@@ -341,7 +332,7 @@ function pickEffort(model, detection) {
 function pickModes(model, detection) {
   const { intent = '', complexity = 'simple' } = detection;
   const caps = MODEL_CAPABILITIES[model] ?? {};
-  const thinkingModels = ['sonnet', 'opus', 'gpt-5.5', 'gpt-5.4'];
+  const thinkingModels = ['sonnet', 'opus', 'o3', 'gpt-4o'];
   const lightIntents   = ['search', 'format', 'explain', 'lookup'];
 
   return {
@@ -350,7 +341,7 @@ function pickModes(model, detection) {
       && !lightIntents.includes(intent),
     fastMode:         model === 'opus',
     extendedContext:  ['sonnet', 'opus'].includes(model),
-    webSearch:        ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.4-mini'].includes(model),
+    webSearch:        ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o'].includes(model),
   };
 }
 
@@ -583,12 +574,21 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
   const modes   = pickModes(model, detection);
   const sandbox = pickSandbox(model, detection);
 
+  const hasBothProviders = !!(
+    profile?.providers?.claude?.enabled &&
+    profile?.providers?.claude?.plan &&
+    profile?.providers?.openai?.enabled &&
+    profile?.providers?.openai?.plan
+  );
+  const degradedDualBrain = !!(dual && detection.designImpact && !hasBothProviders);
+
   const decision = {
     provider,
     model,
     effort,
     tier,
     dualBrain: dual,
+    ...(degradedDualBrain && { degradedDualBrain: true }),
     modes,
     sandbox,
     explanation: '',

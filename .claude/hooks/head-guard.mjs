@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// head-guard.mjs — Blocks HEAD from using mutation tools.
+// head-guard.mjs — Strict default-deny enforcement for HEAD session.
 // Reads Claude Code hook stdin JSON protocol (PreToolUse event).
 //
 // Protocol (Claude Code sends this on stdin):
@@ -12,10 +12,29 @@
 //
 // Key insight: `agent_id` is present when the hook fires inside a spawned
 // subagent (work agent). If absent we are in the HEAD session.
+//
+// HEAD is default-deny. Allowed:
+//   - Agent tool (dispatching is HEAD's primary job)
+//   - Bash: only hook scripts, dual-brain CLI, budget-balancer, metadata git, release npm
+//   - Everything else: DENY
 
 import { readFileSync } from 'fs';
 
-const BLOCKED_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash']);
+// Break-glass: if set, allow everything with a warning
+const BREAK_GLASS = process.env.DUAL_BRAIN_BREAK_GLASS === '1';
+
+// Bash commands that HEAD is permitted to run (checked in order, first match wins)
+const BASH_ALLOWLIST = [
+  // Hook scripts
+  /^node\s+\.claude\/hooks\//,
+  // dual-brain CLI
+  /^dual-brain(\s|$)/,
+  // git metadata only (not git diff with full content)
+  /^git\s+status(\s|$)/,
+  /^git\s+log\s+--oneline(\s|$)/,
+  // npm release ops
+  /^npm\s+(version|publish)(\s|$)/,
+];
 
 // Read stdin JSON payload
 let input;
@@ -36,8 +55,54 @@ if (input.agent_id) {
   process.exit(0);
 }
 
-// HEAD session: block direct mutation tools
-if (BLOCKED_TOOLS.has(toolName)) {
+// Break-glass: allow everything but warn loudly to stderr
+if (BREAK_GLASS) {
+  process.stderr.write(
+    `[dual-brain] ⚠️  BREAK-GLASS MODE ACTIVE — HEAD restrictions bypassed for tool: ${toolName}\n`
+  );
+  process.exit(0);
+}
+
+// ── Agent tool: always allow (dispatching is HEAD's primary job) ────────────
+if (toolName === 'Agent') {
+  process.exit(0);
+}
+
+// ── Bash tool: allowlist-only ───────────────────────────────────────────────
+if (toolName === 'Bash') {
+  const cmd = (input.tool_input?.command || '').trim();
+  const allowed = BASH_ALLOWLIST.some((pattern) => pattern.test(cmd));
+  if (allowed) {
+    process.exit(0);
+  }
+  const output = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason:
+        '[dual-brain] HEAD cannot run arbitrary commands. Dispatch a work agent instead.',
+    },
+  };
+  process.stdout.write(JSON.stringify(output));
+  process.exit(2);
+}
+
+// ── Read tool: deny ─────────────────────────────────────────────────────────
+if (toolName === 'Read') {
+  const output = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason:
+        '[dual-brain] HEAD cannot read files directly. Dispatch an Explore agent for investigation.',
+    },
+  };
+  process.stdout.write(JSON.stringify(output));
+  process.exit(2);
+}
+
+// ── Edit / Write / NotebookEdit: deny (existing behaviour preserved) ────────
+if (['Edit', 'Write', 'NotebookEdit'].includes(toolName)) {
   const output = {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -50,8 +115,7 @@ if (BLOCKED_TOOLS.has(toolName)) {
   process.exit(2);
 }
 
-// Also block MCP filesystem write tools (any mcp__ tool with write/create/
-// delete/remove/move/rename in the name).
+// ── MCP filesystem write tools: deny (existing behaviour preserved) ─────────
 if (toolName.startsWith('mcp__') && /write|create|delete|remove|move|rename/i.test(toolName)) {
   const output = {
     hookSpecificOutput: {
@@ -65,5 +129,5 @@ if (toolName.startsWith('mcp__') && /write|create|delete|remove|move|rename/i.te
   process.exit(2);
 }
 
-// Allow everything else (Read, Agent handled by enforce-tier, etc.)
+// Allow everything else (e.g. ToolSearch, WebSearch, other MCP read tools)
 process.exit(0);

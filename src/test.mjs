@@ -235,14 +235,14 @@ describe('profile', () => {
     assert.equal(getHeadModel(profile), 'sonnet');
   });
 
-  it('getHeadModel returns gpt-5.4 for solo-openai', () => {
+  it('getHeadModel returns gpt-4o for solo-openai', () => {
     const profile = {
       providers: {
         claude: { plan: '$20', enabled: false },
         openai: { plan: '$20', enabled: true },
       },
     };
-    assert.equal(getHeadModel(profile), 'gpt-5.4');
+    assert.equal(getHeadModel(profile), 'gpt-4o');
   });
 
   it('getHeadModel returns sonnet for dual profile (claude is default highest when ranks tie)', () => {
@@ -254,18 +254,18 @@ describe('profile', () => {
       },
     };
     const model = getHeadModel(profile);
-    // sonnet (claude wins tie) or gpt-5.4 (openai) — both are valid depending on iteration order
-    assert.ok(['sonnet', 'gpt-5.4'].includes(model), `Unexpected model: ${model}`);
+    // sonnet (claude wins tie) or gpt-4o (openai) — both are valid depending on iteration order
+    assert.ok(['sonnet', 'gpt-4o'].includes(model), `Unexpected model: ${model}`);
   });
 
-  it('getHeadModel returns gpt-5.4 for dual profile when openai has higher plan', () => {
+  it('getHeadModel returns gpt-4o for dual profile when openai has higher plan', () => {
     const profile = {
       providers: {
         claude: { plan: '$20', enabled: true },  // rank 1
         openai: { plan: '$100', enabled: true }, // rank 2
       },
     };
-    assert.equal(getHeadModel(profile), 'gpt-5.4');
+    assert.equal(getHeadModel(profile), 'gpt-4o');
   });
 });
 
@@ -550,7 +550,7 @@ describe('decide', () => {
       assert.ok(claude.includes('opus'), `opus missing from $100 plan: ${claude.join(', ')}`);
     });
 
-    it('$20 openai plan excludes gpt-5.5', () => {
+    it('$20 openai plan excludes o3', () => {
       const profile = {
         providers: {
           claude: { plan: '$20', enabled: false },
@@ -558,10 +558,10 @@ describe('decide', () => {
         },
       };
       const { openai } = getAvailableModels(profile);
-      assert.ok(!openai.includes('gpt-5.5'), `gpt-5.5 found in $20 plan`);
+      assert.ok(!openai.includes('o3'), `o3 found in $20 plan`);
     });
 
-    it('$100 openai plan includes gpt-5.5', () => {
+    it('$100 openai plan includes o3', () => {
       const profile = {
         providers: {
           claude: { plan: '$20', enabled: false },
@@ -569,7 +569,7 @@ describe('decide', () => {
         },
       };
       const { openai } = getAvailableModels(profile);
-      assert.ok(openai.includes('gpt-5.5'), `gpt-5.5 missing from $100 plan`);
+      assert.ok(openai.includes('o3'), `o3 missing from $100 plan`);
     });
   });
 
@@ -754,7 +754,7 @@ describe('preference routing', () => {
       };
       const detection = { intent: 'edit', risk: 'low', complexity: 'simple', effort: 'medium', tier: 'execute' };
       const decision = decideRoute({ profile: profileWithPref, detection });
-      const cheapModels = ['haiku', 'gpt-4.1-mini'];
+      const cheapModels = ['haiku', 'sonnet', 'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1'];
       assert.ok(cheapModels.includes(decision.model), `Expected cheap model, got: ${decision.model}`);
     });
 
@@ -824,10 +824,10 @@ describe('dispatch', () => {
     });
 
     it('openai provider returns codex CLI args', () => {
-      const decision = { provider: 'openai', model: 'gpt-5.4', effort: null, sandbox: 'danger-full-access' };
+      const decision = { provider: 'openai', model: 'gpt-4o', effort: null, sandbox: 'danger-full-access' };
       const cmd = buildCommand(decision, 'fix the bug');
       assert.equal(cmd[0], 'codex');
-      assert.ok(cmd.includes('gpt-5.4'));
+      assert.ok(cmd.includes('gpt-4o'));
       assert.ok(cmd.includes('fix the bug'));
     });
 
@@ -840,7 +840,7 @@ describe('dispatch', () => {
     });
 
     it('buildCommand includes effort flag for openai when set', () => {
-      const decision = { provider: 'openai', model: 'gpt-5.4', effort: 'high', sandbox: 'danger-full-access' };
+      const decision = { provider: 'openai', model: 'gpt-4o', effort: 'high', sandbox: 'danger-full-access' };
       const cmd = buildCommand(decision, 'fix the bug');
       assert.ok(cmd.includes('-c'));
     });
@@ -946,7 +946,7 @@ describe('dispatch safety features', () => {
 
     it('resets invalid claude model to sonnet for execute tier', () => {
       const rt = { claudeAvailable: true, codexAvailable: false };
-      const result = validateDispatch({ provider: 'claude', model: 'gpt-5.5', tier: 'execute' }, rt);
+      const result = validateDispatch({ provider: 'claude', model: 'o3', tier: 'execute' }, rt);
       assert.ok(!result._error);
       assert.equal(result.model, 'sonnet', `Expected sonnet fallback, got: ${result.model}`);
     });
@@ -967,7 +967,7 @@ describe('dispatch safety features', () => {
 
     it('valid openai models pass through unchanged', () => {
       const rt = { claudeAvailable: true, codexAvailable: true };
-      for (const m of ['o4-mini', 'o3', 'gpt-4.1']) {
+      for (const m of ['o4-mini', 'o3', 'gpt-4o', 'gpt-4.1']) {
         const result = validateDispatch({ provider: 'openai', model: m, tier: 'execute' }, rt);
         assert.ok(!result._error, `Unexpected error for model ${m}`);
         assert.equal(result.model, m, `Model changed unexpectedly: ${result.model}`);
