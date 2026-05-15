@@ -193,7 +193,11 @@ export function formatDoctorReport(results) {
     for (const f of foundations.foundations) {
       if (f.status === 'invalidated') {
         const n = (f.stillUsedBy || []).length;
-        out.push(`  ✗ ${f.id} — INVALIDATED, ${n} dependent${n === 1 ? '' : 's'} still using`);
+        if (n === 0) {
+          out.push(`  ℹ ${f.id} — invalidated, no active dependents (resolved)`);
+        } else {
+          out.push(`  ✗ ${f.id} — INVALIDATED, ${n} dependent${n === 1 ? '' : 's'} still using`);
+        }
       } else {
         const n = f.dependents.length;
         out.push(`  ✓ ${f.id} — active, ${n} dependent${n === 1 ? '' : 's'}`);

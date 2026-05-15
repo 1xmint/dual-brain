@@ -499,8 +499,9 @@ async function cmdStatus(args = []) {
         .filter(([k]) => k.startsWith(`${p.name}:`));
       const sess = sessionStats[p.name] ?? { calls: 0, tokens: 0 };
 
+      const planStr = p.plan ? `  plan=${p.plan}` : '';
       if (provStates.length === 0) {
-        console.log(`  ${label}  plan=${p.plan}  status=healthy  calls=${sess.calls}  tokens=${sess.tokens}`);
+        console.log(`  ${label}${planStr}  status=healthy  calls=${sess.calls}  tokens=${sess.tokens}`);
       } else {
         for (const [k, st] of provStates) {
           const modelClass = k.split(':').slice(1).join(':');
@@ -509,7 +510,7 @@ async function cmdStatus(args = []) {
             const remaining = remainingCooldownMinutes(p.name, modelClass, cwd);
             statusStr = remaining > 0 ? `hot (retry in ${remaining}m)` : 'hot (cooling)';
           }
-          console.log(`  ${label}  plan=${p.plan}  model=${modelClass}  status=${statusStr}  calls=${sess.calls}  tokens=${sess.tokens}`);
+          console.log(`  ${label}${planStr}  model=${modelClass}  status=${statusStr}  calls=${sess.calls}  tokens=${sess.tokens}`);
         }
       }
     }
