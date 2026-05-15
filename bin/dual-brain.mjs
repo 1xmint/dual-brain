@@ -362,6 +362,18 @@ async function cmdGo(args) {
       provider:     plan?._decision?.provider ?? 'claude',
       nextAction:   null,
     }, cwd);
+    // ── Next steps suggestions (dual-brain consensus path) ──────────────────
+    try {
+      const { suggestNextSteps, formatNextSteps } = await import('../src/nextstep.mjs');
+      const steps = await suggestNextSteps(
+        { prompt, tier: plan?._decision?.tier ?? 'think', files, trigger: 'go' },
+        { success: true, filesChanged: files, error: null, duration: null },
+        cwd
+      );
+      if (steps?.steps?.length > 0) {
+        console.log('\n' + formatNextSteps(steps.steps, 3));
+      }
+    } catch { /* non-fatal */ }
   } else {
     const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
     console.log(`\n${statusLine}${result.durationMs != null ? ` in ${(result.durationMs / 1000).toFixed(1)}s` : ''}`);
@@ -381,6 +393,28 @@ async function cmdGo(args) {
     }, cwd);
     if (result.status !== 'completed') process.exit(1);
     await offerAutoCommit(cwd);
+    // ── Next steps suggestions ──────────────────────────────────────────────
+    try {
+      const { suggestNextSteps, formatNextSteps } = await import('../src/nextstep.mjs');
+      const steps = await suggestNextSteps(
+        {
+          prompt,
+          tier:  plan?._decision?.tier ?? 'execute',
+          files: result.filesChanged || files,
+          trigger: 'go',
+        },
+        {
+          success:      result.status === 'completed',
+          filesChanged: result.filesChanged || files,
+          error:        result.error,
+          duration:     result.durationMs,
+        },
+        cwd
+      );
+      if (steps?.steps?.length > 0) {
+        console.log('\n' + formatNextSteps(steps.steps, 3));
+      }
+    } catch { /* non-fatal — module may not exist yet */ }
   }
 }
 
@@ -1472,10 +1506,38 @@ async function mainScreen(rl, ask) {
     statusRows.push(row(`\x1b[2m📦 data-tools v${dtVersion}\x1b[0m`));
   }
 
+  // ── Observer observations (top 2, high priority first) ───────────────────
+  let quickObservations = [];
+  try {
+    const observerMod = await import('../src/observer.mjs');
+    const quickState = await observerMod.getQuickState(cwd);
+    if (quickState?.observations?.length > 0) {
+      const PRIO = { high: 0, medium: 1, low: 2 };
+      const sorted = [...quickState.observations].sort(
+        (a, b) => (PRIO[a.priority] ?? 2) - (PRIO[b.priority] ?? 2)
+      );
+      quickObservations = sorted.slice(0, 2);
+      for (const obs of quickObservations) {
+        let prefix;
+        if (obs.priority === 'high')   prefix = '🔴';
+        else if (obs.priority === 'medium') prefix = '🟡';
+        else                                prefix = '\x1b[2m💡\x1b[0m';
+        statusRows.push(row(`${prefix} ${obs.message}`));
+      }
+    }
+  } catch { /* non-fatal — module may not exist yet */ }
+
   // ── Action cards (git state + open PRs) ──────────────────────────────────
   const repoState  = detectRepoState(cwd);
   const openPRs    = await detectOpenPRs(cwd);
   const actionRows = buildActionRows(repoState, row, openPRs);
+
+  // ── High-priority observer action cards ───────────────────────────────────
+  if (quickObservations.some(o => o.priority === 'high')) {
+    const DIM   = '\x1b[2m';
+    const RESET = '\x1b[0m';
+    actionRows.push(row(`${DIM}[r] Security review  [t] Run tests  [c] Commit${RESET}`));
+  }
 
   // ── Related sessions hint (only when no continuation card is showing) ─────
   if (!interrupted && recentSessions.length > 0) {
