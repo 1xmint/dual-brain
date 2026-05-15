@@ -240,9 +240,14 @@ function decodeJwtPayload(token) {
 }
 
 /**
- * Detect actual subscription plans from Claude Code and Codex config files.
+ * Infer plan tier from Claude Code and Codex auth config files.
  * Returns { claude: '$20'|'$100'|'$200'|null, openai: '$20'|'$100'|'$200'|null }.
  * Returns nulls for any provider whose config cannot be read — never throws.
+ *
+ * NOTE: This reads rate-limit tier signals (organizationRateLimitTier for Claude,
+ * chatgpt_plan_type JWT claim for OpenAI) and maps them to price tiers.
+ * It does NOT retrieve the actual subscription plan name from the provider —
+ * labels like "Max x5" or "Pro" are our own interpretations of those signals.
  */
 function detectPlans() {
   const plans = { claude: null, openai: null };
@@ -371,23 +376,19 @@ function loadProfile(cwd) {
   }
   if (!profile) profile = defaultProfile();
 
-  // Auto-detect plans from provider config files and apply if detected.
+  // Read plan tier from auth config files (JWT or organizationRateLimitTier) and
+  // apply if it differs from the stored profile value.
+  // NOTE: detectPlans() reads rate-limit tier data from the auth config — it infers
+  // a price tier ($20/$100/$200) from that signal, not from the subscription name itself.
+  // The plan label (e.g. "Max x5") comes from our own mapping, not from Claude/OpenAI.
   const detected = detectPlans();
   for (const [provider, detectedPlan] of Object.entries(detected)) {
     if (!detectedPlan) continue;
     if (!profile.providers[provider]) continue;
     const stored = profile.providers[provider].plan;
     if (stored !== detectedPlan) {
-      const labels = {
-        claude: {
-          '$20': 'Claude Pro ($20)', '$100': 'Claude Max x5 ($100)', '$200': 'Claude Max x20 ($200)',
-        },
-        openai: {
-          '$20': 'ChatGPT Plus ($20)', '$100': 'ChatGPT Pro ($100)', '$200': 'ChatGPT Pro ($200)',
-        },
-      };
-      const label = labels[provider]?.[detectedPlan] ?? `${provider} ${detectedPlan}`;
-      process.stderr.write(`[dual-brain] Detected ${label} plan\n`);
+      const providerName = provider === 'claude' ? 'Claude' : 'OpenAI';
+      process.stderr.write(`[dual-brain] ${providerName}: plan updated to ${detectedPlan} (from auth config)\n`);
       profile.providers[provider].plan = detectedPlan;
     }
   }
@@ -622,12 +623,10 @@ async function autoSetup(cwd) {
   if (auth.claude.found) {
     profile.providers.claude.enabled = true;
     profile.providers.claude.plan    = plans.claude || '$20';
-    const planLabel = {
-      '$20':  'Claude Pro ($20)',
-      '$100': 'Claude Max x5 ($100)',
-      '$200': 'Claude Max x20 ($200)',
-    }[profile.providers.claude.plan] || profile.providers.claude.plan;
-    result.actions.push(`${planLabel} (${auth.claude.source})`);
+    // Plan tier is inferred from auth config signal — show tier with "configured",
+    // not a plan name we didn't actually detect.
+    const claudeTierLabel = plans.claude ? `${plans.claude} configured` : 'connected';
+    result.actions.push(`Claude: ${claudeTierLabel} (${auth.claude.source})`);
   } else {
     profile.providers.claude.enabled = false;
     result.warnings.push('Claude CLI not logged in — run: claude login');
@@ -637,12 +636,10 @@ async function autoSetup(cwd) {
   if (auth.openai.found) {
     profile.providers.openai.enabled = true;
     profile.providers.openai.plan    = plans.openai || '$20';
-    const planLabel = {
-      '$20':  'ChatGPT Plus ($20)',
-      '$100': 'ChatGPT Pro ($100)',
-      '$200': 'ChatGPT Pro ($200)',
-    }[profile.providers.openai.plan] || profile.providers.openai.plan;
-    result.actions.push(`${planLabel} (${auth.openai.source})`);
+    // Plan tier is inferred from JWT claim in auth config — show tier with "configured",
+    // not a plan name we didn't actually detect.
+    const openaiTierLabel = plans.openai ? `${plans.openai} configured` : 'connected';
+    result.actions.push(`OpenAI: ${openaiTierLabel} (${auth.openai.source})`);
   } else {
     profile.providers.openai.enabled = false;
     result.warnings.push('Codex CLI not logged in — run: codex login');
@@ -938,7 +935,11 @@ async function detectExistingAuth(cwd) {
   }
 
   // -------------------------------------------------------------------------
-  // Plan detection (re-use detectPlans which reads the same config files)
+  // Plan tier inference (re-uses detectPlans which reads auth config files)
+  // NOTE: This is NOT subscription detection — we infer a price tier ($20/$100/$200)
+  // from rate-limit tier signals in the auth config (organizationRateLimitTier for
+  // Claude, JWT chatgpt_plan_type for OpenAI). The CLI does not report the actual
+  // plan name or price. Any plan label shown to the user comes from our own mapping.
   // -------------------------------------------------------------------------
   const plans = detectPlans();
   if (result.claude.found && plans.claude) result.claude.plan = plans.claude;

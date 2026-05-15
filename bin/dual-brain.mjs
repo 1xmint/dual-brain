@@ -739,18 +739,20 @@ async function welcomeScreen(rl, ask) {
   const claudeReady = auth.claude.found;
   const openaiReady = auth.openai.found;
 
-  const claudePlanLabel = claudeReady
-    ? (CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude ?? 'plan unknown')
-    : null;
-  const openaiPlanLabel = openaiReady
-    ? (OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai ?? 'plan unknown')
-    : null;
+  // Plan labels are inferred from auth config (rate-limit tier / JWT),
+  // not reported directly by the CLI. Suffix shows configured tier, not plan name.
+  const claudePlanSuffix = claudeReady && plans.claude
+    ? ` · ${plans.claude} configured`
+    : '';
+  const openaiPlanSuffix = openaiReady && plans.openai
+    ? ` · ${plans.openai} configured`
+    : '';
 
   const detectedLines = [];
-  if (claudeReady) detectedLines.push(`  Claude CLI ready${claudePlanLabel ? ` (${claudePlanLabel})` : ''}`);
-  else             detectedLines.push(`  Claude CLI not logged in`);
-  if (openaiReady) detectedLines.push(`  Codex CLI ready${openaiPlanLabel ? ` (${openaiPlanLabel})` : ''}`);
-  else             detectedLines.push(`  Codex CLI not logged in`);
+  if (claudeReady) detectedLines.push(`  Claude: authenticated${claudePlanSuffix}`);
+  else             detectedLines.push(`  Claude: not connected`);
+  if (openaiReady) detectedLines.push(`  Codex: authenticated${openaiPlanSuffix}`);
+  else             detectedLines.push(`  Codex: not connected`);
 
   console.log('');
   console.log('Detected:');
@@ -1039,25 +1041,6 @@ async function mainScreen(rl, ask) {
   }
   console.log('');
 
-  // Help shortcuts box (matching data-tools style)
-  const W = 37;
-  const helpTop    = `  ┌${'─'.repeat(W)}┐`;
-  const helpSep    = `  ├${'─'.repeat(W)}┤`;
-  const helpBottom = `  └${'─'.repeat(W)}┘`;
-  const helpPad = (s) => s + ' '.repeat(Math.max(0, W - s.length));
-
-  console.log(helpTop);
-  console.log(`  │ ${helpPad('At ~/workspace$ prompt:')}│`);
-  console.log(`  │ ${helpPad('db = show this menu')}│`);
-  console.log(`  │ ${helpPad('j  = login to claude')}│`);
-  console.log(`  │ ${helpPad('k  = login to codex')}│`);
-  console.log(helpSep);
-  console.log(`  │ ${helpPad('In Claude:')}│`);
-  console.log(`  │ ${helpPad('Ctrl+C x2 = back to menu')}│`);
-  console.log(`  │ ${helpPad('Ctrl+C x3 = exit to shell')}│`);
-  console.log(helpBottom);
-  console.log('');
-
   // Provider status (outside the box)
   for (const line of headerLines) {
     console.log(`  ${line}`);
@@ -1133,7 +1116,12 @@ async function mainScreen(rl, ask) {
       const active = sess.isActive ? ' ●' : '';
       const cat    = sess.category ? `  [${sess.category}]` : '';
       const tool = (sess.tool === 'codex') ? 'cdx' : 'cld';
-      const displayName = (sess.name && sess.name.length > 40) ? sess.name.slice(0, 37) + '...' : (sess.name || sess.id.slice(0, 8));
+      // If the name is still the "Session XXXXXXXX" fallback, try the project path instead
+      let rawName = sess.name || '';
+      if (/^Session [0-9a-f]{8,}$/i.test(rawName)) {
+        rawName = sess.project ? sess.project.replace(/^-/, '/').replace(/-/g, '/') : sess.id.slice(0, 8);
+      }
+      const displayName = rawName.length > 40 ? rawName.slice(0, 37) + '...' : (rawName || sess.id.slice(0, 8));
       console.log(`  [${i + 1}] ${pin}${tool}  ${sess.age.padEnd(8)} ${displayName}${active}${cat}`);
     });
     console.log('');
@@ -1171,14 +1159,40 @@ async function mainScreen(rl, ask) {
   console.log('  [r] Resume (full list)');
   console.log('  [/] Search sessions');
   console.log('  [e] Manage sessions');
-  console.log('  [i] Import from replit-tools');
   console.log('  [m] Manage subscriptions');
-  console.log('  [d] Switch to data-tools');
   console.log('  [s] Settings');
+  console.log('  [?] Help & shortcuts');
+  console.log('');
+  console.log('  \x1b[2mreplit-tools:\x1b[0m');
+  console.log('  [i] Import sessions');
+  console.log('  [d] Switch to data-tools');
+  console.log('');
   console.log('  [q] Exit');
   console.log('');
 
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === '?') {
+    const W = 37;
+    const helpTop    = `  ┌${'─'.repeat(W)}┐`;
+    const helpSep    = `  ├${'─'.repeat(W)}┤`;
+    const helpBottom = `  └${'─'.repeat(W)}┘`;
+    const helpPad = (s) => s + ' '.repeat(Math.max(0, W - s.length));
+    console.log('');
+    console.log(helpTop);
+    console.log(`  │ ${helpPad('At ~/workspace$ prompt:')}│`);
+    console.log(`  │ ${helpPad('db = show this menu')}│`);
+    console.log(`  │ ${helpPad('j  = login to claude')}│`);
+    console.log(`  │ ${helpPad('k  = login to codex')}│`);
+    console.log(helpSep);
+    console.log(`  │ ${helpPad('In Claude:')}│`);
+    console.log(`  │ ${helpPad('Ctrl+C x2 = back to menu')}│`);
+    console.log(`  │ ${helpPad('Ctrl+C x3 = exit to shell')}│`);
+    console.log(helpBottom);
+    console.log('');
+    await ask('  Press Enter to continue...');
+    return { next: 'main' };
+  }
 
   if (choice === 'n') { return { next: 'new-session' }; }
 
@@ -1696,18 +1710,16 @@ async function runOnboardingWizard(detection, cwd, rl) {
   console.log(wRow(`Step 1 of 5: Detected providers`));
   console.log(wSep);
 
-  const claudePlanLabel = claudeReady
-    ? (CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude ?? 'plan unknown')
-    : null;
-  const openaiPlanLabel = openaiReady
-    ? (OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai ?? 'plan unknown')
-    : null;
+  // Plan tier is inferred from auth config signals — not the actual plan name.
+  // Show the tier ($20/$100/$200) with "configured" suffix to be honest.
+  const claudePlanSuffix = claudeReady && plans.claude ? ` · ${plans.claude} configured` : '';
+  const openaiPlanSuffix = openaiReady && plans.openai ? ` · ${plans.openai} configured` : '';
 
   console.log(wRow(claudeReady
-    ? `✓ Claude CLI  ${claudePlanLabel ? `(${claudePlanLabel})` : ''}`
+    ? `✓ Claude CLI${claudePlanSuffix}`
     : `✗ Claude CLI  not logged in`));
   console.log(wRow(openaiReady
-    ? `✓ Codex CLI   ${openaiPlanLabel ? `(${openaiPlanLabel})` : ''}`
+    ? `✓ Codex CLI${openaiPlanSuffix}`
     : `✗ Codex CLI   not logged in`));
   if (existingSessions.length > 0) {
     console.log(wRow(`✓ ${existingSessions.length} data-tools session${existingSessions.length !== 1 ? 's' : ''} found`));
@@ -1747,31 +1759,33 @@ async function runOnboardingWizard(detection, cwd, rl) {
   console.log(wSep);
 
   if (claudeReady) {
-    const detectedClaudePlan = plans.claude || 'pro';
-    const detectedClaudeLabel = CLAUDE_PLAN_LABELS[detectedClaudePlan] ?? detectedClaudePlan;
-    console.log(wRow(`Claude — detected: ${detectedClaudeLabel}`));
+    // Plan tier is inferred from auth config (rate-limit signal), not the actual plan name.
+    const configuredClaudePlan = plans.claude || '$20';
+    const configuredClaudeDesc = configuredClaudePlan + ' configured';
+    console.log(wRow(`Claude — ${configuredClaudeDesc}`));
     console.log(wRow(`  [1] Pro ($20/mo)`));
     console.log(wRow(`  [2] Max x5 ($100/mo)`));
     console.log(wRow(`  [3] Max x20 ($200/mo)`));
-    console.log(wRow(`  [Enter] Keep detected (${detectedClaudeLabel})`));
+    console.log(wRow(`  [Enter] Keep configured (${configuredClaudePlan})`));
     console.log(wSep);
     const claudeChoice = (await ask('  Claude plan [1/2/3/Enter]: ')).trim();
     const claudePlanMap = { '1': 'pro', '2': 'max5', '3': 'max20' };
-    state.claudePlan = claudePlanMap[claudeChoice] || detectedClaudePlan;
+    state.claudePlan = claudePlanMap[claudeChoice] || configuredClaudePlan;
   }
 
   if (openaiReady) {
-    const detectedOpenaiPlan = plans.openai || 'plus';
-    const detectedOpenaiLabel = OPENAI_PLAN_LABELS[detectedOpenaiPlan] ?? detectedOpenaiPlan;
-    console.log(wRow(`OpenAI — detected: ${detectedOpenaiLabel}`));
+    // Plan tier is inferred from JWT claim in auth config, not the actual plan name.
+    const configuredOpenaiPlan = plans.openai || '$20';
+    const configuredOpenaiDesc = configuredOpenaiPlan + ' configured';
+    console.log(wRow(`OpenAI — ${configuredOpenaiDesc}`));
     console.log(wRow(`  [1] Plus ($20/mo)`));
     console.log(wRow(`  [2] Pro ($100/mo)`));
     console.log(wRow(`  [3] Pro ($200/mo higher limits)`));
-    console.log(wRow(`  [Enter] Keep detected (${detectedOpenaiLabel})`));
+    console.log(wRow(`  [Enter] Keep configured (${configuredOpenaiPlan})`));
     console.log(wSep);
     const openaiChoice = (await ask('  OpenAI plan [1/2/3/Enter]: ')).trim();
     const openaiPlanMap = { '1': 'plus', '2': 'pro', '3': 'pro200' };
-    state.openaiPlan = openaiPlanMap[openaiChoice] || detectedOpenaiPlan;
+    state.openaiPlan = openaiPlanMap[openaiChoice] || configuredOpenaiPlan;
   }
 
   console.log(wBottom);
@@ -2053,8 +2067,9 @@ async function diagnosticsScreen(rl, ask) {
 
   const claudeHealthBadge = auth.claude.found ? _providerBadge('claude') : 'not logged in';
   const openaiHealthBadge = auth.openai.found ? _providerBadge('openai') : 'not logged in';
-  const claudePlanStr     = plans.claude ? (CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude) : 'unknown';
-  const openaiPlanStr     = plans.openai ? (OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai) : 'unknown';
+  // Plan tier is inferred from auth config signals — show tier with "configured" to be honest.
+  const claudePlanStr     = plans.claude ? `${plans.claude} configured` : 'unknown';
+  const openaiPlanStr     = plans.openai ? `${plans.openai} configured` : 'unknown';
 
   // ── Enforcement checks ────────────────────────────────────────────────────
   const hooksDir           = join(cwd, '.claude', 'hooks');
