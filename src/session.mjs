@@ -10,7 +10,7 @@
  *   formatSessionCard(session, repo, health) → compact status card string (≤5 lines)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -309,6 +309,112 @@ export function importReplitSessions(cwd = process.cwd()) {
     } catch { continue; }
   }
 
+  // Scan ~/.claude/projects/-home-runner-workspace/ for JSONL files not already in bySession
+  const projectsDir = join(process.env.HOME || '/root', '.claude', 'projects', '-home-runner-workspace');
+  if (existsSync(projectsDir)) {
+    try {
+      for (const f of readdirSync(projectsDir)) {
+        if (!f.endsWith('.jsonl') || f.startsWith('agent-')) continue;
+        const sessionId = f.replace('.jsonl', '');
+        if (bySession.has(sessionId)) continue;
+
+        try {
+          const content = readFileSync(join(projectsDir, f), 'utf8');
+          const lines = content.split('\n').filter(Boolean).slice(0, 50);
+          let firstPrompt = null;
+          let lastTimestamp = 0;
+
+          for (const line of lines) {
+            try {
+              const entry = JSON.parse(line);
+              if (entry.timestamp && entry.timestamp > lastTimestamp) lastTimestamp = entry.timestamp;
+              if (!firstPrompt && entry.type === 'user' && entry.message?.content) {
+                const text = typeof entry.message.content === 'string'
+                  ? entry.message.content
+                  : entry.message.content?.[0]?.text;
+                if (text && !text.startsWith('/') && text.length < 200) {
+                  firstPrompt = text;
+                }
+              }
+            } catch { continue; }
+          }
+
+          if (lastTimestamp === 0) {
+            const stat = statSync(join(projectsDir, f));
+            lastTimestamp = Math.floor(stat.mtimeMs / 1000);
+          }
+
+          bySession.set(sessionId, {
+            sessionId,
+            project: '-home-runner-workspace',
+            entries: [],
+            firstPrompt: firstPrompt || sessionId.slice(0, 8) + '...',
+            lastTimestamp,
+          });
+        } catch { continue; }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Scan ~/.codex/sessions/ for codex session JSONLs (YYYY/MM/DD tree)
+  const codexSessionsDir = join(process.env.HOME || '/root', '.codex', 'sessions');
+  if (existsSync(codexSessionsDir)) {
+    try {
+      const walk = (dir) => {
+        let results = [];
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) results = results.concat(walk(full));
+            else if (entry.isFile() && entry.name.endsWith('.jsonl')) results.push(full);
+          }
+        } catch {}
+        return results;
+      };
+
+      for (const f of walk(codexSessionsDir)) {
+        try {
+          const content = readFileSync(f, 'utf8');
+          const lines = content.split('\n').filter(Boolean);
+          if (!lines.length) continue;
+
+          const meta = JSON.parse(lines[0]);
+          if (meta.type !== 'session_meta' || !meta.payload) continue;
+          if (meta.payload.cwd !== cwd && meta.payload.cwd !== '/home/runner/workspace') continue;
+
+          const id = meta.payload.id;
+          if (bySession.has(id)) continue;
+
+          let firstPrompt = null;
+          let lastTimestamp = Date.parse(meta.payload.timestamp || meta.timestamp) / 1000;
+
+          for (const ln of lines) {
+            try {
+              const j = JSON.parse(ln);
+              if (j.timestamp) {
+                const ts = Date.parse(j.timestamp) / 1000;
+                if (ts > lastTimestamp) lastTimestamp = ts;
+              }
+              if (!firstPrompt && j.type === 'event_msg' && j.payload?.type === 'user_message') {
+                const text = (j.payload.message || '').trim();
+                if (text) firstPrompt = text;
+              }
+            } catch { continue; }
+          }
+
+          bySession.set(id, {
+            sessionId: id,
+            project: '-home-runner-workspace',
+            entries: [],
+            firstPrompt: firstPrompt || id.slice(0, 8) + '...',
+            lastTimestamp,
+            tool: 'codex',
+          });
+        } catch { continue; }
+      }
+    } catch { /* non-fatal */ }
+  }
+
   // Read active terminal sessions
   // Use the same root as replitBase (go up one level from .claude-persistent)
   const replitRoot = join(replitBase, '..');
@@ -346,6 +452,7 @@ export function importReplitSessions(cwd = process.cwd()) {
       isActive: activeSessionIds.has(id),
       source: 'replit-tools',
       age: timeAgo(sess.lastTimestamp),
+      tool: sess.tool || 'claude',
     });
   }
 

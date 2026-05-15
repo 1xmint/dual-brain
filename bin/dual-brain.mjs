@@ -823,8 +823,32 @@ async function mainScreen(rl, ask) {
     subLine('OpenAI', openaiPlan, auth.openai.found, openaiExpired, openaiDays, openaiSub),
   ];
 
+  console.log(`📦 DATA Tools - Dual Brain v${version}`);
   console.log('');
-  console.log(renderHeader(version, headerLines));
+
+  // Help shortcuts box (matching data-tools style)
+  const W = 37;
+  const helpTop    = `  ┌${'─'.repeat(W)}┐`;
+  const helpSep    = `  ├${'─'.repeat(W)}┤`;
+  const helpBottom = `  └${'─'.repeat(W)}┘`;
+  const helpPad = (s) => s + ' '.repeat(Math.max(0, W - s.length));
+
+  console.log(helpTop);
+  console.log(`  │ ${helpPad('At ~/workspace$ prompt:')}│`);
+  console.log(`  │ ${helpPad('db = show this menu')}│`);
+  console.log(`  │ ${helpPad('j  = login to claude')}│`);
+  console.log(`  │ ${helpPad('k  = login to codex')}│`);
+  console.log(helpSep);
+  console.log(`  │ ${helpPad('In Claude:')}│`);
+  console.log(`  │ ${helpPad('Ctrl+C x2 = back to menu')}│`);
+  console.log(`  │ ${helpPad('Ctrl+C x3 = exit to shell')}│`);
+  console.log(helpBottom);
+  console.log('');
+
+  // Provider status (outside the box)
+  for (const line of headerLines) {
+    console.log(`  ${line}`);
+  }
 
   // Auto-refresh expired subscriptions
   if (claudeExpired || openaiExpired) {
@@ -860,10 +884,25 @@ async function mainScreen(rl, ask) {
       const pin    = sess.pinned ? '📌 ' : '   ';
       const active = sess.isActive ? ' ●' : '';
       const cat    = sess.category ? `  [${sess.category}]` : '';
-      console.log(`  [${i + 1}] ${pin}${sess.age.padEnd(6)}  ${sess.name}${active}${cat}`);
+      const tool = (sess.tool === 'codex') ? 'cdx' : 'cld';
+      console.log(`  [${i + 1}] ${pin}${tool}  ${sess.age.padEnd(8)} ${sess.name}${active}${cat}`);
     });
     console.log('');
   }
+
+  const brandW = 37;
+  const brandTop    = `  ┌${'─'.repeat(brandW)}┐`;
+  const brandBottom = `  └${'─'.repeat(brandW)}┘`;
+  const brandPad = (s) => {
+    const leftPad = Math.floor((brandW - s.length) / 2);
+    const rightPad = brandW - s.length - leftPad;
+    return ' '.repeat(leftPad) + s + ' '.repeat(rightPad);
+  };
+  console.log(brandTop);
+  console.log(`  │ ${brandPad('Dual Brain Session Manager')}│`);
+  console.log(`  │ ${brandPad('by Steve Moraco + dual-brain')}│`);
+  console.log(brandBottom);
+  console.log('');
 
   console.log('  [c] Continue last session');
   console.log('  [n] New session');
