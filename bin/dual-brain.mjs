@@ -1518,12 +1518,20 @@ function detectInterruptedWork(sessions, cwd) {
  * Shows: "● Claude  ● OpenAI  ⚖️  Balanced"
  * Uses ANSI color codes for the dots — no dollar amounts or usage bars.
  */
-function buildProviderStatusLine(profile, auth) {
+function buildProviderStatusLine(profile, auth, envReport = null) {
   const GREEN = '\x1b[32m●\x1b[0m';
   const RED   = '\x1b[31m●\x1b[0m';
 
-  const claudeDot = auth.claude.found ? GREEN : RED;
-  const openaiDot = auth.openai.found ? GREEN : RED;
+  // Use envReport secrets when available; fall back to auth detection
+  const claudeAvailable = envReport
+    ? envReport.secrets.ANTHROPIC_API_KEY || auth.claude.found
+    : auth.claude.found;
+  const openaiAvailable = envReport
+    ? envReport.secrets.OPENAI_API_KEY || auth.openai.found
+    : auth.openai.found;
+
+  const claudeDot = claudeAvailable ? GREEN : RED;
+  const openaiDot = openaiAvailable ? GREEN : RED;
 
   const WORK_STYLE_LABELS = {
     'auto':          '⚡ Fast',
@@ -1703,8 +1711,15 @@ async function mainScreen(rl, ask) {
     // 's' → fall through to normal dashboard
   }
 
+  // ── Environment awareness (powers Box 1 dots + Box 3) ────────────────────
+  let envReport = null;
+  try {
+    const { scanEnvironment } = await import('../src/awareness.mjs');
+    envReport = scanEnvironment(cwd);
+  } catch { /* non-fatal */ }
+
   // ── Box 1 — Header row data ─────────────────────────────────────────────
-  const providerLine = buildProviderStatusLine(profile, auth);
+  const providerLine = buildProviderStatusLine(profile, auth, envReport);
 
   // ── Box 2 — Workspace: gather git data ───────────────────────────────────
   let gitBranch       = 'unknown';
@@ -1771,6 +1786,7 @@ async function mainScreen(rl, ask) {
   let awarenessLine2 = '\x1b[2m📋 No roadmap yet\x1b[0m';
   let awarenessLine3 = '\x1b[32m✓\x1b[0m No risk flags';
 
+  // Line 1: observer data first; fall back to envReport-derived observations
   let quickObservations = [];
   try {
     const observerMod = await import('../src/observer.mjs');
@@ -1793,7 +1809,27 @@ async function mainScreen(rl, ask) {
     }
   } catch { /* non-fatal — observer may not exist */ }
 
-  // Try roadmap file
+  // If observer produced nothing, derive from envReport
+  if (awarenessLine1 === '\x1b[2m💡\x1b[0m Ready to work' && envReport) {
+    if (envReport.replit?.hasDatabase) {
+      awarenessLine1 = '\x1b[2m💡\x1b[0m PostgreSQL available';
+    } else if (gitUncommitted > 0) {
+      awarenessLine1 = `\x1b[2m💡\x1b[0m ${gitUncommitted} file${gitUncommitted === 1 ? '' : 's'} ready to commit`;
+    } else if (envReport.dualBrain?.hasFailureMemory) {
+      // Check for recent failures
+      try {
+        const failureMem = await getFailureMem();
+        if (failureMem.getRecentFailures) {
+          const recent = failureMem.getRecentFailures(cwd, 2);
+          if (recent?.length > 0) {
+            awarenessLine1 = `\x1b[33m⚠\x1b[0m  ${recent.length} recent failure${recent.length === 1 ? '' : 's'} — check before proceeding`;
+          }
+        }
+      } catch { /* non-fatal */ }
+    }
+  }
+
+  // Line 2: roadmap file, then ledger open tasks as fallback
   try {
     const roadmapPath = join(cwd, '.dual-brain', 'roadmap.md');
     if (existsSync(roadmapPath)) {
@@ -1805,6 +1841,25 @@ async function mainScreen(rl, ask) {
         const clean = firstItem.replace(/^[-*>]+\s*/, '').trim().slice(0, 45);
         awarenessLine2 = `\x1b[2m📋\x1b[0m ${clean}`;
       }
+    }
+  } catch { /* non-fatal */ }
+
+  if (awarenessLine2 === '\x1b[2m📋 No roadmap yet\x1b[0m') {
+    try {
+      const { getOpenTasks } = await import('../src/ledger.mjs');
+      const open = getOpenTasks(cwd);
+      if (open.length > 0) {
+        awarenessLine2 = '📋 Next: ' + open[0].intent.slice(0, 45);
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Line 3: model registry age warning
+  try {
+    const { getRegistryAge } = await import('../src/models.mjs');
+    const age = getRegistryAge();
+    if (age > 30 && awarenessLine3 === '\x1b[32m✓\x1b[0m No risk flags') {
+      awarenessLine3 = `\x1b[33m⚠\x1b[0m  Model registry ${age} days old`;
     }
   } catch { /* non-fatal */ }
 

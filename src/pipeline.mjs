@@ -66,6 +66,12 @@ export function createPipelineRun(trigger = '', prompt = '') {
     calibration: null,      // user calibration state
     adaptation: null,       // behavior adaptation from calibration
 
+    // Prompt intelligence + environment
+    promptAnalysis: null,   // from analyzePrompt
+    enrichedPrompt: null,   // from enrichPrompt
+    environment: null,      // from scanEnvironment
+    modelSuggestion: null,  // from suggestModel
+
     completedAt: null,
   };
 }
@@ -705,15 +711,66 @@ export async function runPipeline(trigger, prompt, options = {}) {
       // calibration not available — continue degraded
     }
 
+    // Environment awareness
+    try {
+      const { scanEnvironment, getCapabilitySummary } = await import('./awareness.mjs');
+      run.environment = scanEnvironment(cwd);
+
+      // Add capabilities to situation brief
+      if (run.situationBrief && run.environment) {
+        const caps = getCapabilitySummary(run.environment);
+        if (caps.length > 0) {
+          run.situationBrief += '\nCAPABILITIES: ' + caps.join(', ');
+        }
+      }
+    } catch (e) {
+      // awareness not available
+    }
+
+    // Prompt intelligence
+    try {
+      const { analyzePrompt, enrichPrompt, shouldBlock, getBlockReason } = await import('./prompt-intel.mjs');
+
+      run.promptAnalysis = analyzePrompt(prompt, run.projectBrief, run.calibration);
+
+      // Hard block on dangerous intent
+      if (shouldBlock(run.promptAnalysis)) {
+        const reason = getBlockReason(run.promptAnalysis);
+        if (run.taskId) {
+          try {
+            const { failTask } = await import('./ledger.mjs');
+            failTask(run.taskId, 'Blocked by risk detection: ' + reason, cwd);
+          } catch (e) {}
+        }
+        run.completedAt = Date.now();
+        return {
+          success: false,
+          gateFailure: 'risk',
+          reason: 'Prompt blocked: ' + reason,
+          promptAnalysis: run.promptAnalysis,
+          run
+        };
+      }
+
+      // Enrich prompt if intervention says so
+      if (run.promptAnalysis.intervention === 'silent_enrich' || run.promptAnalysis.intervention === 'confirm_rewrite') {
+        run.enrichedPrompt = enrichPrompt(prompt, run.projectBrief, run.promptAnalysis);
+      }
+    } catch (e) {
+      // prompt-intel not available
+    }
+
     // ── Phase 1: Context ──────────────────────────────────────────────────────
 
+    const effectivePrompt = run.enrichedPrompt || prompt;
+
     // Build context pack
-    run.context = await buildContextPack(prompt, files, cwd);
+    run.context = await buildContextPack(effectivePrompt, files, cwd);
 
     // Query failure history (must happen before context gate)
     try {
       const { checkFailureHistory } = await import('./failure-memory.mjs');
-      run.failureHistory = await checkFailureHistory(prompt, files, cwd);
+      run.failureHistory = await checkFailureHistory(effectivePrompt, files, cwd);
     } catch {
       // failure-memory.mjs unavailable — set to empty result so gate still passes
       run.failureHistory = { hasPriorFailures: false, failureCount: 0, lastFailure: null, escalation: { recommended: false } };
@@ -722,7 +779,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
     // Query relevant outcomes (must happen before context gate)
     try {
       const { getRelevantOutcomes } = await import('./outcome.mjs');
-      run.priorOutcomes = await getRelevantOutcomes(prompt, files, cwd);
+      run.priorOutcomes = await getRelevantOutcomes(effectivePrompt, files, cwd);
     } catch {
       // outcome.mjs unavailable — set to empty array so gate still passes
       run.priorOutcomes = [];
@@ -737,6 +794,28 @@ export async function runPipeline(trigger, prompt, options = {}) {
     // ── Phase 2: Plan ─────────────────────────────────────────────────────────
 
     run.plan = buildExecutionPlan(run.context, trigger, { forceDepth, forceChallenger });
+
+    // Model intelligence
+    try {
+      const { suggestModel, getRegistryAge } = await import('./models.mjs');
+      const availableProviders = [];
+      if (run.environment?.secrets?.ANTHROPIC_API_KEY || run.environment?.claudeCode?.isInsideClaude) availableProviders.push('anthropic');
+      if (run.environment?.secrets?.OPENAI_API_KEY) availableProviders.push('openai');
+
+      const intent = run.promptAnalysis?.intent?.type || 'execute';
+      const risk = run.plan?.risk || 'medium';
+      const complexity = run.plan?.complexity || 'medium';
+
+      run.modelSuggestion = suggestModel(intent, risk, complexity, availableProviders);
+
+      // Warn if model registry is stale
+      const age = getRegistryAge();
+      if (age > 30 && run.situationBrief) {
+        run.situationBrief += '\nWARNING: Model registry is ' + age + ' days old';
+      }
+    } catch (e) {
+      // models not available
+    }
 
     if (verbose || dryRun) {
       log(formatExecutionPlan(run.plan));
@@ -805,7 +884,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     run.result = await dispatch({
       decision,
-      prompt,
+      prompt: effectivePrompt,
       files,
       cwd,
       dryRun: false,
@@ -895,6 +974,9 @@ export async function runPipeline(trigger, prompt, options = {}) {
     // Intelligence fields for callers to inspect
     projectBrief: run.projectBrief,
     contradictions: run.contradictions,
+    promptAnalysis: run.promptAnalysis,
+    environment: run.environment,
+    modelSuggestion: run.modelSuggestion,
     // Legacy compatibility
     plan: run.plan,
     result: run.result,

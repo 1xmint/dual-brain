@@ -21,6 +21,34 @@ import { getProviderScore, checkCooldown } from './health.mjs';
 const __dirname  = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE  = join(__dirname, '..');
 
+// ─── Model Registry (optional, lazy-loaded) ───────────────────────────────────
+
+/**
+ * Cached reference to models.mjs exports. Populated on first successful import.
+ * Remains null if models.mjs is unavailable — all callers fall back to
+ * the existing hardcoded model selection logic in that case.
+ */
+let modelRegistry = null;
+let _registryLoadAttempted = false;
+
+/**
+ * Attempt to load models.mjs once. Subsequent calls return immediately.
+ * This is intentionally fire-and-forget: decideRoute stays synchronous and
+ * reads `modelRegistry` after the Promise resolves.
+ */
+function _loadModelRegistry() {
+  if (_registryLoadAttempted) return;
+  _registryLoadAttempted = true;
+  import('./models.mjs').then(mod => {
+    modelRegistry = mod;
+  }).catch(() => {
+    // models.mjs unavailable — fall back to hardcoded logic
+  });
+}
+
+// Kick off the load immediately so it is ready before the first routing call.
+_loadModelRegistry();
+
 // ─── Work Styles ─────────────────────────────────────────────────────────────
 
 /**
@@ -362,6 +390,46 @@ function pickOpenAIModel(detection, available) {
   return available[0] ?? 'gpt-4o-mini';
 }
 
+/**
+ * Normalize a full model ID (e.g. 'claude-sonnet-4-6') to the short name used
+ * by the internal ranking arrays (e.g. 'sonnet'). Pass-through for names already
+ * in short form or OpenAI model IDs that don't need normalization.
+ * @param {string} model
+ * @param {string} provider  'claude'|'openai'
+ * @returns {string}
+ */
+function toShortName(model, provider) {
+  if (!model) return model;
+  const m = model.toLowerCase();
+  if (provider === 'claude') {
+    if (m.includes('haiku'))  return 'haiku';
+    if (m.includes('opus'))   return 'opus';
+    if (m.includes('sonnet')) return 'sonnet';
+  }
+  // OpenAI and already-short names pass through unchanged
+  return model;
+}
+
+/**
+ * Resolve a short model name back to the best full model ID from the registry.
+ * Used after the internal pipeline (health downgrade, profile bias, etc.) finalizes
+ * the short name, to restore the full ID when the registry is available.
+ * @param {string} shortName  e.g. 'sonnet', 'opus', 'haiku'
+ * @param {string} provider   'claude'|'openai'
+ * @param {string} tier       'search'|'execute'|'think'
+ * @returns {string}          Full model ID, or shortName if registry unavailable
+ */
+function toFullModelId(shortName, provider, tier) {
+  if (!modelRegistry) return shortName;
+  const registryProvider = provider === 'claude' ? 'anthropic' : 'openai';
+  // Map short name back to a taskType for the registry lookup
+  const taskType = tier === 'search' ? 'search' : tier === 'think' ? 'think' : 'execute';
+  const candidates = modelRegistry.getModelsForTask(taskType, registryProvider);
+  // Find the registry entry whose name substring matches the short name
+  const match = candidates.find(m => m.id.toLowerCase().includes(shortName.toLowerCase()));
+  return match ? match.id : shortName;
+}
+
 function applyHealthDowngrade(model, score, provider, available, isHighStakes) {
   // score=100 healthy, score=50 degraded, score=25 probing, score=0 hot
   // If score is 0 (hot) and this isn't high-stakes, downgrade one tier
@@ -665,17 +733,52 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
   // Select base model using work style worker assignments.
   // For Claude primary: use complexWorker (opus) on deep reasoning, defaultWorker (sonnet) otherwise.
   // For OpenAI primary: mirror the same logic using GPT equivalents.
-  let model;
-  if (provider === 'claude') {
+  //
+  // Hardcoded fallback models (used when model registry is unavailable):
+  const _fallbackClaude = (() => {
     const wantOpus = needsDeepReasoning && workStyle.key !== 'fast';
-    model = wantOpus && available.claude.includes('opus') ? 'opus' : 'sonnet';
-    if (!available.claude.includes(model)) model = available.claude[available.claude.length - 1] ?? 'sonnet';
-  } else {
-    // OpenAI primary — use o3 for deep reasoning in fullpower, gpt-4o otherwise
+    const fb = wantOpus && available.claude.includes('opus') ? 'opus' : 'sonnet';
+    return available.claude.includes(fb) ? fb : (available.claude[available.claude.length - 1] ?? 'sonnet');
+  })();
+  const _fallbackOpenAI = (() => {
     const wantO3 = needsDeepReasoning && workStyle.key === 'fullpower';
-    model = wantO3 && available.openai.includes('o3') ? 'o3' : 'gpt-4o';
-    if (!available.openai.includes(model)) model = available.openai[available.openai.length - 1] ?? 'gpt-4o';
+    const fb = wantO3 && available.openai.includes('o3') ? 'o3' : 'gpt-4o';
+    return available.openai.includes(fb) ? fb : (available.openai[available.openai.length - 1] ?? 'gpt-4o');
+  })();
+
+  let model;
+  if (modelRegistry) {
+    // Use registry to pick best model for the tier/provider.
+    // Map decide.mjs tier to registry taskType and constraints.
+    const registryProvider = provider === 'claude' ? 'anthropic' : 'openai';
+    const taskType = tier === 'search' ? 'search'
+      : tier === 'think'  ? 'think'
+      : 'execute';
+    const constraints = {
+      provider: registryProvider,
+      ...(tier === 'search' && { preferSpeed: true }),
+      ...(tier === 'think'  && { requireReasoning: true }),
+      ...(!needsDeepReasoning && workStyle.key === 'fast' && { maxCost: 'medium' }),
+    };
+    const registryResult = modelRegistry.getBestModel(taskType, constraints);
+    if (registryResult) {
+      // Registry returns full model IDs (e.g. 'claude-sonnet-4-6').
+      // dispatch.mjs mapToAgentModel handles both short names and full IDs.
+      model = registryResult.id;
+    } else {
+      // Registry found no match — use hardcoded fallback
+      model = provider === 'claude' ? _fallbackClaude : _fallbackOpenAI;
+    }
+  } else {
+    // Registry unavailable — use existing hardcoded selection
+    model = provider === 'claude' ? _fallbackClaude : _fallbackOpenAI;
   }
+
+  // The internal pipeline (health downgrade, profile bias, safety floor) operates on
+  // short model names ('haiku', 'sonnet', 'opus', 'gpt-4o', etc.) and the available[]
+  // arrays use the same short names. Normalize a full model ID to short name first so
+  // that rank lookups work correctly, then restore the full ID at the end.
+  model = toShortName(model, provider);
 
   // Apply health-based downgrade (only if score < 50 and not high-stakes)
   model = applyHealthDowngrade(model, healthScores[provider], provider, available[provider], isHighStakes);
@@ -693,6 +796,10 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
       model = wantedModel;
     }
   }
+
+  // Restore full model ID from registry if the pipeline kept the same short name it started with.
+  // If the pipeline changed the model (downgrade/bias/floor), resolve the new short name to a full ID.
+  model = toFullModelId(model, provider, tier);
 
   // ── Challenger / dual-brain decision ─────────────────────────────────────
   const hasBothProviders = !!(
