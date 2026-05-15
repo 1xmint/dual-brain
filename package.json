@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "6.1.1",
+  "version": "6.2.0",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
