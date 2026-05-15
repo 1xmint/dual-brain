@@ -14,6 +14,7 @@ import { createInterface } from 'readline';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
+import { createHash } from 'crypto';
 
 // Skip hook installation during global npm install — hooks are installed
 // when the user runs 'dual-brain install' in their project directory.
@@ -863,6 +864,39 @@ function generateGitignoreEntries(workspace) {
   return { existing, needed };
 }
 
+// ─── Hook Manifest ──────────────────────────────────────────────────────────
+
+function hashString(s) {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+function generateHookManifest(settings) {
+  const hooks = settings.hooks || {};
+  const preHooks = (hooks.PreToolUse || []).flatMap(entry =>
+    (entry.hooks || []).map(h => hashString(h.command || ''))
+  );
+  const postHooks = (hooks.PostToolUse || []).flatMap(entry =>
+    (entry.hooks || []).map(h => hashString(h.command || ''))
+  );
+  const settingsHash = hashString(JSON.stringify(hooks));
+  return {
+    generatedAt: new Date().toISOString(),
+    expectedHooks: {
+      PreToolUse: preHooks,
+      PostToolUse: postHooks,
+    },
+    settingsHash,
+  };
+}
+
+function writeHookManifest(workspace, settings) {
+  const dualbrain = join(workspace, '.dualbrain');
+  mkdirSync(dualbrain, { recursive: true });
+  const manifest = generateHookManifest(settings);
+  writeFileSync(join(dualbrain, 'hook-manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  return manifest;
+}
+
 // ─── Installation ───────────────────────────────────────────────────────────
 
 function install(workspace, env, mode) {
@@ -914,6 +948,9 @@ function install(workspace, env, mode) {
   const settings = generateSettings(workspace);
   writeFileSync(join(target, 'settings.json'), JSON.stringify(settings, null, 2) + '\n');
   actions.push('✓ settings.json (hooks registered)');
+
+  writeHookManifest(workspace, settings);
+  actions.push('✓ .dualbrain/hook-manifest.json (integrity manifest)');
 
   const claudeMd = generateClaudeMd(mode);
   writeClaudeMd(join(target, 'CLAUDE.md'), claudeMd);

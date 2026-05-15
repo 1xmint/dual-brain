@@ -26,6 +26,7 @@ import { createInterface } from 'readline';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { execFile } from 'child_process';
 
 // ---------------------------------------------------------------------------
 // Claude Code memory integration
@@ -752,6 +753,230 @@ async function autoRefreshToken(cwd) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// detectExistingAuth — silent onboarding scan
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a CLI command with a timeout, returning stdout as a string.
+ * Resolves with null on timeout, error, or non-zero exit.
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {number} timeoutMs
+ * @returns {Promise<string|null>}
+ */
+function _runWithTimeout(cmd, args, timeoutMs) {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+
+    let child;
+    try {
+      child = execFile(cmd, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+        done(err ? null : (stdout || '').trim());
+      });
+    } catch {
+      done(null);
+      return;
+    }
+
+    // Belt-and-suspenders timeout fallback
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      done(null);
+    }, timeoutMs + 500);
+
+    if (child?.on) {
+      child.on('close', () => clearTimeout(timer));
+    }
+  });
+}
+
+/**
+ * Derive a human-readable plan label from a plan tier string.
+ * @param {'claude'|'openai'} provider
+ * @param {string} plan  e.g. '$20' | '$100' | '$200'
+ */
+function _planLabel(provider, plan) {
+  const labels = {
+    claude: { '$20': 'Claude Pro ($20)', '$100': 'Claude Max x5 ($100)', '$200': 'Claude Max x20 ($200)' },
+    openai: { '$20': 'ChatGPT Plus ($20)', '$100': 'ChatGPT Pro ($100)', '$200': 'ChatGPT Pro ($200)' },
+  };
+  return labels[provider]?.[plan] ?? `${provider} ${plan}`;
+}
+
+/**
+ * Silently scan for existing auth from all known sources and return what was
+ * found, together with smart setup recommendations.
+ *
+ * Checks (in order, all non-throwing):
+ *   1. data-tools / replit-tools  — ~/.claude/credentials.json or
+ *      .replit-tools/.claude-persistent/.credentials.json for a session key
+ *   2. Claude CLI                 — `claude auth status` with 3 s timeout
+ *   3. Codex CLI                  — `codex auth status` with 3 s timeout or
+ *                                   ~/.codex/ config files
+ *   4. Existing dual-brain config — .dualbrain/profile.json
+ *
+ * Returns:
+ * {
+ *   claude:          { found: boolean, source: string|null, plan: string|null, expiresAt: string|null },
+ *   openai:          { found: boolean, source: string|null, plan: string|null },
+ *   existingProfile: boolean,
+ *   recommendations: { headModel: string, budget: string, profile: string },
+ * }
+ *
+ * @param {string} [cwd]
+ */
+async function detectExistingAuth(cwd) {
+  const home = homedir();
+  const root = cwd || process.cwd();
+
+  // -------------------------------------------------------------------------
+  // Result skeleton
+  // -------------------------------------------------------------------------
+  const result = {
+    claude:          { found: false, source: null, plan: null, expiresAt: null },
+    openai:          { found: false, source: null, plan: null },
+    existingProfile: false,
+    recommendations: { headModel: 'claude-sonnet-4-6', budget: '$20', profile: 'balanced' },
+  };
+
+  // -------------------------------------------------------------------------
+  // 1. data-tools / replit-tools — credentials.json session key
+  // -------------------------------------------------------------------------
+  const credPaths = [
+    join(root, '.replit-tools', '.claude-persistent', '.credentials.json'),
+    join(home, '.claude', '.credentials.json'),
+    // legacy replit persistent path
+    '/home/runner/workspace/.replit-tools/.claude-persistent/.credentials.json',
+  ];
+  for (const credPath of credPaths) {
+    try {
+      const creds = JSON.parse(readFileSync(credPath, 'utf8'));
+      const oauth  = creds?.claudeAiOauth;
+      if (oauth?.accessToken || oauth?.sessionKey) {
+        result.claude.found  = true;
+        result.claude.source = credPath.includes('.replit-tools') ? 'data-tools' : 'credentials.json';
+        // Expiry
+        if (oauth.expiresAt) {
+          try { result.claude.expiresAt = new Date(oauth.expiresAt).toISOString(); } catch {}
+        }
+        break;
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // -------------------------------------------------------------------------
+  // 2. Claude CLI auth detection (config files + `claude auth status`)
+  // -------------------------------------------------------------------------
+  if (!result.claude.found) {
+    // Config-file scan (same paths as detectAuth)
+    const claudeConfigPaths = [
+      join(root, '.replit-tools', '.claude-persistent', '.claude.json'),
+      '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
+      join(home, '.claude', '.claude.json'),
+    ];
+    for (const p of claudeConfigPaths) {
+      try {
+        const data = JSON.parse(readFileSync(p, 'utf8'));
+        if (data?.oauthAccount || (data?.apiKey && typeof data.apiKey === 'string')) {
+          result.claude.found  = true;
+          result.claude.source = p.includes('.replit-tools') ? 'claude CLI (replit-tools)' : 'claude CLI';
+          break;
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    // CLI fallback: `claude auth status`
+    if (!result.claude.found) {
+      const out = await _runWithTimeout('claude', ['auth', 'status'], 3000);
+      if (out && /logged.in|authenticated|signed.in/i.test(out)) {
+        result.claude.found  = true;
+        result.claude.source = 'claude CLI (auth status)';
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3. Codex CLI / OpenAI auth detection
+  // -------------------------------------------------------------------------
+  const codexConfigPaths = [
+    join(root, '.replit-tools', '.codex-persistent', 'auth.json'),
+    '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
+    join(home, '.codex', 'auth.json'),
+  ];
+  for (const p of codexConfigPaths) {
+    try {
+      const data        = JSON.parse(readFileSync(p, 'utf8'));
+      const accessToken = data?.tokens?.access_token || data?.access_token;
+      const idToken     = data?.tokens?.id_token     || data?.id_token;
+      if (accessToken || idToken) {
+        result.openai.found  = true;
+        result.openai.source = p.includes('.replit-tools') ? 'codex CLI (replit-tools)' : 'codex CLI';
+        break;
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // CLI fallback: `codex auth status`
+  if (!result.openai.found) {
+    const out = await _runWithTimeout('codex', ['auth', 'status'], 3000);
+    if (out && /logged.in|authenticated|signed.in/i.test(out)) {
+      result.openai.found  = true;
+      result.openai.source = 'codex CLI (auth status)';
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 4. Existing dual-brain profile
+  // -------------------------------------------------------------------------
+  for (const p of [projectPath(root), GLOBAL_PATH]) {
+    if (existsSync(p)) {
+      result.existingProfile = true;
+      break;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan detection (re-use detectPlans which reads the same config files)
+  // -------------------------------------------------------------------------
+  const plans = detectPlans();
+  if (result.claude.found && plans.claude) result.claude.plan = plans.claude;
+  if (result.openai.found && plans.openai) result.openai.plan = plans.openai;
+
+  // -------------------------------------------------------------------------
+  // Smart recommendations
+  // -------------------------------------------------------------------------
+  const claudeRank = PLAN_RANK[result.claude.plan] || 0;
+  const openaiRank = PLAN_RANK[result.openai.plan] || 0;
+
+  if (result.claude.found && !result.openai.found) {
+    // Solo Claude
+    result.recommendations.headModel = 'claude-sonnet-4-6';
+    result.recommendations.budget    = result.claude.plan || '$20';
+    result.recommendations.profile   = claudeRank >= 2 ? 'quality-first' : 'balanced';
+  } else if (result.openai.found && !result.claude.found) {
+    // Solo OpenAI
+    result.recommendations.headModel = 'gpt-4o';
+    result.recommendations.budget    = result.openai.plan || '$20';
+    result.recommendations.profile   = openaiRank >= 2 ? 'quality-first' : 'balanced';
+  } else if (result.claude.found && result.openai.found) {
+    // Both available — higher-ranked provider drives HEAD model
+    if (openaiRank > claudeRank) {
+      result.recommendations.headModel = 'gpt-4o';
+    } else {
+      result.recommendations.headModel = 'claude-sonnet-4-6';
+    }
+    const topPlan = openaiRank >= claudeRank ? result.openai.plan : result.claude.plan;
+    result.recommendations.budget  = topPlan || '$20';
+    const topRank = Math.max(claudeRank, openaiRank);
+    result.recommendations.profile = topRank >= 2 ? 'quality-first' : 'balanced';
+  }
+  // else: no auth found — defaults remain (claude-sonnet-4-6 / $20 / balanced)
+
+  return result;
+}
+
 export {
   loadProfile, saveProfile, ensureProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
@@ -760,4 +985,5 @@ export {
   detectAuth, detectEnvironment,
   saveSubscription, listSubscriptions,
   defaultProfile, autoSetup, autoRefreshToken,
+  detectExistingAuth,
 };

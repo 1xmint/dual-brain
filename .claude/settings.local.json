@@ -3,13 +3,23 @@
     "PreToolUse": [
       {
         "matcher": "",
-        "command": "node /home/runner/workspace/hooks/head-guard.mjs"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /home/runner/workspace/.claude/hooks/head-guard.mjs"
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "",
-        "command": "node /home/runner/workspace/hooks/auto-update-wrapper.mjs"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /home/runner/workspace/.claude/hooks/auto-update-wrapper.mjs"
+          }
+        ]
       }
     ]
   }

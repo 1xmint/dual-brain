@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dual-brain — CLI entry point. Commands: init, go, status, remember, forget
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, mkdirSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawnSync as _spawnSyncTop } from 'node:child_process';
@@ -609,6 +609,53 @@ function cmdForget(text) {
   if (!text) err('Usage: dual-brain forget "preference text"');
   forgetPreference(text, process.cwd());
   console.log('Preference removed (if matched).');
+}
+
+function cmdBreakGlass(reason) {
+  if (!reason) err('Usage: dual-brain break-glass "reason"');
+  const cwd = process.cwd();
+  const dualbrain = join(cwd, '.dualbrain');
+  const tokenPath = join(dualbrain, 'break-glass.json');
+  const auditDir  = join(dualbrain, 'audit');
+  const auditFile = join(auditDir, 'head-audit.jsonl');
+  const TTL_MINUTES = 5;
+
+  mkdirSync(dualbrain, { recursive: true });
+  mkdirSync(auditDir, { recursive: true });
+
+  const token = {
+    createdAt: Date.now(),
+    ttlMinutes: TTL_MINUTES,
+    reason,
+  };
+  writeFileSync(tokenPath, JSON.stringify(token, null, 2));
+
+  // Audit entry
+  const auditEntry = {
+    ts: new Date().toISOString(),
+    event: 'break-glass-activated',
+    reason,
+    ttlMinutes: TTL_MINUTES,
+    expiresAt: new Date(token.createdAt + TTL_MINUTES * 60 * 1000).toISOString(),
+  };
+  try {
+    appendFileSync(auditFile, JSON.stringify(auditEntry) + '\n');
+  } catch { /* non-fatal */ }
+
+  const width = 51;
+  const inner = width - 2;
+  const pad = (s) => ' ' + s + ' '.repeat(inner - 1 - s.length);
+  const reasonLine  = `Reason: ${reason}`;
+  const expiresLine = `Expires: ${TTL_MINUTES} minutes`;
+  const auditLine   = 'All tool calls logged to audit.';
+
+  console.log('┌' + '─'.repeat(inner) + '┐');
+  console.log('│' + pad('🔓 Break-Glass Activated') + '│');
+  console.log('├' + '─'.repeat(inner) + '┤');
+  console.log('│' + pad(reasonLine) + '│');
+  console.log('│' + pad(expiresLine) + '│');
+  console.log('│' + pad(auditLine) + '│');
+  console.log('└' + '─'.repeat(inner) + '┘');
 }
 
 // ─── Screen helpers ───────────────────────────────────────────────────────────
@@ -1582,6 +1629,282 @@ async function subscriptionsScreen(rl, ask) {
   return { next: 'main' };
 }
 
+// ─── Onboarding Wizard ───────────────────────────────────────────────────────
+
+/**
+ * 5-step onboarding wizard shown on first run (no .dualbrain/profile.json).
+ * Matches the rounded ┌─┐ box style used in mainScreen / renderHeader.
+ * @param {{ auth, plans, existingSessions }} detection
+ * @param {string} cwd
+ * @param {object} rl  readline interface
+ * @returns {object|null}  profile object to save, or null if cancelled/skipped
+ */
+async function runOnboardingWizard(detection, cwd, rl) {
+  const ask = (q) => new Promise(res => rl.question(q, res));
+  const version = readVersion();
+
+  // ── Rounded box helpers (matching mainScreen style) ────────────────────────
+  const W = 51;
+  const wTop    = `  ┌${'─'.repeat(W)}┐`;
+  const wSep    = `  ├${'─'.repeat(W)}┤`;
+  const wBottom = `  └${'─'.repeat(W)}┘`;
+  const wPad = (s) => {
+    const plain = s.replace(/\x1b\[[0-9;]*m/g, '');
+    let vlen = 0;
+    for (const ch of plain) {
+      const cp = ch.codePointAt(0);
+      if (
+        (cp >= 0x1f300 && cp <= 0x1faff) ||
+        (cp >= 0x2600  && cp <= 0x27bf)  ||
+        cp === 0xfe0f || cp === 0x20e3
+      ) { vlen += 2; } else { vlen += 1; }
+    }
+    return s + ' '.repeat(Math.max(0, W - vlen));
+  };
+  const wRow = (s) => `  │ ${wPad(s)}│`;
+
+  // ── Collected wizard state ─────────────────────────────────────────────────
+  const state = {
+    claudePlan:     null,
+    openaiPlan:     null,
+    headModel:      null,
+    importSessions: false,
+    profile:        'auto',
+  };
+
+  const { auth, plans, existingSessions } = detection;
+  const claudeReady = auth.claude.found;
+  const openaiReady = auth.openai.found;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Step 1 — Welcome & provider detection
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('');
+  console.log(wTop);
+  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
+  console.log(wSep);
+  console.log(wRow(`Step 1 of 5: Detected providers`));
+  console.log(wSep);
+
+  const claudePlanLabel = claudeReady
+    ? (CLAUDE_PLAN_LABELS[plans.claude] ?? plans.claude ?? 'plan unknown')
+    : null;
+  const openaiPlanLabel = openaiReady
+    ? (OPENAI_PLAN_LABELS[plans.openai] ?? plans.openai ?? 'plan unknown')
+    : null;
+
+  console.log(wRow(claudeReady
+    ? `✓ Claude CLI  ${claudePlanLabel ? `(${claudePlanLabel})` : ''}`
+    : `✗ Claude CLI  not logged in`));
+  console.log(wRow(openaiReady
+    ? `✓ Codex CLI   ${openaiPlanLabel ? `(${openaiPlanLabel})` : ''}`
+    : `✗ Codex CLI   not logged in`));
+  if (existingSessions.length > 0) {
+    console.log(wRow(`✓ ${existingSessions.length} data-tools session${existingSessions.length !== 1 ? 's' : ''} found`));
+  }
+  console.log(wSep);
+  console.log(wRow(`[Enter] Continue setup   [s] Skip wizard`));
+  console.log(wBottom);
+  console.log('');
+
+  if (!claudeReady && !openaiReady) {
+    console.log('  No AI provider found. Log in first:');
+    console.log('    claude auth login   — for Claude');
+    console.log('    codex login         — for OpenAI/Codex');
+    console.log('  Then re-run: dual-brain init\n');
+    return null;
+  }
+
+  const step1 = (await ask('  > ')).trim().toLowerCase();
+  if (step1 === 's') {
+    // Skip: auto-save detected plans and proceed directly
+    const skippedProfile = loadProfile(cwd);
+    if (claudeReady) skippedProfile.providers.claude = { enabled: true, plan: plans.claude || 'pro' };
+    if (openaiReady) skippedProfile.providers.openai = { enabled: true, plan: plans.openai || 'plus' };
+    const enabledCount = [claudeReady, openaiReady].filter(Boolean).length;
+    skippedProfile.mode = enabledCount >= 2 ? 'auto' : claudeReady ? 'solo-claude' : 'solo-openai';
+    return skippedProfile;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Step 2 — Budget / plan selection
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('');
+  console.log(wTop);
+  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
+  console.log(wSep);
+  console.log(wRow(`Step 2 of 5: Subscription plans`));
+  console.log(wSep);
+
+  if (claudeReady) {
+    const detectedClaudePlan = plans.claude || 'pro';
+    const detectedClaudeLabel = CLAUDE_PLAN_LABELS[detectedClaudePlan] ?? detectedClaudePlan;
+    console.log(wRow(`Claude — detected: ${detectedClaudeLabel}`));
+    console.log(wRow(`  [1] Pro ($20/mo)`));
+    console.log(wRow(`  [2] Max x5 ($100/mo)`));
+    console.log(wRow(`  [3] Max x20 ($200/mo)`));
+    console.log(wRow(`  [Enter] Keep detected (${detectedClaudeLabel})`));
+    console.log(wSep);
+    const claudeChoice = (await ask('  Claude plan [1/2/3/Enter]: ')).trim();
+    const claudePlanMap = { '1': 'pro', '2': 'max5', '3': 'max20' };
+    state.claudePlan = claudePlanMap[claudeChoice] || detectedClaudePlan;
+  }
+
+  if (openaiReady) {
+    const detectedOpenaiPlan = plans.openai || 'plus';
+    const detectedOpenaiLabel = OPENAI_PLAN_LABELS[detectedOpenaiPlan] ?? detectedOpenaiPlan;
+    console.log(wRow(`OpenAI — detected: ${detectedOpenaiLabel}`));
+    console.log(wRow(`  [1] Plus ($20/mo)`));
+    console.log(wRow(`  [2] Pro ($100/mo)`));
+    console.log(wRow(`  [3] Pro ($200/mo higher limits)`));
+    console.log(wRow(`  [Enter] Keep detected (${detectedOpenaiLabel})`));
+    console.log(wSep);
+    const openaiChoice = (await ask('  OpenAI plan [1/2/3/Enter]: ')).trim();
+    const openaiPlanMap = { '1': 'plus', '2': 'pro', '3': 'pro200' };
+    state.openaiPlan = openaiPlanMap[openaiChoice] || detectedOpenaiPlan;
+  }
+
+  console.log(wBottom);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Step 3 — HEAD model selection
+  // ══════════════════════════════════════════════════════════════════════════
+  const hasBigPlan = state.claudePlan === 'max5' || state.claudePlan === 'max20';
+  const recommendedModel = hasBigPlan ? 'claude-opus-4-5' : 'claude-sonnet-4-5';
+  const recommendedLabel = hasBigPlan
+    ? 'Opus (Max plan — best quality)'
+    : 'Sonnet (Pro plan — balanced speed/quality)';
+
+  console.log('');
+  console.log(wTop);
+  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
+  console.log(wSep);
+  console.log(wRow(`Step 3 of 5: HEAD model (think-tier)`));
+  console.log(wSep);
+  console.log(wRow(`Recommended: ${recommendedLabel}`));
+  console.log(wSep);
+  console.log(wRow(`  [1] Haiku   — fastest, lowest cost`));
+  console.log(wRow(`  [2] Sonnet  — balanced (recommended for Pro)`));
+  console.log(wRow(`  [3] Opus    — best quality (recommended for Max)`));
+  console.log(wRow(`  [Enter] Use recommended`));
+  console.log(wBottom);
+  console.log('');
+
+  const step3 = (await ask('  HEAD model [1/2/3/Enter]: ')).trim();
+  const modelMap = {
+    '1': 'claude-haiku-4-5',
+    '2': 'claude-sonnet-4-5',
+    '3': 'claude-opus-4-5',
+  };
+  state.headModel = modelMap[step3] || recommendedModel;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Step 4 — Import sessions + profile selection
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('');
+  console.log(wTop);
+  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
+  console.log(wSep);
+  console.log(wRow(`Step 4 of 5: Sessions & routing profile`));
+  console.log(wSep);
+
+  if (existingSessions.length > 0) {
+    console.log(wRow(`Import ${existingSessions.length} data-tools session${existingSessions.length !== 1 ? 's' : ''}?`));
+    console.log(wRow(`  [y] Yes   [Enter/n] Skip`));
+    console.log(wSep);
+    const importChoice = (await ask('  Import sessions [y/Enter]: ')).trim().toLowerCase();
+    state.importSessions = importChoice === 'y';
+    if (state.importSessions) {
+      console.log('');
+      console.log(`  Importing ${existingSessions.length} sessions...`);
+      const recent = existingSessions.slice(0, 5);
+      for (const sess of recent) {
+        console.log(`  ${sess.age.padEnd(6)}  ${sess.name}`);
+      }
+      if (existingSessions.length > 5) {
+        console.log(`  ... and ${existingSessions.length - 5} more`);
+      }
+    }
+    console.log(wSep);
+  }
+
+  console.log(wRow(`Routing profile:`));
+  console.log(wRow(`  [1] auto         — adapts based on task risk & outcomes`));
+  console.log(wRow(`  [2] balanced     — best model per tier, normal budgets`));
+  console.log(wRow(`  [3] cost-saver   — prefer cheaper models, skip GPT`));
+  console.log(wRow(`  [4] quality-first — dual-brain for medium+ risk`));
+  console.log(wRow(`  [Enter] auto (recommended)`));
+  console.log(wBottom);
+  console.log('');
+
+  const step4 = (await ask('  Profile [1/2/3/4/Enter]: ')).trim();
+  const profileMap = { '1': 'auto', '2': 'balanced', '3': 'cost-saver', '4': 'quality-first' };
+  state.profile = profileMap[step4] || 'auto';
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Step 5 — Summary & confirm
+  // ══════════════════════════════════════════════════════════════════════════
+  const claudeSummary = state.claudePlan
+    ? `Claude:     ${CLAUDE_PLAN_LABELS[state.claudePlan] ?? state.claudePlan}`
+    : `Claude:     not configured`;
+  const openaiSummary = state.openaiPlan
+    ? `OpenAI:     ${OPENAI_PLAN_LABELS[state.openaiPlan] ?? state.openaiPlan}`
+    : `OpenAI:     not configured`;
+  const modelSummary   = `HEAD model: ${state.headModel}`;
+  const profileSummary = `Profile:    ${state.profile}`;
+  const sessionSummary = existingSessions.length > 0
+    ? `Sessions:   ${state.importSessions ? `${existingSessions.length} imported` : 'skipped'}`
+    : null;
+
+  console.log('');
+  console.log(wTop);
+  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
+  console.log(wSep);
+  console.log(wRow(`Step 5 of 5: Summary`));
+  console.log(wSep);
+  console.log(wRow(claudeSummary));
+  console.log(wRow(openaiSummary));
+  console.log(wRow(modelSummary));
+  console.log(wRow(profileSummary));
+  if (sessionSummary) console.log(wRow(sessionSummary));
+  console.log(wSep);
+  console.log(wRow(`[Enter] Save and start   [q] Quit without saving`));
+  console.log(wBottom);
+  console.log('');
+
+  const step5 = (await ask('  > ')).trim().toLowerCase();
+  if (step5 === 'q') {
+    console.log('\n  Setup cancelled.\n');
+    return null;
+  }
+
+  // ── Build and return the profile object ────────────────────────────────────
+  const finalProfile = loadProfile(cwd);
+
+  if (state.claudePlan) {
+    finalProfile.providers.claude = { enabled: true, plan: state.claudePlan };
+  } else if (claudeReady) {
+    finalProfile.providers.claude = { enabled: true, plan: plans.claude || 'pro' };
+  }
+
+  if (state.openaiPlan) {
+    finalProfile.providers.openai = { enabled: true, plan: state.openaiPlan };
+  } else if (openaiReady) {
+    finalProfile.providers.openai = { enabled: true, plan: plans.openai || 'plus' };
+  }
+
+  const enabledCount = [
+    finalProfile.providers?.claude?.enabled,
+    finalProfile.providers?.openai?.enabled,
+  ].filter(Boolean).length;
+
+  finalProfile.mode = enabledCount >= 2 ? state.profile : claudeReady ? 'solo-claude' : 'solo-openai';
+  finalProfile.headModel = state.headModel;
+  finalProfile.bias = state.profile;
+
+  return finalProfile;
+}
+
 // ─── Screen: dashboardScreen (kept for internal reference, unreachable) ───────
 
 async function dashboardScreen(rl, ask) {
@@ -2246,9 +2569,20 @@ async function main() {
       if (profileExists(cwd)) {
         await runScreens('main');
       } else {
-        // First run: welcomeScreen handles auto-setup detection internally,
-        // then falls through to manual wizard if needed.
-        await runScreens('welcome');
+        // First run: run the 5-step onboarding wizard, then go to main.
+        process.stdout.write(`\ndual-brain v${readVersion()} — Setup\n\nDetecting your setup...\n`);
+        const auth  = await detectAuth();
+        const plans = detectPlans();
+        const existingSessions = importReplitSessions(cwd);
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const wizardProfile = await runOnboardingWizard({ auth, plans, existingSessions }, cwd, rl);
+        if (wizardProfile) {
+          saveProfile(wizardProfile, { cwd });
+          await cmdInstall(cwd);
+          console.log('\n  ✅ Setup complete! Starting dual-brain...\n');
+        }
+        rl.close();
+        await runScreens('main');
       }
     } else {
       // Non-TTY: print status card and exit
@@ -2264,8 +2598,21 @@ async function main() {
 
   if (cmd === 'init') {
     if (isInteractive) {
-      // Run welcome wizard then dashboard
-      await runScreens('welcome');
+      // Run 5-step onboarding wizard then main screen
+      const cwd = process.cwd();
+      process.stdout.write(`\ndual-brain v${readVersion()} — Setup\n\nDetecting your setup...\n`);
+      const auth  = await detectAuth();
+      const plans = detectPlans();
+      const existingSessions = importReplitSessions(cwd);
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const wizardProfile = await runOnboardingWizard({ auth, plans, existingSessions }, cwd, rl);
+      if (wizardProfile) {
+        saveProfile(wizardProfile, { cwd });
+        await cmdInstall(cwd);
+        console.log('\n  ✅ Setup complete! Starting dual-brain...\n');
+      }
+      rl.close();
+      await runScreens('main');
     } else {
       await cmdInit();
     }
@@ -2282,8 +2629,9 @@ async function main() {
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
-  if (cmd === 'remember') { cmdRemember(args[1]); return; }
-  if (cmd === 'forget')   { cmdForget(args[1]); return; }
+  if (cmd === 'remember')    { cmdRemember(args[1]); return; }
+  if (cmd === 'forget')      { cmdForget(args[1]); return; }
+  if (cmd === 'break-glass') { cmdBreakGlass(args.slice(1).join(' ')); return; }
 
   if (cmd === 'search') {
     const query = args.slice(1).filter(a => !a.startsWith('--')).join(' ');
