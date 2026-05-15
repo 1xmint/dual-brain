@@ -2783,6 +2783,29 @@ async function settingsScreen(rl, ask) {
   const _stC = typeof _stCal.corrections === 'number' ? _stCal.corrections.toFixed(1) : String(_stCal.corrections ?? 3);
   const _stA = typeof _stCal.autonomy    === 'number' ? _stCal.autonomy.toFixed(1)    : String(_stCal.autonomy    ?? 3);
 
+  // Cost efficiency summary (graceful — only shown when data exists)
+  let _stEffScore = null;
+  let _stEffRate  = null;
+  let _stEffTrend = null;
+  let _stEffTier  = null;
+  try {
+    const _stCt = await import('../src/cost-tracker.mjs');
+    const _stSummary = _stCt.getCostSummary(cwd, 7);
+    if (_stSummary.totalActions > 0) {
+      _stEffScore = _stCt.getEfficiencyScore(cwd);
+      _stEffRate  = Math.round(_stSummary.savingsRate * 100);
+      _stEffTrend = _stSummary.trend;
+      const tierOrder = ['recall', 'quick', 'standard', 'deep', 'ultra'];
+      const _stTierKeys = tierOrder.filter(k => _stSummary.byTier[k]);
+      _stEffTier = _stTierKeys.map(k => {
+        const t = _stSummary.byTier[k];
+        return `${k.padEnd(8)} ${String(t.count).padStart(3)}`;
+      }).join('  ');
+    }
+  } catch { /* non-fatal */ }
+
+  const _stTrendIcon = _stEffTrend === 'improving' ? '↗' : _stEffTrend === 'degrading' ? '↘' : '→';
+
   const lines = [
     top,
     row('Settings'),
@@ -2799,6 +2822,12 @@ async function settingsScreen(rl, ask) {
     row('User Calibration'),
     row(`  Specificity: ${_stS}  Corrections: ${_stC}  Autonomy: ${_stA}`),
     row(`  Level: ${_stLevel} · Style: ${_stStyle}`),
+    ...(_stEffScore !== null ? [
+      sep,
+      row('Cost Efficiency (7 days)'),
+      row(`  Score: ${_stEffScore}/100  Savings: ${_stEffRate}%  Trend: ${_stTrendIcon} ${_stEffTrend}`),
+      ...(_stEffTier ? [row(`  Tiers: ${_stEffTier}`)] : []),
+    ] : []),
     sep,
     row('[1-3] change style  [r] reset calibration  [b] back'),
     row('[m] subscriptions  [e] sessions  [x] diagnostics'),

@@ -682,10 +682,10 @@ function applyCriticalRiskFloor(model, provider, available, risk) {
 
 /**
  * Main routing decision function.
- * @param {{ profile: object, detection: object, cwd?: string }} input
+ * @param {{ profile: object, detection: object, cwd?: string, thinkResult?: object }} input
  * @returns {object} Routing decision
  */
-export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
+export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult } = {}) {
   const available = getAvailableModels(profile);
 
   // Resolve active work style
@@ -785,6 +785,51 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
 
   // Apply profile mode bias (cost-saver / quality-first / preferences) using patched profile
   model = applyProfileBias(model, profileWithEffectiveBias, provider, available[provider], detection.tier);
+
+  // Think-engine tier hint: use as a HINT to allow cheaper model when think-engine
+  // classifies the task as recall/quick. Never escalate — only downgrade when safe to do so.
+  let thinkTier = null;
+  try {
+    if (thinkResult?.tier) thinkTier = thinkResult.tier;
+  } catch (e) {}
+
+  if (thinkTier && !isHighStakes) {
+    const claudeRankAsc = ['haiku', 'sonnet', 'opus'];
+    const openaiRankAsc = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+
+    if (thinkTier === 'recall' && provider === 'claude') {
+      // recall → haiku is fine if available
+      const target = 'haiku';
+      const currentIdx = claudeRankAsc.indexOf(model);
+      const targetIdx  = claudeRankAsc.indexOf(target);
+      if (targetIdx !== -1 && targetIdx < currentIdx && available.claude.includes(target)) {
+        model = target;
+      }
+    } else if (thinkTier === 'recall' && provider === 'openai') {
+      const target = 'gpt-4o-mini';
+      const currentIdx = openaiRankAsc.indexOf(model);
+      const targetIdx  = openaiRankAsc.indexOf(target);
+      if (targetIdx !== -1 && targetIdx < currentIdx && available.openai.includes(target)) {
+        model = target;
+      }
+    } else if (thinkTier === 'quick' && provider === 'claude') {
+      // quick → sonnet is sufficient
+      const target = 'sonnet';
+      const currentIdx = claudeRankAsc.indexOf(model);
+      const targetIdx  = claudeRankAsc.indexOf(target);
+      if (targetIdx !== -1 && targetIdx < currentIdx && available.claude.includes(target)) {
+        model = target;
+      }
+    } else if (thinkTier === 'quick' && provider === 'openai') {
+      const target = 'gpt-4o';
+      const currentIdx = openaiRankAsc.indexOf(model);
+      const targetIdx  = openaiRankAsc.indexOf(target);
+      if (targetIdx !== -1 && targetIdx < currentIdx && available.openai.includes(target)) {
+        model = target;
+      }
+    }
+    // 'standard', 'deep', 'ultra' — leave model unchanged; existing routing already picked correctly
+  }
 
   // Safety floor: critical-risk tasks must never use haiku/gpt-4.1-mini even in cost-saver mode
   model = applyCriticalRiskFloor(model, provider, available[provider], detection.risk);

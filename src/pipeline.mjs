@@ -72,6 +72,10 @@ export function createPipelineRun(trigger = '', prompt = '') {
     environment: null,      // from scanEnvironment
     modelSuggestion: null,  // from suggestModel
 
+    // Think-engine fields
+    thinkResult: null,       // from think-engine
+    decisionPreflight: null, // from lookupDecision
+
     completedAt: null,
   };
 }
@@ -385,7 +389,7 @@ export function buildExecutionPlan(contextPack, trigger, options = {}) {
     effort: depthToEffort[reasoningDepth] ?? detection.effort,
   };
 
-  const decision = decideRoute({ profile, detection: detectionWithDepth, cwd: contextPack.cwd });
+  const decision = decideRoute({ profile, detection: detectionWithDepth, cwd: contextPack.cwd, thinkResult: options.thinkResult });
 
   // Resolve full model ID for display (mirrors dispatch.mjs CLAUDE_MODEL_IDS)
   const CLAUDE_MODEL_IDS = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
@@ -727,6 +731,34 @@ export async function runPipeline(trigger, prompt, options = {}) {
       // awareness not available
     }
 
+    // Knowledge preflight — check if we already know the answer
+    try {
+      const { lookupDecision, triageQuestion } = await import('./think-engine.mjs');
+      const cwd = options.cwd || process.cwd();
+
+      run.decisionPreflight = lookupDecision(prompt, options.tags || [], cwd);
+
+      // If exact reuse found, we can short-circuit
+      if (run.decisionPreflight.recommendation === 'reuse' && run.decisionPreflight.candidates[0]) {
+        // Add cached decision info to situation brief
+        if (run.situationBrief) {
+          run.situationBrief += '\nCACHED DECISION: Found prior decision with ' +
+            Math.round(run.decisionPreflight.candidates[0].relevance * 100) + '% relevance';
+        }
+      }
+
+      // Triage to determine thinking tier
+      const triage = triageQuestion(prompt, run.projectBrief, run.decisionPreflight);
+      run.thinkResult = { tier: triage.recommendedTier, estimatedTokens: triage.estimatedTokens, triage };
+
+      // Add to situation brief
+      if (run.situationBrief) {
+        run.situationBrief += '\nTHINK TIER: ' + triage.recommendedTier + ' (' + triage.estimatedTokens + ' tokens est.)';
+      }
+    } catch (e) {
+      // think-engine not available
+    }
+
     // Prompt intelligence
     try {
       const { analyzePrompt, enrichPrompt, shouldBlock, getBlockReason } = await import('./prompt-intel.mjs');
@@ -793,7 +825,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     // ── Phase 2: Plan ─────────────────────────────────────────────────────────
 
-    run.plan = buildExecutionPlan(run.context, trigger, { forceDepth, forceChallenger });
+    run.plan = buildExecutionPlan(run.context, trigger, { forceDepth, forceChallenger, thinkResult: run.thinkResult });
 
     // Model intelligence
     try {
@@ -956,6 +988,23 @@ export async function runPipeline(trigger, prompt, options = {}) {
       return { success: false, gateFailure: 'outcome', reason: run.gates.outcome.reason, run };
     }
 
+    // Persist decision for future recall
+    if (run.result && !run.result?.error) {
+      try {
+        const { persistDecision } = await import('./think-engine.mjs');
+        const cwd = options.cwd || process.cwd();
+        persistDecision(
+          prompt,
+          typeof run.result === 'string' ? run.result : JSON.stringify(run.result).slice(0, 1000),
+          run.thinkResult?.tier || 'standard',
+          { tags: options.tags || [], projectBrief: run.projectBrief },
+          cwd
+        );
+      } catch (e) {
+        // persist failed — non-blocking
+      }
+    }
+
   } catch (err) {
     log(`[pipeline] error in pipeline step: ${err.message}`);
     run.result = { status: 'error', error: err.message };
@@ -977,6 +1026,8 @@ export async function runPipeline(trigger, prompt, options = {}) {
     promptAnalysis: run.promptAnalysis,
     environment: run.environment,
     modelSuggestion: run.modelSuggestion,
+    thinkResult: run.thinkResult,
+    decisionPreflight: run.decisionPreflight,
     // Legacy compatibility
     plan: run.plan,
     result: run.result,
