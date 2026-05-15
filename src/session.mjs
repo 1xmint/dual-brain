@@ -355,6 +355,90 @@ export function importReplitSessions(cwd = process.cwd()) {
   return sessions;
 }
 
+// ─── Session metadata overlay ─────────────────────────────────────────────────
+
+const SESSION_META_FILE = '.dualbrain/sessions.json';
+
+function sessionMetaPath(cwd) {
+  return join(cwd ?? process.cwd(), SESSION_META_FILE);
+}
+
+export function getSessionMeta(cwd = process.cwd()) {
+  const p = sessionMetaPath(cwd);
+  if (!existsSync(p)) return {};
+  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return {}; }
+}
+
+function saveSessionMeta(meta, cwd = process.cwd()) {
+  ensureDir(cwd);
+  const p   = sessionMetaPath(cwd);
+  const tmp = p + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(meta, null, 2) + '\n');
+  renameSync(tmp, p);
+}
+
+export function renameSession(sessionId, name, cwd = process.cwd()) {
+  const meta = getSessionMeta(cwd);
+  meta[sessionId] = { ...meta[sessionId], name, createdAt: meta[sessionId]?.createdAt ?? new Date().toISOString() };
+  saveSessionMeta(meta, cwd);
+}
+
+export function pinSession(sessionId, cwd = process.cwd()) {
+  const meta = getSessionMeta(cwd);
+  meta[sessionId] = { ...meta[sessionId], pinned: true, createdAt: meta[sessionId]?.createdAt ?? new Date().toISOString() };
+  saveSessionMeta(meta, cwd);
+}
+
+export function unpinSession(sessionId, cwd = process.cwd()) {
+  const meta = getSessionMeta(cwd);
+  meta[sessionId] = { ...meta[sessionId], pinned: false };
+  saveSessionMeta(meta, cwd);
+}
+
+export function categorizeSession(sessionId, category, cwd = process.cwd()) {
+  const meta = getSessionMeta(cwd);
+  meta[sessionId] = { ...meta[sessionId], category, createdAt: meta[sessionId]?.createdAt ?? new Date().toISOString() };
+  saveSessionMeta(meta, cwd);
+}
+
+const AUTO_LABEL_RULES = [
+  { keywords: ['auth', 'login', 'credential', 'security', 'token'], label: 'security' },
+  { keywords: ['ui', 'css', 'style', 'component', 'react', 'frontend'], label: 'ui' },
+  { keywords: ['refactor', 'cleanup', 'rename', 'reorganize'], label: 'refactor' },
+  { keywords: ['bug', 'fix', 'error', 'crash', 'broken'], label: 'bugfix' },
+  { keywords: ['test', 'spec', 'coverage'], label: 'testing' },
+  { keywords: ['deploy', 'ci', 'build', 'release'], label: 'devops' },
+  { keywords: ['plan', 'design', 'architect', 'brainstorm'], label: 'planning' },
+];
+
+export function autoLabel(session) {
+  const text = (session.name || '').toLowerCase();
+  for (const { keywords, label } of AUTO_LABEL_RULES) {
+    if (keywords.some(kw => new RegExp(`\\b${kw}\\b`).test(text))) return label;
+  }
+  return null;
+}
+
+export function enrichSessions(sessions, cwd = process.cwd()) {
+  const meta = getSessionMeta(cwd);
+  const enriched = sessions.map(sess => {
+    const overlay = meta[sess.id] ?? {};
+    const category = overlay.category ?? autoLabel({ ...sess, name: overlay.name ?? sess.name });
+    return {
+      ...sess,
+      name:     overlay.name ?? sess.name,
+      pinned:   overlay.pinned ?? false,
+      category: category ?? null,
+    };
+  });
+  enriched.sort((a, b) => {
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    return new Date(b.lastActive) - new Date(a.lastActive);
+  });
+  return enriched;
+}
+
 // ─── CLI (direct invocation) ──────────────────────────────────────────────────
 
 const isMain = process.argv[1]?.endsWith('session.mjs');

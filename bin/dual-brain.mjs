@@ -29,7 +29,7 @@ import {
 import { dispatch, detectRuntime, dispatchDualBrain } from '../src/dispatch.mjs';
 
 import { loadRepoCache } from '../src/repo.mjs';
-import { loadSession, saveSession, formatSessionCard, importReplitSessions } from '../src/session.mjs';
+import { loadSession, saveSession, formatSessionCard, importReplitSessions, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions } from '../src/session.mjs';
 
 import { box, bar, badge, menu, separator } from '../src/tui.mjs';
 
@@ -816,13 +816,15 @@ async function mainScreen(rl, ask) {
   }
   console.log('');
 
-  const recentSessions = importReplitSessions(cwd).slice(0, 5);
+  const recentSessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 7);
 
   if (recentSessions.length > 0) {
     console.log('Recent:');
     recentSessions.forEach((sess, i) => {
-      const activeIndicator = sess.isActive ? ' ●' : '';
-      console.log(`  [${i + 1}] ${sess.age.padEnd(6)}  ${sess.name}${activeIndicator}`);
+      const pin    = sess.pinned ? '📌 ' : '   ';
+      const active = sess.isActive ? ' ●' : '';
+      const cat    = sess.category ? `  [${sess.category}]` : '';
+      console.log(`  [${i + 1}] ${pin}${sess.age.padEnd(6)}  ${sess.name}${active}${cat}`);
     });
     console.log('');
   }
@@ -832,6 +834,7 @@ async function mainScreen(rl, ask) {
   if (recentSessions.length > 0) {
     console.log('  [1-9] Resume numbered above');
   }
+  console.log('  [e] Manage sessions');
   console.log('  [d] Switch to data-tools');
   if (!auth.claude.found) console.log('  [j] Login to Claude');
   if (!auth.openai.found) console.log('  [k] Login to Codex');
@@ -863,6 +866,8 @@ async function mainScreen(rl, ask) {
     spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
     return { next: 'main' };
   }
+
+  if (choice === 'e') { return { next: 'sessions' }; }
 
   if (choice === 'd') {
     const { spawnSync } = await import('node:child_process');
@@ -1592,6 +1597,131 @@ async function sessionDetailScreen(rl, ask, ctx = {}) {
   return { next: 'dashboard' };
 }
 
+// ─── Screen: sessionsScreen ───────────────────────────────────────────────────
+
+const CATEGORIES = ['security', 'ui', 'refactor', 'bugfix', 'testing', 'devops', 'planning'];
+
+async function sessionsScreen(rl, ask) {
+  const cwd = process.cwd();
+  const sessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 9);
+
+  console.log('');
+  console.log(separator('Session Manager'));
+  console.log('');
+
+  if (sessions.length === 0) {
+    console.log('  No sessions found.\n');
+    console.log('  [b] Back\n');
+    const choice = (await ask('  Choice: ')).trim().toLowerCase();
+    if (choice === 'b' || choice === 'back') return { next: 'main' };
+    return { next: 'sessions' };
+  }
+
+  sessions.forEach((sess, i) => {
+    const pin    = sess.pinned ? '📌 ' : '   ';
+    const active = sess.isActive ? ' ●' : '';
+    const cat    = sess.category ? `  [${sess.category}]` : '';
+    console.log(`  [${i + 1}] ${pin}${sess.age.padEnd(6)}  ${sess.name}${active}${cat}`);
+  });
+
+  console.log('');
+  console.log('  [1-9] Select a session to manage');
+  console.log('  [b] Back');
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === 'b' || choice === 'back') return { next: 'main' };
+
+  const numChoice = parseInt(choice, 10);
+  if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= sessions.length) {
+    return { next: 'session-manage', session: sessions[numChoice - 1] };
+  }
+
+  return { next: 'sessions' };
+}
+
+async function sessionManageScreen(rl, ask, ctx = {}) {
+  const sess = ctx.session;
+  if (!sess) return { next: 'sessions' };
+
+  const cwd = process.cwd();
+  const pinLabel = sess.pinned ? 'Unpin' : 'Pin';
+  const catLabel = sess.category ? `[${sess.category}]` : '(none)';
+
+  console.log('');
+  console.log(separator(`Session: ${sess.name}`));
+  console.log('');
+  console.log(`  Age:      ${sess.age}`);
+  console.log(`  Category: ${catLabel}`);
+  console.log(`  Pinned:   ${sess.pinned ? 'yes' : 'no'}`);
+  console.log('');
+  console.log(menu([
+    { key: 'r', label: 'Rename',           section: '' },
+    { key: 'p', label: pinLabel,           section: '' },
+    { key: 'c', label: 'Set category',     section: '' },
+    { key: 'o', label: 'Open (resume)',    section: '' },
+    { key: 'b', label: 'Back',             section: '' },
+  ]));
+  console.log('');
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (choice === 'r') {
+    const name = (await ask('  New name: ')).trim();
+    if (name) {
+      renameSession(sess.id, name, cwd);
+      console.log(`  Renamed to: ${name}`);
+    }
+    return { next: 'session-manage', session: { ...sess, name: name || sess.name } };
+  }
+
+  if (choice === 'p') {
+    if (sess.pinned) {
+      unpinSession(sess.id, cwd);
+      console.log('  Unpinned.');
+      return { next: 'session-manage', session: { ...sess, pinned: false } };
+    } else {
+      pinSession(sess.id, cwd);
+      console.log('  Pinned.');
+      return { next: 'session-manage', session: { ...sess, pinned: true } };
+    }
+  }
+
+  if (choice === 'c') {
+    console.log('');
+    CATEGORIES.forEach((cat, i) => console.log(`  (${i + 1}) ${cat}`));
+    console.log(`  (${CATEGORIES.length + 1}) custom`);
+    console.log('');
+    const catChoice = (await ask('  Category: ')).trim();
+    const catIndex = parseInt(catChoice, 10);
+    let category = null;
+    if (!isNaN(catIndex) && catIndex >= 1 && catIndex <= CATEGORIES.length) {
+      category = CATEGORIES[catIndex - 1];
+    } else if (catIndex === CATEGORIES.length + 1) {
+      category = (await ask('  Custom category: ')).trim() || null;
+    } else if (catChoice) {
+      category = catChoice;
+    }
+    if (category) {
+      categorizeSession(sess.id, category, cwd);
+      console.log(`  Category set to: ${category}`);
+    }
+    return { next: 'session-manage', session: { ...sess, category: category ?? sess.category } };
+  }
+
+  if (choice === 'o') {
+    const { spawnSync } = await import('node:child_process');
+    console.log(`\n  Launching: claude --resume ${sess.id}\n`);
+    spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+    return { next: 'sessions' };
+  }
+
+  if (choice === 'b' || choice === 'back') return { next: 'sessions' };
+
+  return { next: 'session-manage', session: sess };
+}
+
 // ─── Screen state machine ─────────────────────────────────────────────────────
 
 const SCREENS = {
@@ -1606,6 +1736,8 @@ const SCREENS = {
   diagnostics:      diagnosticsScreen,
   repl:             replScreen,
   'session-detail': sessionDetailScreen,
+  sessions:         sessionsScreen,
+  'session-manage': sessionManageScreen,
 };
 
 async function runScreens(startScreen = 'dashboard') {

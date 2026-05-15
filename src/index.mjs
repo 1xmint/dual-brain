@@ -13,7 +13,7 @@ export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrai
 export { loadPlaybook, listPlaybooks, executePlaybook, createRunArtifact } from './playbook.mjs';
 export { getHealth, markHot, markDegraded, markHealthy, checkCooldown, getProviderScore, recordDispatch, getSessionStats, resetHealth, remainingCooldownMinutes } from './health.mjs';
 export { detectRepo, loadRepoCache, getTestCommand, getLintCommand } from './repo.mjs';
-export { loadSession, saveSession, updateSession, clearSession, formatSessionCard } from './session.mjs';
+export { loadSession, saveSession, updateSession, clearSession, formatSessionCard, importReplitSessions, renameSession, pinSession, unpinSession, categorizeSession, getSessionMeta, autoLabel, enrichSessions } from './session.mjs';
 export { decompose, isSimpleTask, taskGraphToWaves } from './decompose.mjs';
 export { generateBrief, compressPriorResults, listRoles } from './brief.mjs';
 export { redact, redactFiles, isSecretFile } from './redact.mjs';
