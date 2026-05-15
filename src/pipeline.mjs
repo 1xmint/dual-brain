@@ -28,6 +28,12 @@ export function createPipelineRun(trigger = '', prompt = '') {
     trigger,
     prompt,
 
+    // Phase 0: Intelligence
+    projectBrief: null,    // from deriveProjectState
+    taskBrief: null,       // from deriveTaskContext
+    contradictions: [],    // from detectContradictions
+    situationBrief: null,  // formatted string from formatBrief
+
     // Phase 1: Context
     context: null,
     failureHistory: null,   // result of checkFailureHistory — even empty counts as "queried"
@@ -633,6 +639,17 @@ export async function runPipeline(trigger, prompt, options = {}) {
   const run = createPipelineRun(trigger, prompt);
 
   try {
+    // ── Phase 0: Situational awareness ───────────────────────────────────────
+
+    try {
+      const { deriveProjectState, deriveTaskContext, detectContradictions, formatBrief } = await import('./intelligence.mjs');
+      run.projectBrief = await deriveProjectState(options.cwd || process.cwd());
+      run.taskBrief = deriveTaskContext(prompt, options.recentEvents || []);
+      run.situationBrief = formatBrief(run.projectBrief, run.taskBrief);
+    } catch (e) {
+      // intelligence module not available — continue without it (degraded)
+    }
+
     // ── Phase 1: Context ──────────────────────────────────────────────────────
 
     // Build context pack
@@ -668,6 +685,34 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     if (verbose || dryRun) {
       log(formatExecutionPlan(run.plan));
+    }
+
+    // Contradiction detection
+    if (run.projectBrief && run.plan) {
+      try {
+        const { detectContradictions } = await import('./intelligence.mjs');
+        const planForCheck = {
+          description: run.plan.description || prompt,
+          targetFiles: run.plan.targetFiles || run.plan.files || [],
+          assumptions: run.plan.assumptions || {}
+        };
+        run.contradictions = detectContradictions(run.projectBrief, run.taskBrief, planForCheck);
+
+        // Any blocking contradiction fails the pipeline
+        const blockers = run.contradictions.filter(c => c.severity === 'block');
+        if (blockers.length > 0) {
+          run.completedAt = Date.now();
+          return {
+            success: false,
+            gateFailure: 'contradiction',
+            reason: blockers.map(b => b.message).join('; '),
+            contradictions: blockers,
+            run
+          };
+        }
+      } catch (e) {
+        // contradiction detection failed — continue (degraded)
+      }
     }
 
     // Gate 2: Planning gate
@@ -711,6 +756,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
       dryRun: false,
       verbose,
       profile: run.context.profile,
+      situationBrief: run.situationBrief,
     });
 
     // ── Phase 4: Verification ─────────────────────────────────────────────────
@@ -751,6 +797,9 @@ export async function runPipeline(trigger, prompt, options = {}) {
   return {
     success: true,
     run,
+    // Intelligence fields for callers to inspect
+    projectBrief: run.projectBrief,
+    contradictions: run.contradictions,
     // Legacy compatibility
     plan: run.plan,
     result: run.result,

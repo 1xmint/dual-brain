@@ -702,6 +702,17 @@ async function dispatch(input = {}) {
   // that this agent call came through the official pipeline.
   prompt = _prependDispatchMarker(prompt);
 
+  // ── Situation brief injection ────────────────────────────────────────────────
+  // Prepend a compact project-state summary when provided by the pipeline.
+  // This gives every dispatched agent immediate context about the project reality.
+  const situationBrief = typeof input.situationBrief === 'string' && input.situationBrief.trim()
+    ? input.situationBrief.trim()
+    : null;
+  if (situationBrief) {
+    prompt = `--- SITUATION BRIEF ---\n${situationBrief}\n--- END BRIEF ---\n\n${prompt}`;
+  }
+  // ── End situation brief ──────────────────────────────────────────────────────
+
   // ── Specialist prompt injection ──────────────────────────────────────────────
   const specialist = decision.specialist && decision.specialist !== 'generic'
     ? decision.specialist
@@ -1017,6 +1028,15 @@ async function dispatchDualBrain(input = {}) {
 
   // Stamp with dispatch marker so enforce-tier.mjs allows this Agent call
   prompt = _prependDispatchMarker(prompt);
+
+  // ── Situation brief injection ────────────────────────────────────────────────
+  const _dualBrainBrief = typeof input.situationBrief === 'string' && input.situationBrief.trim()
+    ? input.situationBrief.trim()
+    : null;
+  if (_dualBrainBrief) {
+    prompt = `--- SITUATION BRIEF ---\n${_dualBrainBrief}\n--- END BRIEF ---\n\n${prompt}`;
+  }
+  // ── End situation brief ──────────────────────────────────────────────────────
 
   // Feature 1: Validate both sub-decisions before spawning anything
   const rt = await detectRuntime();
