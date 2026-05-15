@@ -157,6 +157,129 @@ function buildExplanation({ intent, risk, complexity, fileCount, priorFailures }
   return parts.join(' ') + '.';
 }
 
+// ─── Reasoning depth classification ───────────────────────────────────────────
+
+const ULTRA_UNCERTAINTY = /\b(not sure|maybe|should we|architect|design|trade-?off|approach)\b/i;
+const ULTRA_DEEP_ANALYSIS = /\b(think about|analyze|analyse|evaluate|compare options)\b/i;
+const HIGH_CROSS_CUTTING = /\b(refactor|rename across|update all|migration)\b/i;
+const LOW_SIMPLE = /\b(grep|find|search|list|show|what is|where is)\b/i;
+
+/**
+ * Classify the reasoning depth needed for a task.
+ * Returns { depth: 'low'|'medium'|'high'|'ultra', signals: string[] }
+ */
+function classifyReasoningDepth(prompt, files = [], priorOutcomes = []) {
+  const signals = [];
+
+  // Gather prior failure count from priorOutcomes array
+  const failures = priorOutcomes.filter(o => o && (o.failed || o.status === 'failed' || o.outcome === 'failed' || o.success === false)).length;
+
+  // File-based risk (reuse classifyRisk)
+  const { level: fileRisk } = classifyRisk(files);
+
+  // Keyword risk from prompt (reuse RISK_KEYWORDS)
+  let keywordRisk = 'low';
+  for (const { level, regex } of RISK_KEYWORDS) {
+    if (regex.test(prompt)) { keywordRisk = level; break; }
+  }
+
+  const risk = higherRisk(fileRisk, keywordRisk);
+
+  // Directory spread from files
+  const dirs = new Set(files.map(f => {
+    const parts = f.replace(/^\//, '').split('/');
+    return parts.length > 1 ? parts[0] : '.';
+  }));
+  const dirCount = dirs.size;
+
+  // ── Ultra signals ──────────────────────────────────────────────────────────
+  const ultraSignals = [];
+
+  if (ULTRA_UNCERTAINTY.test(prompt)) {
+    const match = prompt.match(ULTRA_UNCERTAINTY);
+    ultraSignals.push(`prompt contains '${match[0]}'`);
+  }
+  if (ULTRA_DEEP_ANALYSIS.test(prompt)) {
+    const match = prompt.match(ULTRA_DEEP_ANALYSIS);
+    ultraSignals.push(`prompt requests deep analysis ('${match[0]}')`);
+  }
+  if (risk === 'critical') {
+    ultraSignals.push('risk classified as critical');
+  }
+  if (failures >= 2) {
+    ultraSignals.push(`${failures} prior failures on similar task`);
+  }
+  if (fileRisk === 'critical') {
+    ultraSignals.push('files include auth/security/billing/migration patterns');
+  }
+
+  if (ultraSignals.length > 0) {
+    return { depth: 'ultra', signals: ultraSignals };
+  }
+
+  // ── High signals ───────────────────────────────────────────────────────────
+  const highSignals = [];
+
+  if (risk === 'high') {
+    highSignals.push('risk classified as high');
+  }
+  if (files.length > 5) {
+    highSignals.push(`${files.length} files provided`);
+  }
+  if (failures === 1) {
+    highSignals.push('1 prior failure on similar task');
+  }
+  if (HIGH_CROSS_CUTTING.test(prompt)) {
+    const match = prompt.match(HIGH_CROSS_CUTTING);
+    highSignals.push(`prompt mentions cross-cutting concern ('${match[0]}')`);
+  }
+  if (dirCount >= 3) {
+    highSignals.push(`files span ${dirCount} directories`);
+  }
+
+  if (highSignals.length > 0) {
+    return { depth: 'high', signals: highSignals };
+  }
+
+  // ── Medium signals ─────────────────────────────────────────────────────────
+  const MEDIUM_IMPL = /\b(add|implement|build|create|fix|update)\b/i;
+  const mediumSignals = [];
+
+  if (risk === 'medium') {
+    mediumSignals.push('risk classified as medium');
+  }
+  if (files.length >= 2 && files.length <= 5) {
+    mediumSignals.push(`${files.length} files provided`);
+  }
+  if (MEDIUM_IMPL.test(prompt)) {
+    const match = prompt.match(MEDIUM_IMPL);
+    mediumSignals.push(`prompt contains implementation keyword ('${match[0]}')`);
+  }
+
+  if (mediumSignals.length > 0) {
+    return { depth: 'medium', signals: mediumSignals };
+  }
+
+  // ── Low signals ────────────────────────────────────────────────────────────
+  const lowSignals = [];
+
+  if (risk === 'low') {
+    lowSignals.push('risk classified as low');
+  }
+  if (files.length <= 1) {
+    lowSignals.push(files.length === 0 ? 'no files provided' : '1 file provided');
+  }
+  if (LOW_SIMPLE.test(prompt)) {
+    const match = prompt.match(LOW_SIMPLE);
+    lowSignals.push(`prompt is a simple lookup ('${match[0]}')`);
+  }
+  if (failures === 0) {
+    lowSignals.push('no prior failures');
+  }
+
+  return { depth: 'low', signals: lowSignals.length > 0 ? lowSignals : ['no elevated signals detected'] };
+}
+
 /** Main detection function. Input: { prompt, files?, priorFailures? } */
 function detectTask(input) {
   const { prompt = '', files = [], priorFailures = 0 } = input;
@@ -213,6 +336,12 @@ function detectTask(input) {
   // 8. Explanation
   const explanation = buildExplanation({ intent, risk, complexity, fileCount, priorFailures });
 
+  // 9. Reasoning depth
+  const priorOutcomes = priorFailures > 0
+    ? Array.from({ length: priorFailures }, () => ({ failed: true }))
+    : [];
+  const { depth: reasoningDepth, signals: reasoningSignals } = classifyReasoningDepth(prompt, files, priorOutcomes);
+
   return {
     intent,
     risk,
@@ -225,6 +354,8 @@ function detectTask(input) {
     requiresWrite: requiresWrite(intent),
     explanation,
     specialist: specialistResult,
+    reasoningDepth,
+    reasoningSignals,
   };
 }
 
@@ -342,4 +473,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   console.log(JSON.stringify(result, null, 2));
 }
 
-export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths, classifySpecialist };
+export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths, classifySpecialist, classifyReasoningDepth };
