@@ -1837,8 +1837,8 @@ async function mainScreen(rl, ask) {
     });
   }
 
-  // ── Actions bar — four product verbs first, then navigation ────────────────
-  const actionsContent = 'd Do  p Plan  r Review  s Ship  │  n New  / Search  q Quit';
+  // ── Actions bar — navigation only (pipeline verbs are internal stages, not menu items) ─
+  const actionsContent = 'n New session  / Search  q Quit';
   const actionsRow     = row(actionsContent);
 
   // ── Print the full box ────────────────────────────────────────────────────
@@ -1948,7 +1948,7 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        const singleKeySet = new Set(['n', 's', 'q', '/', 'i', 'd', 'p', 'r']);
+        const singleKeySet = new Set(['n', 's', 'q', '/', 'i']);
         if (singleKeySet.has(lower)) {
           cleanup();
           process.stdout.write('\n');
@@ -2017,37 +2017,6 @@ async function mainScreen(rl, ask) {
 
   if (choice === 'n') { return { next: 'new-session' }; }
 
-  // Four product verbs
-  if (choice === 'd') {
-    // "Do" — prompt user for a task description, then dispatch
-    const prompt = (await ask('  What do you want to do? ')).trim();
-    if (!prompt) return { next: 'main' };
-    return { next: 'go', prompt };
-  }
-
-  if (choice === 'p') {
-    // "Plan" — dry-run routing for a task
-    const prompt = (await ask('  Describe the task to plan: ')).trim();
-    if (!prompt) return { next: 'main' };
-    return { next: 'go', prompt, dryRun: true };
-  }
-
-  if (choice === 'r') {
-    // "Review" — dual-brain review current diff
-    const { spawnSync } = await import('node:child_process');
-    process.stdout.write('\n  Running dual-brain review...\n\n');
-    spawnSync('node', ['.claude/hooks/dual-brain-review.mjs'], { stdio: 'inherit', cwd });
-    return { next: 'main' };
-  }
-
-  if (choice === 's') {
-    // "Ship" — run quality gate then prompt for commit/PR
-    const { spawnSync } = await import('node:child_process');
-    process.stdout.write('\n  Running quality gate + ship flow...\n\n');
-    spawnSync('node', ['.claude/hooks/quality-gate.mjs'], { stdio: 'inherit', cwd });
-    return { next: 'main' };
-  }
-
   if (choice === '/') {
     const query = (await ask('  Search: ')).trim();
     if (!query) return { next: 'main' };
@@ -2084,6 +2053,7 @@ async function mainScreen(rl, ask) {
     return { next: 'main' };
   }
 
+  if (choice === 's') { return { next: 'settings' }; }
   if (choice === 'i') { return { next: 'import-picker' }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
@@ -2097,26 +2067,8 @@ async function newSessionScreen(rl, ask) {
   const input = (await ask('\n  What do you want to do? ')).trim();
   if (!input) { return { next: 'main' }; }
 
-  const profile = loadProfile(cwd);
-  const detection = detectTask({ prompt: input });
-  const decision = decideRoute({ profile, detection, cwd });
-
-  console.log(`\n  Routing: ${decision.provider}/${decision.model} (${decision.tier})`);
-  console.log(`  Reason: ${decision.explanation}\n`);
-
-  const { spawnSync } = await import('node:child_process');
-  const launchTool = decision.provider === 'openai' ? 'codex' : 'claude';
-  if (launchTool === 'codex') {
-    spawnSync('codex', [input], { stdio: 'inherit' });
-  } else {
-    spawnSync('claude', ['-p', input], { stdio: 'inherit' });
-  }
-
-  // After session ends, capture the most-recent session ID so [c] can resume it
-  const freshSessions = importReplitSessions(cwd);
-  if (freshSessions.length > 0) {
-    saveTerminalState(cwd, getTerminalId(), freshSessions[0].id, launchTool);
-  }
+  // All work routes through pipeline — detect → decide → dispatch with mandatory gates.
+  await cmdGo([input], { cwd });
 
   return { next: 'main' };
 }
@@ -4094,27 +4046,11 @@ async function runScreens(startScreen = 'dashboard') {
   let current = startScreen;
   let ctx = {};
   while (current && current !== 'exit') {
-    // Handle type-to-start dispatch from mainScreen
+    // Handle type-to-start dispatch from mainScreen — all work routes through pipeline.
     if (current === 'go' && ctx.prompt) {
       const prompt = ctx.prompt;
-      const cwd    = process.cwd();
-      const profile   = loadProfile(cwd);
-      const detection = detectTask({ prompt });
-      const decision  = decideRoute({ profile, detection, cwd });
-      process.stdout.write(`\n  Routing: ${decision.provider}/${decision.model} (${decision.tier})\n`);
-      process.stdout.write(`  Reason: ${decision.explanation}\n\n`);
-      const { spawnSync } = await import('node:child_process');
-      const launchTool = decision.provider === 'openai' ? 'codex' : 'claude';
-      if (launchTool === 'codex') {
-        spawnSync('codex', [prompt], { stdio: 'inherit' });
-      } else {
-        spawnSync('claude', ['-p', prompt], { stdio: 'inherit' });
-      }
-      const freshSessions = importReplitSessions(cwd);
-      if (freshSessions.length > 0) {
-        saveTerminalState(cwd, getTerminalId(), freshSessions[0].id, launchTool);
-      }
-      await offerAutoCommit(cwd);
+      const dryRun = ctx.dryRun || false;
+      await cmdGo([prompt], { dryRun });
       current = 'main';
       ctx = {};
       continue;

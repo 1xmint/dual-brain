@@ -1,10 +1,20 @@
 /**
- * doctor.mjs — Internal honesty checker for dual-brain development.
- * NOT for npm users. For developers working on this repo.
+ * doctor.mjs — Diagnostic and recovery stage in the dual-brain pipeline.
+ * Doctor is a diagnostic/recovery stage in the pipeline. It proposes, never implements.
  *
- * Exports: runDoctor, formatDoctorReport, scanClaims, checkDecisions,
- *          checkFoundations, checkRoleBoundaries, checkEvidence, checkTokenWaste,
- *          runHealthCheck, formatHealthReport, compareHealth
+ * Doctor can diagnose problems and propose recovery actions, but it NEVER directly
+ * edits files, dispatches agents, or runs commands. All proposals are returned as
+ * data for the pipeline to execute through its normal gated flow.
+ *
+ * Pipeline interface:
+ *   doctorDiagnose(run)          — pre-execution diagnostic check
+ *   doctorRecover(run, failure)  — post-failure recovery proposal
+ *
+ * Internal honesty checks (for developers working on this repo):
+ *   runDoctor, formatDoctorReport, scanClaims, checkDecisions,
+ *   checkFoundations, checkRoleBoundaries, checkEvidence, checkTokenWaste,
+ *   runHealthCheck, formatHealthReport, compareHealth,
+ *   doctorDiagnose, doctorRecover
  */
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'fs';
@@ -370,6 +380,173 @@ export function formatHealthReport(results) {
 
   if (staticChecks) out.push('', '  Static checks: ' + (staticChecks.summary?.verdict || 'unknown'));
   return out.join('\n');
+}
+
+// ─── Pipeline Stage: Diagnose ─────────────────────────────────────────────────
+
+/**
+ * Pipeline-compatible diagnostic check. Called before execution to surface
+ * blocking or advisory findings based on the current pipeline run context.
+ *
+ * @param {object} run - PipelineRun object
+ * @param {object}   run.context         - Context pack (prompt, files, detection, profile, cwd)
+ * @param {object[]} run.failureHistory  - Prior failures for this prompt fingerprint
+ * @param {object[]} run.priorOutcomes   - Recent outcome records
+ * @param {object}   run.plan            - Execution plan (may be null before buildExecutionPlan)
+ * @returns {Promise<{
+ *   findings: Array<{check: string, severity: string, message: string}>,
+ *   canProceed: boolean,
+ *   suggestedFixes: string[],
+ *   blockedApproaches: string[]
+ * }>}
+ */
+export async function doctorDiagnose(run) {
+  const { context = {}, failureHistory = [], priorOutcomes = [], plan = null } = run;
+  const cwd = context.cwd ?? process.cwd();
+
+  const findings = [];
+  const suggestedFixes = [];
+
+  // ── Role boundary check: pull from audit log ──────────────────────────────
+  const roleBoundaries = await checkRoleBoundaries(cwd);
+  for (const rb of roleBoundaries) {
+    findings.push({ check: 'role-boundaries', severity: rb.severity, message: rb.message });
+  }
+  if (roleBoundaries.length > 0) {
+    suggestedFixes.push('Dispatch search/work agents instead of using Read/Write/Bash directly from HEAD.');
+  }
+
+  // ── Evidence integrity check ──────────────────────────────────────────────
+  const evidenceIssues = await checkEvidence(cwd);
+  for (const ev of evidenceIssues) {
+    findings.push({ check: 'evidence', severity: ev.severity, message: ev.message });
+  }
+  if (evidenceIssues.some(e => e.type === 'false-file-claim')) {
+    suggestedFixes.push('Verify file claims match actual git state before recording outcomes as successful.');
+  }
+
+  // ── Token waste check ─────────────────────────────────────────────────────
+  const wasteIssues = await checkTokenWaste(cwd);
+  for (const tw of wasteIssues) {
+    findings.push({ check: 'token-waste', severity: tw.severity, message: tw.message });
+  }
+
+  // ── Foundation integrity check ────────────────────────────────────────────
+  const { issues: foundationIssues } = await checkFoundations(cwd);
+  for (const fi of foundationIssues) {
+    if (fi.type === 'dependent-on-invalidated') {
+      findings.push({
+        check: 'foundations',
+        severity: 'block',
+        message: `Active work depends on invalidated foundation "${fi.invalidatedFoundation}" via ${fi.file.join(', ')}`,
+      });
+      suggestedFixes.push(`Resolve dependency on invalidated foundation "${fi.invalidatedFoundation}" before proceeding.`);
+    }
+  }
+
+  // ── Repeated failure detection ────────────────────────────────────────────
+  const repeatFailures = failureHistory.filter(f => !f.resolved);
+  if (repeatFailures.length >= 2) {
+    findings.push({
+      check: 'failure-history',
+      severity: 'block',
+      message: `${repeatFailures.length} unresolved prior failures for this prompt — repeated approach likely to fail again.`,
+    });
+    suggestedFixes.push('Escalate to dual-brain think flow before retrying. Prior approaches must not be repeated.');
+  } else if (repeatFailures.length === 1) {
+    findings.push({
+      check: 'failure-history',
+      severity: 'warn',
+      message: '1 prior failure for this prompt — verify the approach differs before proceeding.',
+    });
+  }
+
+  // ── Risk/plan consistency check ───────────────────────────────────────────
+  if (plan && context.detection) {
+    const { risk } = context.detection;
+    if (risk === 'critical' && !plan.useChallenger) {
+      findings.push({
+        check: 'plan-consistency',
+        severity: 'warn',
+        message: 'Critical-risk task routed without challenger — dual-brain think is recommended.',
+      });
+      suggestedFixes.push('Enable challenger or run dual-brain think before executing critical-risk tasks.');
+    }
+  }
+
+  // ── Derive blocked approaches from failure history ────────────────────────
+  const blockedApproaches = repeatFailures
+    .filter(f => f.approach)
+    .map(f => f.approach);
+
+  const canProceed = !findings.some(f => f.severity === 'block');
+
+  return { findings, canProceed, suggestedFixes, blockedApproaches };
+}
+
+// ─── Pipeline Stage: Recover ──────────────────────────────────────────────────
+
+/**
+ * Pipeline-compatible recovery proposer. Called when pipeline execution fails.
+ * Returns a recovery proposal for the pipeline to route — never executes directly.
+ *
+ * @param {object} run - PipelineRun object (same shape as doctorDiagnose)
+ * @param {object} failure - Failure context from the failed execution
+ * @param {string}  [failure.error]      - Error message
+ * @param {string}  [failure.approach]   - What was attempted
+ * @param {string}  [failure.tier]       - Tier that failed ('search'|'execute'|'think')
+ * @param {number}  [failure.failCount]  - How many times this has failed
+ * @returns {Promise<{
+ *   proposal: string,
+ *   avoidApproaches: string[],
+ *   escalation: string|null
+ * }>}
+ */
+export async function doctorRecover(run, failure = {}) {
+  const { failureHistory = [] } = run;
+  const { error = '', approach = '', tier = 'execute', failCount = 1 } = failure;
+
+  // Collect all previously failed approaches from history + this failure
+  const avoidApproaches = [
+    ...failureHistory.filter(f => f.approach).map(f => f.approach),
+    ...(approach ? [approach] : []),
+  ].filter(Boolean);
+
+  // Determine escalation: 2+ failures → dual-brain think
+  const totalFailures = failureHistory.filter(f => !f.resolved).length + 1;
+  const escalation = totalFailures >= 2 ? 'dual-brain' : null;
+
+  // Build a concrete recovery proposal without implementing anything
+  const proposalParts = [];
+
+  if (escalation === 'dual-brain') {
+    proposalParts.push(
+      `Escalate to dual-brain think flow: ${totalFailures} failures indicate the approach is fundamentally flawed.`,
+      'Run: node .claude/hooks/dual-brain-think.mjs --question "<revised problem statement>"',
+      'Do not retry the same implementation path.',
+    );
+  } else {
+    if (tier === 'search') {
+      proposalParts.push('Retry search with narrower scope or different file patterns.');
+    } else if (tier === 'execute') {
+      proposalParts.push(
+        'Re-route through execute tier with a revised task description.',
+        error ? `Prior error was: ${error.slice(0, 120)}` : '',
+      );
+    } else if (tier === 'think') {
+      proposalParts.push('Re-run think tier with more context or an explicit constraint list.');
+    } else {
+      proposalParts.push('Retry with a revised task description that avoids the failed approach.');
+    }
+
+    if (avoidApproaches.length > 0) {
+      proposalParts.push(`Explicitly exclude these approaches: ${avoidApproaches.join(', ')}`);
+    }
+  }
+
+  const proposal = proposalParts.filter(Boolean).join(' ');
+
+  return { proposal, avoidApproaches, escalation };
 }
 
 // ─── Health Baseline Comparison ───────────────────────────────────────────────

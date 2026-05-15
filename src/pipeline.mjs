@@ -1,15 +1,220 @@
 #!/usr/bin/env node
 // pipeline.mjs — Unified Pipeline for dual-brain.
 // Every feature (go, think, review, watch, auto-commit, pr-triage, wave) routes through here.
-// Exports: runPipeline, buildExecutionPlan, formatExecutionPlan
+// Exports: runPipeline, buildExecutionPlan, formatExecutionPlan, createPipelineRun
+// Gate exports: contextGate, planningGate, principleGate, executionGate, outcomeGate
 
 import { execSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { detectTask } from './detect.mjs';
 import { decideRoute, getWorkStyle, WORK_STYLES } from './decide.mjs';
 import { dispatch } from './dispatch.mjs';
 import { loadProfile } from './profile.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+// ─── PipelineRun factory ──────────────────────────────────────────────────────
+
+/**
+ * Create a fresh PipelineRun object.
+ * @param {string} trigger
+ * @param {string} prompt
+ * @returns {object}
+ */
+export function createPipelineRun(trigger = '', prompt = '') {
+  return {
+    id: randomUUID(),
+    startedAt: Date.now(),
+    trigger,
+    prompt,
+
+    // Phase 1: Context
+    context: null,
+    failureHistory: null,   // result of checkFailureHistory — even empty counts as "queried"
+    priorOutcomes: null,    // result of getRelevantOutcomes — even empty counts as "queried"
+
+    // Gate results
+    gates: {
+      context:   null,   // { passed: bool, reason: string }
+      planning:  null,
+      principle: null,
+      execution: null,
+      outcome:   null,
+    },
+
+    // Phase 2: Plan
+    plan: null,
+
+    // Phase 3: Execution
+    result: null,
+
+    // Phase 4: Verification
+    verification: null,
+
+    // Phase 5: Outcome
+    outcome: null,
+
+    completedAt: null,
+  };
+}
+
+// ─── Gate helpers ─────────────────────────────────────────────────────────────
+
+function gate(passed, reason) {
+  return { passed: Boolean(passed), reason: reason ?? '' };
+}
+
+// ─── Principle predicates ─────────────────────────────────────────────────────
+
+/**
+ * Block if 2 or more prior failures on the same approach.
+ */
+function rejectsRepeatedFailedApproach(run) {
+  const count = run.failureHistory?.failureCount ?? 0;
+  if (count >= 2) {
+    return { blocked: true, reason: `${count} prior failures on similar approach — must change strategy or use dual-brain` };
+  }
+  return { blocked: false };
+}
+
+/**
+ * Block if no plan is present.
+ */
+function requiresApprovedPlan(run) {
+  if (!run.plan) {
+    return { blocked: true, reason: 'No execution plan — pipeline cannot proceed without a plan' };
+  }
+  return { blocked: false };
+}
+
+/**
+ * Warn if plan touches more than 10 files or 3+ unrelated areas.
+ * Not a hard block — returns warning in reason but blocked: false.
+ */
+function rejectsScopeCreep(run) {
+  const fileCount = run.context?.files?.explicit?.length ?? 0;
+  const extractedCount = run.context?.files?.extracted?.length ?? 0;
+  const total = fileCount + extractedCount;
+
+  if (total > 10) {
+    return { blocked: false, reason: `Scope warning: plan touches ${total} files — consider splitting into smaller tasks` };
+  }
+  return { blocked: false };
+}
+
+/**
+ * Block high/critical risk tasks that have no challenger configured.
+ */
+function requiresDualBrainForHighRisk(run) {
+  const risk = run.context?.detection?.risk ?? 'low';
+  const hasChallenger = run.plan?.useChallenger && run.plan?.challengerModel;
+
+  if ((risk === 'high' || risk === 'critical') && !hasChallenger) {
+    return { blocked: true, reason: `High-risk task (${risk}) requires dual-brain challenger — configure OpenAI provider or lower risk scope` };
+  }
+  return { blocked: false };
+}
+
+// ─── Five mandatory gates ─────────────────────────────────────────────────────
+
+/**
+ * Gate 1: Context gate.
+ * Passes only if failureHistory and priorOutcomes were actually queried (not null).
+ */
+export function contextGate(run) {
+  if (run.failureHistory === null) {
+    return gate(false, 'failureHistory was never queried — context phase incomplete');
+  }
+  if (run.priorOutcomes === null) {
+    return gate(false, 'priorOutcomes was never queried — context phase incomplete');
+  }
+  if (run.context === null) {
+    return gate(false, 'context pack was never built — context phase incomplete');
+  }
+  return gate(true, 'context loaded');
+}
+
+/**
+ * Gate 2: Planning gate.
+ * Passes if plan exists AND the proposed approach doesn't repeat a known failure.
+ */
+export function planningGate(run) {
+  if (!run.plan) {
+    return gate(false, 'No execution plan built');
+  }
+
+  // Check if the approach matches a prior failure
+  const history = run.failureHistory;
+  if (history?.hasPriorFailures && history?.escalation?.recommended) {
+    const esc = history.escalation;
+    // If the plan doesn't reflect the escalation (still using low depth when ultra is recommended)
+    const planDepth = run.plan.reasoningDepth ?? 'low';
+    const needsDepth = esc.toDepth ?? 'low';
+    const depthOrder = ['low', 'medium', 'high', 'ultra'];
+    const planIdx = depthOrder.indexOf(planDepth);
+    const needsIdx = depthOrder.indexOf(needsDepth);
+
+    if (planIdx < needsIdx) {
+      return gate(
+        false,
+        `Plan uses ${planDepth} reasoning but prior failures require ${needsDepth}. ${esc.reason}. Use a different strategy.`
+      );
+    }
+  }
+
+  return gate(true, 'plan approved');
+}
+
+/**
+ * Gate 3: Principle gate.
+ * Runs all principle predicates — any hard block fails the gate.
+ */
+export function principleGate(run) {
+  const checks = [
+    rejectsRepeatedFailedApproach(run),
+    requiresApprovedPlan(run),
+    rejectsScopeCreep(run),
+    requiresDualBrainForHighRisk(run),
+  ];
+
+  const blocked = checks.find(c => c.blocked);
+  if (blocked) {
+    return gate(false, blocked.reason);
+  }
+
+  // Collect non-blocking warnings for the reason field
+  const warnings = checks.filter(c => !c.blocked && c.reason).map(c => c.reason);
+  return gate(true, warnings.length ? warnings.join('; ') : 'all principles satisfied');
+}
+
+/**
+ * Gate 4: Execution gate.
+ * Final "cleared to work?" check — all previous gates must have passed and plan must exist.
+ */
+export function executionGate(run) {
+  const prevGates = ['context', 'planning', 'principle'];
+  for (const name of prevGates) {
+    const g = run.gates[name];
+    if (!g || !g.passed) {
+      return gate(false, `Upstream gate '${name}' did not pass — cannot proceed to execution`);
+    }
+  }
+  if (!run.plan) {
+    return gate(false, 'No plan present at execution gate');
+  }
+  return gate(true, 'cleared for execution');
+}
+
+/**
+ * Gate 5: Outcome gate.
+ * After execution, checks that an outcome was recorded.
+ */
+export function outcomeGate(run) {
+  if (run.result && run.outcome === null) {
+    return gate(false, 'Execution completed but outcome was not recorded');
+  }
+  return gate(true, 'outcome recorded');
+}
 
 // ─── Context Pack ─────────────────────────────────────────────────────────────
 
@@ -336,10 +541,12 @@ async function verify(result, plan, cwd) {
 
 // ─── Outcome recording ────────────────────────────────────────────────────────
 
-async function recordOutcomeSafe(plan, result, verification) {
+async function recordOutcomeSafe(run) {
   try {
     const { recordOutcome } = await import('./outcome.mjs');
-    await recordOutcome({ plan, result, verification });
+    const cwd = run.context?.cwd ?? process.cwd();
+    const recorded = await recordOutcome(run.plan, run.result, run.verification, cwd);
+    run.outcome = recorded;
   } catch {
     // outcome.mjs doesn't exist yet — silently skip
   }
@@ -371,6 +578,27 @@ async function _loadProfileSafe(cwd) {
   }
 }
 
+// ─── Gate runner ─────────────────────────────────────────────────────────────
+
+/**
+ * Run a named gate, store its result in run.gates, and return whether it passed.
+ * If gate throws, it is treated as a failure (fail-closed).
+ */
+function runGate(run, gateName, gateFn) {
+  let result;
+  try {
+    result = gateFn(run);
+  } catch (err) {
+    result = gate(false, `Gate '${gateName}' threw: ${err.message}`);
+  }
+  // Treat missing result or missing passed field as fail-closed
+  if (!result || typeof result.passed !== 'boolean') {
+    result = gate(false, `Gate '${gateName}' returned invalid result`);
+  }
+  run.gates[gateName] = result;
+  return result.passed;
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /**
@@ -386,7 +614,7 @@ async function _loadProfileSafe(cwd) {
  * @param {string}   [options.forceDepth]      Override reasoning depth
  * @param {boolean}  [options.forceChallenger] Force dual-brain challenger
  * @param {boolean}  [options.silent]          Suppress all output
- * @returns {Promise<{ plan: object, result: object|null, verification: object|null }>}
+ * @returns {Promise<{ plan: object, result: object|null, verification: object|null } | { success: false, gateFailure: string, reason: string, run: object } | { success: true, run: object }>}
  */
 export async function runPipeline(trigger, prompt, options = {}) {
   const {
@@ -401,67 +629,131 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
   const log = silent ? () => {} : (msg) => process.stderr.write(msg + '\n');
 
-  let contextPack, plan, result = null, verification = null;
+  // Create the PipelineRun state object
+  const run = createPipelineRun(trigger, prompt);
 
   try {
-    // ── Step 1: Context Pack ─────────────────────────────────────────────────
-    contextPack = await buildContextPack(prompt, files, cwd);
+    // ── Phase 1: Context ──────────────────────────────────────────────────────
 
-    // ── Step 2: Execution Plan ───────────────────────────────────────────────
-    plan = buildExecutionPlan(contextPack, trigger, { forceDepth, forceChallenger });
+    // Build context pack
+    run.context = await buildContextPack(prompt, files, cwd);
+
+    // Query failure history (must happen before context gate)
+    try {
+      const { checkFailureHistory } = await import('./failure-memory.mjs');
+      run.failureHistory = await checkFailureHistory(prompt, files, cwd);
+    } catch {
+      // failure-memory.mjs unavailable — set to empty result so gate still passes
+      run.failureHistory = { hasPriorFailures: false, failureCount: 0, lastFailure: null, escalation: { recommended: false } };
+    }
+
+    // Query relevant outcomes (must happen before context gate)
+    try {
+      const { getRelevantOutcomes } = await import('./outcome.mjs');
+      run.priorOutcomes = await getRelevantOutcomes(prompt, files, cwd);
+    } catch {
+      // outcome.mjs unavailable — set to empty array so gate still passes
+      run.priorOutcomes = [];
+    }
+
+    // Gate 1: Context gate
+    if (!runGate(run, 'context', contextGate)) {
+      run.completedAt = Date.now();
+      return { success: false, gateFailure: 'context', reason: run.gates.context.reason, run };
+    }
+
+    // ── Phase 2: Plan ─────────────────────────────────────────────────────────
+
+    run.plan = buildExecutionPlan(run.context, trigger, { forceDepth, forceChallenger });
 
     if (verbose || dryRun) {
-      log(formatExecutionPlan(plan));
+      log(formatExecutionPlan(run.plan));
+    }
+
+    // Gate 2: Planning gate
+    if (!runGate(run, 'planning', planningGate)) {
+      run.completedAt = Date.now();
+      return { success: false, gateFailure: 'planning', reason: run.gates.planning.reason, run };
+    }
+
+    // Gate 3: Principle gate
+    if (!runGate(run, 'principle', principleGate)) {
+      run.completedAt = Date.now();
+      return { success: false, gateFailure: 'principle', reason: run.gates.principle.reason, run };
     }
 
     if (dryRun) {
-      return { plan, result: null, verification: null };
+      run.completedAt = Date.now();
+      // Return legacy-compatible shape for dry-run callers
+      return { plan: run.plan, result: null, verification: null, run };
     }
 
-    // ── Step 3: Checkpoint (best-effort, before execute) ────────────────────
-    if (plan.checkpointRequired) {
-      await createCheckpoint(cwd, contextPack);
+    // Gate 4: Execution gate (cleared to work?)
+    if (!runGate(run, 'execution', executionGate)) {
+      run.completedAt = Date.now();
+      return { success: false, gateFailure: 'execution', reason: run.gates.execution.reason, run };
     }
 
-    // ── Step 4: Execute ──────────────────────────────────────────────────────
-    const decision = {
-      ...plan._decision,
-      // Pass reasoning depth as a hint; dispatch uses effort from decision
-    };
+    // ── Phase 3: Execute ──────────────────────────────────────────────────────
 
-    result = await dispatch({
+    // Checkpoint (best-effort, before execute)
+    if (run.plan.checkpointRequired) {
+      await createCheckpoint(cwd, run.context);
+    }
+
+    const decision = { ...run.plan._decision };
+
+    run.result = await dispatch({
       decision,
       prompt,
       files,
       cwd,
       dryRun: false,
       verbose,
-      profile: contextPack.profile,
+      profile: run.context.profile,
     });
 
-    // ── Step 5: Verify ───────────────────────────────────────────────────────
-    verification = await verify(result, plan, cwd);
+    // ── Phase 4: Verification ─────────────────────────────────────────────────
+
+    run.verification = await verify(run.result, run.plan, cwd);
 
     if (verbose) {
-      log(`[pipeline] verification: ${verification.ok ? 'ok' : 'failed'}`);
-      for (const note of verification.notes) log(`[pipeline]   ${note}`);
+      log(`[pipeline] verification: ${run.verification.ok ? 'ok' : 'failed'}`);
+      for (const note of run.verification.notes) log(`[pipeline]   ${note}`);
     }
 
-    if (!verification.ok) {
+    if (!run.verification.ok) {
       _incrementFailureCache(prompt);
+    }
+
+    // ── Phase 5: Outcome ──────────────────────────────────────────────────────
+
+    await recordOutcomeSafe(run);
+
+    // Gate 5: Outcome gate
+    if (!runGate(run, 'outcome', outcomeGate)) {
+      run.completedAt = Date.now();
+      return { success: false, gateFailure: 'outcome', reason: run.gates.outcome.reason, run };
     }
 
   } catch (err) {
     log(`[pipeline] error in pipeline step: ${err.message}`);
-    result = { status: 'error', error: err.message };
-    verification = { ok: false, notes: [err.message] };
-    if (contextPack) _incrementFailureCache(prompt);
+    run.result = { status: 'error', error: err.message };
+    run.verification = { ok: false, notes: [err.message] };
+    if (run.context) _incrementFailureCache(prompt);
+    run.completedAt = Date.now();
+    return { success: false, gateFailure: 'error', reason: err.message, run };
   }
 
-  // ── Step 6: Outcome Record ───────────────────────────────────────────────
-  if (plan) {
-    await recordOutcomeSafe(plan, result, verification);
-  }
+  run.completedAt = Date.now();
 
-  return { plan: plan ?? null, result, verification };
+  // Return both new-style and legacy-compatible shapes
+  return {
+    success: true,
+    run,
+    // Legacy compatibility
+    plan: run.plan,
+    result: run.result,
+    verification: run.verification,
+  };
 }

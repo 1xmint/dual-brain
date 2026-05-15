@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// HEAD dispatches into pipeline. No direct implementation. No side doors.
 // head-guard.mjs — Strict default-deny enforcement for HEAD session.
 // Reads Claude Code hook stdin JSON protocol (PreToolUse event).
 //
@@ -337,6 +338,10 @@ function checkBashPolicy(command) {
   if (/^node\s+\.claude\/hooks\//.test(cmd)) return { allowed: true, reason: 'bash-hook-script' };
   if (/^node\s+\/home\/runner\/workspace\/.claude\/hooks\//.test(cmd)) return { allowed: true, reason: 'bash-hook-script-abs' };
 
+  // Allowed: pipeline entry point (all work flows through pipeline.mjs with mandatory gates)
+  if (/^node\s+src\/pipeline\.mjs(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-pipeline' };
+  if (/^node\s+\/home\/runner\/workspace\/src\/pipeline\.mjs(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-pipeline-abs' };
+
   // Allowed: dual-brain CLI
   if (/^dual-brain(\s|$)/.test(cmd)) return { allowed: true, reason: 'bash-dual-brain' };
 
@@ -383,12 +388,21 @@ function checkBashPolicy(command) {
  * Break-glass is checked before calling this (callers handle it).
  */
 function getToolVerdict(tName, toolInput) {
-  // Agent dispatch — always allowed (this is HEAD's primary job)
+  // Agent dispatch — always allowed (this is HEAD's primary job).
+  // Architectural intent: Agent dispatches should go through pipeline.mjs so that
+  // mandatory gates (detect → decide → dispatch) are enforced. We cannot fully verify
+  // this at the hook level, but the pipeline is the required entry point for all work.
   if (tName === 'Agent') return { allowed: true, reason: 'agent-dispatch' };
 
-  // Write — always blocked (memory path gets a more specific message)
+  // Write — always blocked.
+  // src/ and bin/ writes are hard-blocked here in addition to the general deny:
+  // these directories contain pipeline logic and must only be modified by work agents
+  // dispatched through the pipeline with proper gate enforcement.
   if (tName === 'Write') {
     const filePath = (toolInput?.file_path || '').replace(/\\/g, '/');
+    if (/(?:^|\/)(?:src|bin)\//.test(filePath)) {
+      return { allowed: false, reason: 'HEAD cannot write to src/ or bin/ — dispatch a work agent through pipeline' };
+    }
     if (filePath.includes('/memory/') || filePath.includes('claude-persistent')) {
       return { allowed: false, reason: 'HEAD cannot write memories — fix the code instead' };
     }
