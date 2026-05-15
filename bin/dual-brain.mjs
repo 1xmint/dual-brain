@@ -45,6 +45,27 @@ function flag(args, name) { const i = args.indexOf(name); return i !== -1 ? (arg
 function err(msg) { process.stderr.write(`Error: ${msg}\n`); process.exit(1); }
 function vtrace(msg) { process.stderr.write(`[verbose] ${msg}\n`); }
 
+function daysUntil(isoDate) {
+  if (!isoDate) return null;
+  const ms = Date.parse(isoDate) - Date.now();
+  return Math.ceil(ms / 86400000);
+}
+
+async function askExpiry(ask, provLabel) {
+  console.log(`  ${provLabel} — how long should this auth last?`);
+  console.log('    (1) 1 week   (2) 2 weeks   (3) 1 month   (4) Custom date   (Enter) No expiry');
+  const choice = (await ask('  > ')).trim();
+  const now = new Date();
+  if (choice === '1') { now.setDate(now.getDate() + 7); return now.toISOString(); }
+  if (choice === '2') { now.setDate(now.getDate() + 14); return now.toISOString(); }
+  if (choice === '3') { now.setMonth(now.getMonth() + 1); return now.toISOString(); }
+  if (choice === '4') {
+    const d = (await ask('  Date YYYY-MM-DD: ')).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return new Date(d).toISOString();
+  }
+  return null;
+}
+
 function printHelp() {
   console.log(`
 dual-brain <command> [options]
@@ -703,12 +724,10 @@ async function welcomeScreen(rl, ask) {
     for (const provider of ['claude', 'openai']) {
       if (!existingProfile.providers[provider]?.enabled) continue;
       const provLabel = provider === 'claude' ? 'Claude' : 'OpenAI';
-      const label = (await ask(`  ${provLabel} label (e.g. "Josh's account"): `)).trim();
+      const label = (await ask(`  ${provLabel} label (e.g. "Josh's $100 sub"): `)).trim();
       if (label) existingProfile.providers[provider].label = label;
-      const expiryStr = (await ask(`  ${provLabel} expiry YYYY-MM-DD (auto-refreshes when expired, or Enter to skip): `)).trim();
-      if (expiryStr && /^\d{4}-\d{2}-\d{2}$/.test(expiryStr)) {
-        existingProfile.providers[provider].expiresAt = new Date(expiryStr).toISOString();
-      }
+      const expiry = await askExpiry(ask, provLabel);
+      if (expiry) existingProfile.providers[provider].expiresAt = expiry;
     }
   }
 
@@ -753,10 +772,20 @@ async function mainScreen(rl, ask) {
   const claudeExpired = claudeSub?.expiresAt && Date.parse(claudeSub.expiresAt) < now;
   const openaiExpired = openaiSub?.expiresAt && Date.parse(openaiSub.expiresAt) < now;
 
-  let claudeStatus = auth.claude.found ? `Claude: ${claudePlan} ✓` : `Claude: not logged in`;
-  let openaiStatus = auth.openai.found ? `OpenAI: ${openaiPlan} ✓` : `OpenAI: not logged in`;
-  if (claudeExpired) claudeStatus = `Claude: ${claudePlan} ⚠ expired`;
-  if (openaiExpired) openaiStatus = `OpenAI: ${openaiPlan} ⚠ expired`;
+  const claudeDays = daysUntil(claudeSub?.expiresAt);
+  const openaiDays = daysUntil(openaiSub?.expiresAt);
+
+  function subStatus(name, plan, found, expired, days, sub) {
+    if (!found) return `${name}: not logged in`;
+    let s = `${name}: ${plan} ✓`;
+    if (sub?.label) s += ` [${sub.label}]`;
+    if (expired) return `${name}: ${plan} ⚠ expired${sub?.label ? ` [${sub.label}]` : ''}`;
+    if (days !== null && days <= 7) s += ` (${days}d left)`;
+    return s;
+  }
+
+  let claudeStatus = subStatus('Claude', claudePlan, auth.claude.found, claudeExpired, claudeDays, claudeSub);
+  let openaiStatus = subStatus('OpenAI', openaiPlan, auth.openai.found, openaiExpired, openaiDays, openaiSub);
 
   console.log(`\ndual-brain v${version}`);
   console.log(`${claudeStatus}  ·  ${openaiStatus}`);
@@ -1073,15 +1102,10 @@ async function subscriptionsScreen(rl, ask) {
       const provLabel = provider === 'claude' ? 'Claude' : 'OpenAI';
       const currentLabel = prov.label || '';
       const label = (await ask(`  ${provLabel} label [${currentLabel || 'none'}]: `)).trim();
-      if (label) prov.label = label;
-      const currentExpiry = prov.expiresAt ? prov.expiresAt.slice(0, 10) : '';
-      const expiryStr = (await ask(`  ${provLabel} expiry YYYY-MM-DD [${currentExpiry || 'none'}]: `)).trim();
-      if (expiryStr && /^\d{4}-\d{2}-\d{2}$/.test(expiryStr)) {
-        prov.expiresAt = new Date(expiryStr).toISOString();
-      } else if (expiryStr === '-') {
-        delete prov.expiresAt;
-        delete prov.label;
-      }
+      if (label === '-') { delete prov.label; }
+      else if (label) { prov.label = label; }
+      const expiry = await askExpiry(ask, provLabel);
+      if (expiry) { prov.expiresAt = expiry; }
     }
     saveProfile(profile, { cwd });
     console.log('  Team config saved.');
