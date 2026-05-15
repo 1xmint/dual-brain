@@ -284,6 +284,39 @@ async function cmdStatus(args = []) {
     vtrace(`Raw profile:\n${JSON.stringify(profile, null, 2)}`);
   }
 
+  // Enforcement health check
+  console.log('\nEnforcement:');
+  try {
+    const { readFileSync: rfs, existsSync: exs } = await import('node:fs');
+    const settingsFile = join(cwd, '.claude', 'settings.json');
+    if (!exs(settingsFile)) {
+      console.log('  NOT INSTALLED — run: dual-brain install');
+    } else {
+      const settings = JSON.parse(rfs(settingsFile, 'utf8'));
+      const preToolUse = settings?.hooks?.PreToolUse ?? [];
+      const guardCmd  = 'bash .claude/hooks/head-guard.sh';
+      const tierCmd   = 'node .claude/hooks/enforce-tier.mjs';
+      const hasEdit   = preToolUse.some(e => e.matcher === 'Edit'   && e.hooks?.some(h => h.command === guardCmd));
+      const hasWrite  = preToolUse.some(e => e.matcher === 'Write'  && e.hooks?.some(h => h.command === guardCmd));
+      const hasBash   = preToolUse.some(e => e.matcher === 'Bash'   && e.hooks?.some(h => h.command === guardCmd));
+      const hasAgent  = preToolUse.some(e => e.matcher === 'Agent'  && e.hooks?.some(h => h.command === tierCmd));
+      const activeCount = [hasEdit, hasWrite, hasBash, hasAgent].filter(Boolean).length;
+      if (activeCount === 4) {
+        console.log(`  active (${activeCount} guards: Edit, Write, Bash, Agent)`);
+      } else {
+        const missing = [
+          !hasEdit  && 'Edit',
+          !hasWrite && 'Write',
+          !hasBash  && 'Bash',
+          !hasAgent && 'Agent',
+        ].filter(Boolean);
+        console.log(`  PARTIAL — missing guards: ${missing.join(', ')} — run: dual-brain install`);
+      }
+    }
+  } catch {
+    console.log('  unknown (could not read .claude/settings.json)');
+  }
+
   // Update check
   try {
     const localVer  = readVersion();
@@ -330,9 +363,27 @@ function cmdCool(providerArg) {
 }
 
 async function cmdInstall() {
+  const cwd = process.cwd();
+
+  // Run the main install.mjs (orchestrator config, all hooks, CLAUDE.md, etc.)
   const { spawnSync } = await import('child_process');
-  const result = spawnSync('node', [join(__dirname, '..', 'install.mjs')], { stdio: 'inherit', cwd: process.cwd() });
-  process.exit(result.status || 0);
+  const result = spawnSync('node', [join(__dirname, '..', 'install.mjs')], { stdio: 'inherit', cwd });
+  if (result.status !== 0) { process.exit(result.status || 1); }
+
+  // Additionally merge enforcement hooks into .claude/settings.json
+  const { installHooks } = await import('../src/install-hooks.mjs');
+  const { installed, skipped } = installHooks(cwd);
+
+  if (installed.length > 0) {
+    console.log(`\nEnforcement hooks installed (${installed.length}):`);
+    for (const item of installed) console.log(`  + ${item}`);
+  }
+  if (skipped.length > 0) {
+    console.log(`Enforcement hooks already present (${skipped.length}):`);
+    for (const item of skipped) console.log(`  = ${item}`);
+  }
+
+  process.exit(0);
 }
 
 function cmdRemember(text) {

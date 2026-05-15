@@ -744,38 +744,49 @@ function generateSettings(workspace) {
   let existing = {};
   try { existing = JSON.parse(readFileSync(settingsPath, 'utf8')); } catch {}
 
-  const hooks = {
-    PreToolUse: [
-      {
-        matcher: 'Agent',
-        hooks: [{ type: 'command', command: 'node .claude/hooks/enforce-tier.mjs' }],
-      },
-    ],
-    PostToolUse: [
-      {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'node .claude/hooks/cost-logger.mjs' }],
-      },
-      {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'node .claude/hooks/auto-update-wrapper.mjs' }],
-      },
-    ],
-  };
+  const HEAD_GUARD_CMD = 'bash .claude/hooks/head-guard.sh';
+  const ENFORCE_TIER_CMD = 'node .claude/hooks/enforce-tier.mjs';
+
+  // All dual-brain PreToolUse hooks we manage
+  const DESIRED_PRE = [
+    { matcher: 'Edit',         command: HEAD_GUARD_CMD },
+    { matcher: 'Write',        command: HEAD_GUARD_CMD },
+    { matcher: 'NotebookEdit', command: HEAD_GUARD_CMD },
+    { matcher: 'Bash',         command: HEAD_GUARD_CMD },
+    { matcher: 'Agent',        command: ENFORCE_TIER_CMD },
+  ];
 
   const DUAL_BRAIN_CMDS = [
-    'node .claude/hooks/enforce-tier.mjs',
+    HEAD_GUARD_CMD,
+    ENFORCE_TIER_CMD,
     'node .claude/hooks/cost-logger.mjs',
     'node .claude/hooks/auto-update-wrapper.mjs',
   ];
 
-  const merged = { ...(existing.hooks || {}) };
-  for (const [event, entries] of Object.entries(hooks)) {
-    const existingEntries = (merged[event] || []).filter(e =>
-      !e.hooks?.some(h => DUAL_BRAIN_CMDS.includes(h.command))
-    );
-    merged[event] = [...existingEntries, ...entries];
+  // Build merged PreToolUse: keep user entries that aren't ours, then add ours
+  const existingPre = (existing.hooks?.PreToolUse || []).filter(e =>
+    !e.hooks?.some(h => DUAL_BRAIN_CMDS.includes(h.command))
+  );
+  const mergedPre = [...existingPre];
+  for (const { matcher, command } of DESIRED_PRE) {
+    mergedPre.push({ matcher, hooks: [{ type: 'command', command }] });
   }
+
+  // Build merged PostToolUse
+  const postHooks = [
+    { matcher: '', hooks: [{ type: 'command', command: 'node .claude/hooks/cost-logger.mjs' }] },
+    { matcher: '', hooks: [{ type: 'command', command: 'node .claude/hooks/auto-update-wrapper.mjs' }] },
+  ];
+  const existingPost = (existing.hooks?.PostToolUse || []).filter(e =>
+    !e.hooks?.some(h => DUAL_BRAIN_CMDS.includes(h.command))
+  );
+  const mergedPost = [...existingPost, ...postHooks];
+
+  const merged = {
+    ...(existing.hooks || {}),
+    PreToolUse: mergedPre,
+    PostToolUse: mergedPost,
+  };
 
   return { ...existing, hooks: merged };
 }
@@ -875,8 +886,8 @@ function install(workspace, env, mode) {
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
 
-  // Copy bash hooks (auto-update.sh lives alongside .mjs hooks in the package)
-  const BASH_HOOKS = ['auto-update.sh'];
+  // Copy bash hooks (auto-update.sh and head-guard.sh live alongside .mjs hooks in the package)
+  const BASH_HOOKS = ['auto-update.sh', 'head-guard.sh'];
   for (const h of BASH_HOOKS) {
     const src = join(__dirname, 'hooks', h);
     const dst = join(target, 'hooks', h);
