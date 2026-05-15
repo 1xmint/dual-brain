@@ -32,6 +32,7 @@
   },
   "scripts": {
     "test": "node hooks/test-orchestrator.mjs",
+    "test:core": "node --test src/test.mjs",
     "postinstall": "node install.mjs"
   },
   "engines": {

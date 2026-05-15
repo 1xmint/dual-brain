@@ -122,12 +122,12 @@ export function getModelCapabilities(model) {
 
 /**
  * Return which models the user can access given their profile's provider plans.
- * @param {{ subscriptions?: { claude?: { plan?: string }, openai?: { plan?: string } } }} profile
+ * @param {{ providers?: { claude?: { plan?: string, enabled?: boolean }, openai?: { plan?: string, enabled?: boolean } } }} profile
  * @returns {{ claude: string[], openai: string[] }}
  */
 export function getAvailableModels(profile) {
-  const claudePlan = profile?.subscriptions?.claude?.plan || '$100';
-  const openaiPlan = profile?.subscriptions?.openai?.plan || '$20';
+  const claudePlan = profile?.providers?.claude?.plan || '$100';
+  const openaiPlan = profile?.providers?.openai?.plan || '$20';
   return {
     claude: CLAUDE_MODELS_BY_PLAN[claudePlan] ?? CLAUDE_MODELS_BY_PLAN['$100'],
     openai: OPENAI_MODELS_BY_PLAN[openaiPlan] ?? OPENAI_MODELS_BY_PLAN['$20'],
@@ -148,8 +148,8 @@ export function estimateBudgetPressure(profile, cwd) {
     ? join(cwd, '.dualbrain', 'usage')
     : USAGE_DIR;
 
-  const claudePlan = profile?.subscriptions?.claude?.plan || '$100';
-  const openaiPlan = profile?.subscriptions?.openai?.plan || '$20';
+  const claudePlan = profile?.providers?.claude?.plan || '$100';
+  const openaiPlan = profile?.providers?.openai?.plan || '$20';
 
   // Budget ceilings (5-hour execute tier as proxy for overall pressure)
   const BUDGETS = {
@@ -209,8 +209,10 @@ export function shouldDualBrain(detection, profile) {
   const { intent = '', risk = 'low', complexity = 'simple' } = detection;
   const dualEnabled = profile?.dual_brain_enabled !== false;
   const hasBothProviders = !!(
-    profile?.subscriptions?.claude?.plan &&
-    profile?.subscriptions?.openai?.plan
+    profile?.providers?.claude?.enabled &&
+    profile?.providers?.claude?.plan &&
+    profile?.providers?.openai?.enabled &&
+    profile?.providers?.openai?.plan
   );
   if (!dualEnabled || !hasBothProviders) return false;
 
@@ -362,8 +364,8 @@ function chooseProvider(detection, profile, pressure) {
 
   // Claude throttled → route to OpenAI
   if (claudePressure > 0.9) return 'openai';
-  // OpenAI not configured → use Claude
-  if (!profile?.subscriptions?.openai?.plan) return 'claude';
+  // OpenAI not configured or not enabled → use Claude
+  if (!profile?.providers?.openai?.enabled || !profile?.providers?.openai?.plan) return 'claude';
 
   // Isolated execute tasks can go to OpenAI if Claude is warm
   if (tier === 'execute' && !THINK_INTENTS.includes(intent)) {

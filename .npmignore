@@ -1,0 +1,10 @@
+# Experimental/superseded hooks — not shipped
+hooks/context-guard.mjs
+hooks/parallelism-scaler.mjs
+hooks/quality-tiers.mjs
+
+# Development files
+scripts/
+.claude/
+.dualbrain/
+*.jsonl

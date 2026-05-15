@@ -37,6 +37,7 @@ dual-brain <command> [options]
 
 Commands:
   init                      First-time setup (providers, plans, optimization)
+  install                   Install Claude Code hooks into the current project
   go "task description"     Detect → decide → dispatch a task
     --dry-run               Show routing decision without executing
     --files a.mjs,b.mjs     Provide file context for risk classification
@@ -163,6 +164,12 @@ async function cmdStatus() {
   } catch { /* network unavailable — skip */ }
 }
 
+async function cmdInstall() {
+  const { spawnSync } = await import('child_process');
+  const result = spawnSync('node', [join(__dirname, '..', 'install.mjs')], { stdio: 'inherit', cwd: process.cwd() });
+  process.exit(result.status || 0);
+}
+
 function cmdRemember(text) {
   if (!text) err('Usage: dual-brain remember "preference text"');
   const profile = rememberPreference(text, { scope: 'project', cwd: process.cwd() });
@@ -185,6 +192,7 @@ async function main() {
   if (cmd === '--version' || cmd === '-v')      { console.log(readVersion()); return; }
 
   if (cmd === 'init')     { await cmdInit(); return; }
+  if (cmd === 'install')  { await cmdInstall(); return; }
   if (cmd === 'go')       { await cmdGo(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(); return; }
   if (cmd === 'remember') { cmdRemember(args[1]); return; }

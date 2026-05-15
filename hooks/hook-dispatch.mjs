@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * dispatch.mjs — Single entry point for the HEAD to dispatch work.
+ * hook-dispatch.mjs — Single entry point for the HEAD to dispatch work.
  *
  * Classifies the task, checks budget, decides if a strategist is needed,
  * then launches the appropriate agent and returns a compressed result.
  *
- * CLI: node hooks/dispatch.mjs --task "..." [--files a.js,b.js]
+ * CLI: node hooks/hook-dispatch.mjs --task "..." [--files a.js,b.js]
  *      [--tier execute|think|search] [--force-provider claude|openai]
  *      [--dry-run] [--pipeline]
  *
@@ -231,7 +231,7 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   const files = filesArg ? String(filesArg).split(',').map(f => f.trim()) : [];
 
   if (!task) {
-    console.error('Usage: node hooks/dispatch.mjs --task "description" [--files a.js,b.js] [--tier execute|think|search] [--force-provider claude|openai] [--dry-run] [--pipeline]');
+    console.error('Usage: node hooks/hook-dispatch.mjs --task "description" [--files a.js,b.js] [--tier execute|think|search] [--force-provider claude|openai] [--dry-run] [--pipeline]');
     process.exit(1);
   }
 

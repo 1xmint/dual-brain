@@ -56,6 +56,18 @@ function defaultProfile() {
 // ---------------------------------------------------------------------------
 
 function migrateProfile(profile) {
+  // v5.x compat: convert old `subscriptions` field to `providers`
+  if (profile.subscriptions && !profile.providers) {
+    profile.providers = {};
+    for (const [key, sub] of Object.entries(profile.subscriptions)) {
+      profile.providers[key] = {
+        plan: sub.plan || '$20',
+        enabled: true,
+      };
+    }
+    delete profile.subscriptions;
+  }
+
   if (!profile.schemaVersion || profile.schemaVersion < 1) {
     // v0 → v1: add missing fields with defaults
     profile.schemaVersion = 1;

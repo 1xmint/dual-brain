@@ -2,38 +2,49 @@
 
 This project uses dual-provider orchestration. Config: `.claude/orchestrator.json`.
 
+## Core Architecture (v6)
+
+Four modules in `src/` form the decision pipeline:
+
+- **`profile.mjs`** — Load active profile, provider availability, preferences, and subscription plan
+- **`detect.mjs`** — Classify task intent, risk, complexity, and tier from prompt + file paths
+- **`decide.mjs`** — Route to provider/model/tier; handles budget pressure and dual-brain threshold
+- **`dispatch.mjs`** — Execute the decision: Claude subagent, GPT via Codex, or dual-brain flow
+
+The hooks layer (`/home/runner/workspace/.claude/hooks/`) wraps these modules for Claude Code integration and is still valid.
+
+## CLI Commands
+
+```bash
+dual-brain init                        # First-time setup
+dual-brain go "task description"       # Detect → decide → dispatch
+dual-brain go --dry-run "..."          # Show routing without executing
+dual-brain go --files a.mjs,b.mjs "..." # Provide file context for risk classification
+dual-brain status                      # Provider health, budget pressure, models
+dual-brain remember "preference"       # Save project-scoped preference
+dual-brain forget "preference"         # Remove preference by fuzzy match
+```
+
 ## Tier Routing
 
-Route subagents by task complexity:
-
-- **Search** (`model: "haiku"`): Read-only lookups, grep, explore. Return: files found, line refs, confidence.
-- **Execute** (`model: "sonnet"`): Edits, tests, git ops. Return: files changed, tests run, edge cases.
+- **Search** (`haiku`): Read-only lookups, grep, explore. Return: files found, line refs, confidence.
+- **Execute** (`sonnet`): Edits, tests, git ops. Return: files changed, tests run, edge cases.
 - **Think** (main session, Opus): Architecture, review, planning. Return: decision, alternatives, risks.
-
-## GPT Lane
-
-For isolated or parallel work, dispatch to GPT via Codex CLI:
-
-- `node .claude/hooks/gpt-work-dispatcher.mjs --task "..." --model gpt-5.4` — execution tasks
 
 ## Dual-Brain Collaboration
 
 Dual-brain is a multi-round conversation between Claude and GPT — not a single-shot dispatch.
 
 **Think flow** (architecture decisions):
-1. Round 1: `node .claude/hooks/dual-brain-think.mjs --question "..."`
-   → GPT gives independent analysis
+1. Round 1: `node .claude/hooks/dual-brain-think.mjs --question "..."` → GPT gives independent analysis
 2. You analyze the same question independently
-3. Round 2: `node .claude/hooks/dual-brain-think.mjs --question "..." --round 2 --claude-says "<your analysis>"`
-   → GPT responds to your points: agreements, pushback, refined recommendation
+3. Round 2: `node .claude/hooks/dual-brain-think.mjs --question "..." --round 2 --claude-says "<your analysis>"` → GPT responds with agreements, pushback, refined recommendation
 4. You synthesize both rounds into a final decision
 
 **Review flow** (code review):
-1. Round 1: `node .claude/hooks/dual-brain-review.mjs`
-   → GPT reviews the diff independently
+1. Round 1: `node .claude/hooks/dual-brain-review.mjs` → GPT reviews the diff independently
 2. You review the same diff independently
-3. Round 2: `node .claude/hooks/dual-brain-review.mjs --round 2 --claude-review "<your findings>"`
-   → GPT confirms shared findings, acknowledges misses, disputes false positives
+3. Round 2: `node .claude/hooks/dual-brain-review.mjs --round 2 --claude-review "<your findings>"` → GPT confirms shared findings, acknowledges misses
 4. You synthesize into a final review verdict
 
 ## Routing Rules
@@ -47,20 +58,15 @@ Dual-brain is a multi-round conversation between Claude and GPT — not a single
 
 **Claude MUST follow these rules before implementing multi-file changes:**
 
-1. **Before starting any batch of 3+ file edits**: run `node .claude/hooks/budget-balancer.mjs` and `node .claude/hooks/vibe-router.mjs "description"` to check provider balance and classify tasks
-2. **When budget-balancer recommends GPT**: dispatch execution work via `node .claude/hooks/gpt-work-dispatcher.mjs --task "..." --tier execute`
+1. **Before starting any batch of 3+ file edits**: run `node .claude/hooks/budget-balancer.mjs` to check provider balance, then `dual-brain go --dry-run "description"` to classify tasks
+2. **When budget-balancer recommends GPT**: dispatch via `src/dispatch.mjs` (or `node .claude/hooks/gpt-work-dispatcher.mjs --task "..." --tier execute`)
 3. **Security/auth/credential changes**: always require dual-brain think flow before implementation
 4. **Audit remediation batches**: plan waves with dual-brain think, dispatch execution to GPT, Claude reviews
 5. **Claude's role in multi-task work**: define acceptance criteria, dispatch agents, review results — not solo-implement everything
 
-**Triggers that require this workflow:**
-- 3+ production files being edited in one session
-- Any change touching auth, credentials, tokens, or secrets
-- Any change to dispatcher, agent routing, or tier logic
-- Audit or review remediation involving multiple subsystems
-- When Claude's think capacity is above 60% per budget-balancer
+**Triggers that require this workflow:** 3+ production files edited in one session · auth/credentials/tokens/secrets · changes to dispatcher, agent routing, or tier logic · audit remediation across multiple subsystems · Claude think capacity above 60% per budget-balancer.
 
-**Failure to route is itself a bug.** If Claude implements a large batch solo when GPT has capacity, the user should treat this as a process failure and correct it.
+**Failure to route is itself a bug.**
 
 ## Quality Gate
 
@@ -72,91 +78,60 @@ Gate statuses: `pass` (safe to end), `issues_found` (fix first), `needs_human_re
 
 ## Profiles
 
-Active profile controls routing posture, budgets, and quality gate behavior.
 Profile persists to `.claude/dual-brain.profile.json` (gitignored).
 
-- **auto** (default): Adapts routing based on task risk, provider health, and outcomes. Uses file-path risk classification and failure-loop detection to auto-escalate when needed.
+- **auto** (default): Adapts routing based on task risk, provider health, and outcomes
 - **balanced**: Best model per tier, normal budgets, reviews at medium+ risk
 - **cost-saver**: Prefer cheaper models, lower budgets, skip GPT for non-critical
 - **quality-first**: Dual-brain for medium+ risk, higher budgets, stricter reviews
 
-Switch profiles: `npx dual-brain mode cost-saver`
-Check status: `npx dual-brain status`
-
-Natural language aliases work everywhere: "go aggressive", "be careful", "cheap mode", "fast", "thorough", "smart". The system strips prefixes like "go"/"be"/"use" and resolves to the canonical profile name.
+Switch: `dual-brain mode cost-saver` · Natural language aliases work: "be careful", "cheap mode", "thorough"
 
 ## Adaptive Routing (Auto Mode)
 
-Auto mode classifies risk from file paths and adjusts routing in real-time:
-
 - **Risk classification**: auth/secrets→critical, billing/migrations→high, tests/utils→medium, docs→low
-- **Failure detection**: 2+ failures on same prompt in 2 hours → auto-escalate tier or trigger dual-brain. Uses time-weighted decay (recent failures count more) and ledger pruning for entries >24hrs.
+- **Failure detection**: 2+ failures on same prompt in 2 hours → auto-escalate tier or trigger dual-brain
 - **Provider balance**: Routes to underused provider when one subscription is hot
-- **Burst awareness**: Suppresses duplicate warnings and balance hints during agent waves (3+ agents in 90s)
+- **Burst awareness**: Suppresses duplicate warnings during agent waves (3+ agents in 90s)
 
-## Vibe Coding
+## Budget Balancer
 
-Casual natural language → structured work. The vibe coding system translates informal requests into properly routed, risk-classified, quality-gated work.
+`src/decide.mjs` handles routing decisions using the same token data internally. For inspection:
 
-**Wave Orchestrator** — the primary way to run multi-step work:
 ```bash
-node .claude/hooks/wave-orchestrator.mjs "fix the login bug and update the nav"
-node .claude/hooks/wave-orchestrator.mjs --dry-run "refactor auth module"
-node .claude/hooks/wave-orchestrator.mjs --resume <manifestId>
-node .claude/hooks/wave-orchestrator.mjs --show <manifestId>
+node .claude/hooks/budget-balancer.mjs
 ```
-The wave orchestrator decomposes intent, plans dependency-aware waves, assigns file ownership to prevent conflicts, dispatches agents with transparent routing tables, checkpoints between waves, and supports resume on failure. Every dispatch shows: provider, model, tier, effort, agent type, and routing reason.
 
-Manifests persist to `.dualbrain/manifests/`, checkpoints to `.dualbrain/checkpoints/`.
-
-Also available via the control panel: `[w]` Vibe workflow.
-
-**Intent compiler** — decompose multi-task requests:
-```bash
-node .claude/hooks/vibe-router.mjs "fix the login bug and also update the nav"
-```
-Returns structured tasks with tier/risk classification, complexity level, quality gates, and wave strategy.
-
-**Plan generator** — Steve-style 3-part markdown plans:
-```bash
-node .claude/hooks/plan-generator.mjs --utterance "..." [--write]
-```
-Generates: (1) dependency-ordered task table, (2) user stories + edge cases, (3) questions with suggested answers. Pass `--write` to save to `.claude/plans/`.
-
-**Durable memory** — preferences persist across sessions:
-```bash
-node .claude/hooks/vibe-memory.mjs                              # show state
-node .claude/hooks/vibe-memory.mjs --set preferences.risk_tolerance=careful
-node .claude/hooks/vibe-memory.mjs --threads                    # active work
-node .claude/hooks/vibe-memory.mjs --infer                      # preference suggestions
-```
-Tracks preferred profile, risk tolerance, active threads, and learns from usage patterns.
-
-## Budget Balancer (Token-Based)
-
-The budget balancer tracks real token usage against actual subscription limits.
+Tracks 5-hour and 7-day rolling windows against subscription limits (Claude Pro/Max, ChatGPT Plus/Pro). The higher pressure window is the binding constraint. Uses actual `input_tokens + output_tokens` from usage logs.
 
 **Subscription tiers** (configured in `orchestrator.json` → `subscriptions.*.plan`):
 - Claude: Pro $20, Max x5 $100, Max x20 $200
 - ChatGPT: Plus $20, Pro $100, Pro $200
 
-**Two rolling windows**: 5-hour and 7-day weekly. The higher pressure is the binding constraint.
+## Multi-Step Work
 
-**Token tracking**: Uses actual `input_tokens + output_tokens` from usage logs when available, falls back to conservative estimates only when logs lack token data.
+The wave orchestrator is available for complex multi-step tasks:
 
 ```bash
-node .claude/hooks/budget-balancer.mjs
+node .claude/hooks/wave-orchestrator.mjs "fix the login bug and update the nav"
+node .claude/hooks/wave-orchestrator.mjs --dry-run "refactor auth module"
+node .claude/hooks/wave-orchestrator.mjs --resume <manifestId>
 ```
-Shows per-provider per-tier pressure with real token counts (e.g., `136.0K/350.0K`), weekly pressure when binding, and routing recommendation with reason.
+
+For most tasks, prefer `dual-brain go "..."` — it runs the same detect→decide→dispatch pipeline with less overhead.
 
 ## Available Tools
 
-- `node .claude/hooks/wave-orchestrator.mjs "..."` — auto-wave orchestrator (plan, dispatch, test, review)
-- `node .claude/hooks/vibe-router.mjs "..."` — decompose casual requests into structured work
-- `node .claude/hooks/plan-generator.mjs --utterance "..."` — generate execution plans
-- `node .claude/hooks/vibe-memory.mjs` — persistent preferences and work threads
-- `node .claude/hooks/cost-report.mjs` — activity and cost estimates
-- `node .claude/hooks/health-check.mjs` — verify system health
-- `node .claude/hooks/budget-balancer.mjs` — provider balance (token-based, real limits)
-- `node .claude/hooks/decision-ledger.mjs` — routing outcome insights
-- `node .claude/hooks/test-orchestrator.mjs` — run self-tests (40 tests)
+| Tool | Purpose |
+|------|---------|
+| `dual-brain go "..."` | Primary entry point: detect, decide, dispatch |
+| `dual-brain status` | Provider health, budget, models |
+| `node .claude/hooks/budget-balancer.mjs` | Token usage and routing recommendation |
+| `node .claude/hooks/dual-brain-think.mjs` | Multi-round architecture decisions with GPT |
+| `node .claude/hooks/dual-brain-review.mjs` | Multi-round code review with GPT |
+| `node .claude/hooks/wave-orchestrator.mjs "..."` | Dependency-aware multi-wave dispatch |
+| `node .claude/hooks/session-report.mjs` | End-of-session summary |
+| `node .claude/hooks/quality-gate.mjs` | Gate check before ending session |
+| `node .claude/hooks/health-check.mjs` | System health |
+| `node .claude/hooks/test-orchestrator.mjs` | Self-tests (40 tests) |
+| `node .claude/hooks/vibe-memory.mjs` | Persistent preferences across sessions |

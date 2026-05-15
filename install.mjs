@@ -15,6 +15,13 @@ import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 
+// Skip hook installation during global npm install — hooks are installed
+// when the user runs 'dual-brain install' in their project directory.
+if (process.env.npm_config_global === 'true' || (process.env.npm_lifecycle_event === 'postinstall' && !process.env.INIT_CWD)) {
+  console.log('dual-brain: global install detected. Run "dual-brain install" in your project to set up hooks.');
+  process.exit(0);
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')).version;
 const VERSION_STAMP_FILE = '.claude/dual-brain.version.json';

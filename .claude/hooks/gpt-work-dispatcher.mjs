@@ -167,13 +167,17 @@ function classifyCodexFailure(proc) {
   return failureType;
 }
 
-function runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox) {
-  return spawnSync(codexBin, [
+function runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox, effort) {
+  const args = [
     'exec', '--json', '--ephemeral',
     '-m', model,
     '-s', sandbox,
-    prompt,
-  ], {
+  ];
+  if (effort && ['low', 'medium', 'high', 'xhigh'].includes(effort)) {
+    args.push('-c', `reasoning.effort="${effort}"`);
+  }
+  args.push(prompt);
+  return spawnSync(codexBin, args, {
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: timeoutMs || 120000,
@@ -181,7 +185,7 @@ function runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox) {
   });
 }
 
-function executeCodex(codexBin, model, prompt, cwd, timeoutMs, sandbox = 'danger-full-access') {
+function executeCodex(codexBin, model, prompt, cwd, timeoutMs, sandbox = 'danger-full-access', effort = null) {
   const startTime = Date.now();
 
   function finalizeAttempt(proc, attemptStartTime, attemptCount) {
@@ -243,14 +247,14 @@ function executeCodex(codexBin, model, prompt, cwd, timeoutMs, sandbox = 'danger
 
   let attemptCount = 1;
   let attemptStartTime = startTime;
-  let proc = runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox);
+  let proc = runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox, effort);
   let result = finalizeAttempt(proc, attemptStartTime, attemptCount);
 
   if (!result.success && (result.failureType === 'rate_limit' || result.failureType === 'timeout')) {
     spawnSync('sleep', ['3'], { stdio: 'ignore' });
     attemptCount += 1;
     attemptStartTime = Date.now();
-    proc = runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox);
+    proc = runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox, effort);
     result = finalizeAttempt(proc, attemptStartTime, attemptCount);
   }
 
@@ -400,10 +404,12 @@ export async function dispatchGptTask(task) {
   };
   const prompt = buildPrompt(preparedTask);
   const sandbox = GPT_TIER_SANDBOX[tier] || GPT_TIER_SANDBOX.execute;
-  const result = executeCodex(codexBin, model, prompt, task.cwd, task.timeoutMs, sandbox);
+  const effort = task.effort || null;
+  const result = executeCodex(codexBin, model, prompt, task.cwd, task.timeoutMs, sandbox, effort);
   result.tier = tier;
   result.classifiedTier = classifiedTier;
   result.modelOverride = modelOverride;
+  result.effort = effort;
   result.sandbox = sandbox;
   result.profile = loadActiveProfile();
   logUsageEvent(result, preparedTask);
@@ -468,7 +474,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const rawArgs = parseArgs(process.argv.slice(2));
 
   if (!rawArgs.task) {
-    console.error('Usage: node gpt-work-dispatcher.mjs --task "<description>" [--tier think|execute|search] [--model MODEL] [--force-model] [--files file1,file2] [--timeout 120]');
+    console.error('Usage: node gpt-work-dispatcher.mjs --task "<description>" [--tier think|execute|search] [--model MODEL] [--force-model] [--files file1,file2] [--timeout 120] [--effort low|medium|high|xhigh]');
     process.exit(1);
   }
 
