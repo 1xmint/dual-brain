@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -58,6 +58,14 @@
     "src/decompose.mjs",
     "src/brief.mjs",
     "src/redact.mjs",
+    "src/pipeline.mjs",
+    "src/context.mjs",
+    "src/outcome.mjs",
+    "src/observer.mjs",
+    "src/nextstep.mjs",
+    "src/doctor.mjs",
+    "src/receipt.mjs",
+    "src/failure-memory.mjs",
     "src/index.mjs",
     "src/tui.mjs",
     "src/install-hooks.mjs",
