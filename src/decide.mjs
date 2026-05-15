@@ -15,6 +15,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { getProviderScore, checkCooldown } from './health.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE   = join(__dirname, '..');
@@ -134,64 +135,43 @@ export function getAvailableModels(profile) {
   };
 }
 
-// ─── Exported: estimateBudgetPressure ─────────────────────────────────────────
+// ─── Exported: estimateBudgetPressure (deprecated stub) ──────────────────────
 
 /**
- * Read recent usage logs from .dualbrain/usage/ and estimate current pressure.
- * Returns { claude: 0-1, openai: 0-1 }. If no logs, returns 0 for both.
- * @param {object} profile
+ * @deprecated Replaced by the health-based router in health.mjs.
+ * Returns an empty object so callers that still import this don't crash.
+ * The budget-balancer.mjs hook file is separate and can keep using usage logs.
+ * @returns {{ claude: number, openai: number }}
+ */
+export function estimateBudgetPressure(_profile, _cwd) {
+  return { claude: 0, openai: 0 };
+}
+
+// ─── Internal: health-based provider scoring ──────────────────────────────────
+
+/**
+ * Return a 0-100 routing score for each provider using health.mjs state.
+ * For each provider we check its primary model class for the given tier.
+ * @param {'search'|'execute'|'think'} tier
  * @param {string} [cwd]
  * @returns {{ claude: number, openai: number }}
  */
-export function estimateBudgetPressure(profile, cwd) {
-  const usageDir = cwd
-    ? join(cwd, '.dualbrain', 'usage')
-    : USAGE_DIR;
+function getHealthScores(tier, cwd) {
+  // Map tier to representative model class per provider
+  const claudeClass = tier === 'search' ? 'haiku'
+    : tier === 'think' ? 'opus'
+    : 'sonnet';
+  const openaiClass = tier === 'search' ? 'gpt-4.1-mini'
+    : tier === 'think' ? 'gpt-5.5'
+    : 'gpt-5.4';
 
-  const claudePlan = profile?.providers?.claude?.plan || '$100';
-  const openaiPlan = profile?.providers?.openai?.plan || '$20';
-
-  // Budget ceilings (5-hour execute tier as proxy for overall pressure)
-  const BUDGETS = {
-    claude: { '$20': 80_000, '$100': 350_000, '$200': 900_000 },
-    openai: { '$20': 80_000, '$100': 200_000, '$200': 400_000 },
-  };
-
-  const claudeBudget = BUDGETS.claude[claudePlan] ?? 350_000;
-  const openaiBudget = BUDGETS.openai[openaiPlan] ?? 80_000;
-
-  if (!existsSync(usageDir)) return { claude: 0, openai: 0 };
-
-  const cutoff = Date.now() - FIVE_HRS_MS;
-  let claudeTokens = 0;
-  let openaiTokens = 0;
-
-  // Scan last 2 days of usage files
-  for (let i = 0; i <= 1; i++) {
-    const date = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
-    const file = join(usageDir, `usage-${date}.jsonl`);
-    if (!existsSync(file)) continue;
-    let raw;
-    try { raw = readFileSync(file, 'utf8'); } catch { continue; }
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue;
-      let rec;
-      try { rec = JSON.parse(line); } catch { continue; }
-      const ts = Date.parse(rec.timestamp);
-      if (isNaN(ts) || ts < cutoff) continue;
-      const tokens = (rec.input_tokens ?? 0) + (rec.output_tokens ?? 0)
-        || TOKEN_FALLBACK[rec.tier] || TOKEN_FALLBACK.execute;
-      if (rec.provider === 'claude' || /haiku|sonnet|opus/i.test(rec.model || '')) {
-        claudeTokens += tokens;
-      } else {
-        openaiTokens += tokens;
-      }
-    }
-  }
+  // Trigger cooldown expiry check (transitions hot→probing automatically)
+  checkCooldown('claude', claudeClass, cwd);
+  checkCooldown('openai', openaiClass, cwd);
 
   return {
-    claude: Math.min(1, claudeTokens / claudeBudget),
-    openai: Math.min(1, openaiTokens / openaiBudget),
+    claude: getProviderScore('claude', claudeClass, cwd),
+    openai: getProviderScore('openai', openaiClass, cwd),
   };
 }
 
@@ -258,13 +238,15 @@ function pickOpenAIModel(detection, available) {
   return available[0] ?? 'gpt-4.1-mini';
 }
 
-function applyPressureDowngrade(model, pressure, provider, available, isHighStakes) {
-  if (pressure <= 0.7 || isHighStakes) return model;
+function applyHealthDowngrade(model, score, provider, available, isHighStakes) {
+  // score=100 healthy, score=50 degraded, score=25 probing, score=0 hot
+  // If score is 0 (hot) and this isn't high-stakes, downgrade one tier
+  if (score >= 50 || isHighStakes) return model;
 
   if (provider === 'claude') {
     const claudeRank = ['haiku', 'sonnet', 'opus'];
     const idx = claudeRank.indexOf(model);
-    const steps = pressure > 0.9 ? 2 : 1;
+    const steps = score === 0 ? 2 : 1;
     const downIdx = Math.max(0, idx - steps);
     for (let i = downIdx; i <= idx; i++) {
       if (available.includes(claudeRank[i])) return claudeRank[i];
@@ -273,7 +255,7 @@ function applyPressureDowngrade(model, pressure, provider, available, isHighStak
   } else {
     const oaiRank = ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'];
     const idx = oaiRank.indexOf(model);
-    const steps = pressure > 0.9 ? 2 : 1;
+    const steps = score === 0 ? 2 : 1;
     const downIdx = Math.max(0, idx - steps);
     for (let i = downIdx; i <= idx; i++) {
       if (available.includes(oaiRank[i])) return oaiRank[i];
@@ -349,31 +331,32 @@ function pickSandbox(model, detection) {
   return 'workspace-write';
 }
 
-function chooseProvider(detection, profile, pressure) {
+function chooseProvider(detection, profile, healthScores) {
   const { tier = 'execute', intent = '' } = detection;
-  const claudePressure = pressure.claude;
-  const openaiPressure = pressure.openai;
+  const claudeScore = healthScores.claude;
+  const openaiScore = healthScores.openai;
 
-  // Both throttled → pick least throttled
-  if (claudePressure > 0.9 && openaiPressure > 0.9) {
-    return claudePressure <= openaiPressure ? 'claude' : 'openai';
-  }
-
-  // Think-tier strongly prefers Claude (session context coupling)
-  if (THINK_INTENTS.includes(intent) && claudePressure < 0.9) return 'claude';
-
-  // Claude throttled → route to OpenAI
-  if (claudePressure > 0.9) return 'openai';
-  // OpenAI not configured or not enabled → use Claude
+  // OpenAI not configured or not enabled → always use Claude
   if (!profile?.providers?.openai?.enabled || !profile?.providers?.openai?.plan) return 'claude';
 
-  // Isolated execute tasks can go to OpenAI if Claude is warm
-  if (tier === 'execute' && !THINK_INTENTS.includes(intent)) {
-    if (claudePressure > 0.55 && openaiPressure < claudePressure) return 'openai';
+  // Both hot (score=0) → pick the one with the higher score; if tied, prefer Claude
+  if (claudeScore === 0 && openaiScore === 0) {
+    return claudeScore >= openaiScore ? 'claude' : 'openai';
   }
 
-  // Default: Claude (lower session-context overhead)
-  return 'claude';
+  // Think-tier strongly prefers Claude (session context coupling), unless Claude is hot
+  if (THINK_INTENTS.includes(intent) && claudeScore > 0) return 'claude';
+
+  // Claude hot → route to OpenAI if available
+  if (claudeScore === 0 && openaiScore > 0) return 'openai';
+
+  // Isolated execute tasks: route to OpenAI if Claude is degraded/probing but OpenAI is healthy
+  if (tier === 'execute' && !THINK_INTENTS.includes(intent)) {
+    if (claudeScore < 100 && openaiScore > claudeScore) return 'openai';
+  }
+
+  // Default: Claude (lower session-context overhead, higher score wins)
+  return claudeScore >= openaiScore ? 'claude' : 'openai';
 }
 
 // ─── Exported: explainDecision ────────────────────────────────────────────────
@@ -388,7 +371,7 @@ function chooseProvider(detection, profile, pressure) {
 export function explainDecision(decision, detection, profile) {
   const { provider, model, effort, dualBrain } = decision;
   const { intent = 'task', risk = 'low', complexity = 'simple', tier = 'execute' } = detection;
-  const pressure = decision._pressure || { claude: 0, openai: 0 };
+  const healthScores = decision._healthScores || {};
   const mode = profile?.mode || profile?.profile || 'auto';
 
   const modelLabel = effort ? `${model} ${effort}` : model;
@@ -396,11 +379,14 @@ export function explainDecision(decision, detection, profile) {
   if (dualBrain) {
     return `Using ${modelLabel} with dual-brain review because this ${intent} change is ${risk} risk.`;
   }
-  if (pressure.claude > 0.9 && provider === 'openai') {
-    return `Using ${modelLabel} because Claude is throttled and this is an isolated ${tier} task.`;
+  // Health-based explanations
+  const claudeScore = healthScores.claude ?? 100;
+  const providerScore = healthScores[provider] ?? 100;
+  if (claudeScore === 0 && provider === 'openai') {
+    return `Using ${modelLabel} because Claude is rate-limited and this is an isolated ${tier} task.`;
   }
-  if (pressure[provider] > 0.7) {
-    return `Using ${modelLabel} (downgraded due to budget pressure) for this ${complexity} ${intent}.`;
+  if (providerScore < 50) {
+    return `Using ${modelLabel} (downgraded due to rate-limit cooldown) for this ${complexity} ${intent}.`;
   }
   if (mode === 'cost-saver') {
     return `Using ${modelLabel} because cost-saver mode prefers cheaper models for ${risk}-risk work.`;
@@ -409,12 +395,58 @@ export function explainDecision(decision, detection, profile) {
     return `Using ${modelLabel} because quality-first mode prefers stronger models for ${intent}.`;
   }
   if (THINK_INTENTS.includes(intent)) {
-    return `Using ${modelLabel} because ${intent} tasks need deep reasoning and Claude has budget headroom.`;
+    return `Using ${modelLabel} because ${intent} tasks need deep reasoning and Claude is healthy.`;
   }
   if (tier === 'search' || SEARCH_INTENTS.includes(intent)) {
     return `Using ${modelLabel} because this is a simple ${intent} with low risk.`;
   }
-  return `Using ${modelLabel} because Claude has budget headroom and this is a routine ${intent}.`;
+  return `Using ${modelLabel} because ${provider} is healthy and this is a routine ${intent}.`;
+}
+
+// ─── Exported: parsePreferences ──────────────────────────────────────────────
+
+/**
+ * Parse free-text user preferences into routing-relevant signals.
+ * @param {Array<{text: string, enabled: boolean, scope: string}>} preferences
+ * @returns {{
+ *   biasOverride: 'cost-saver'|'quality-first'|null,
+ *   preferProvider: 'claude'|'openai'|null,
+ *   avoidProvider: 'claude'|'openai'|null,
+ *   alwaysDualBrain: boolean,
+ *   neverDualBrain: boolean,
+ *   preferModel: 'opus'|'sonnet'|'haiku'|null,
+ * }}
+ */
+export function parsePreferences(preferences) {
+  const active = (preferences || []).filter(p => p.enabled);
+  const signals = {
+    biasOverride:    null,
+    preferProvider:  null,
+    avoidProvider:   null,
+    alwaysDualBrain: false,
+    neverDualBrain:  false,
+    preferModel:     null,
+  };
+
+  for (const pref of active) {
+    const t = pref.text.toLowerCase();
+    // Cost/quality bias signals
+    if (/cheap|save|budget|frugal|economical|cost/i.test(t))      signals.biasOverride   = 'cost-saver';
+    if (/quality|best|thorough|careful|premium/i.test(t))         signals.biasOverride   = 'quality-first';
+    // Provider preference signals
+    if (/prefer claude|use claude|claude first/i.test(t))          signals.preferProvider = 'claude';
+    if (/prefer (openai|gpt|chatgpt)|use (openai|gpt)/i.test(t))  signals.preferProvider = 'openai';
+    if (/avoid claude|no claude/i.test(t))                         signals.avoidProvider  = 'claude';
+    if (/avoid (openai|gpt)|no (openai|gpt)/i.test(t))            signals.avoidProvider  = 'openai';
+    // Dual-brain signals
+    if (/always/.test(t) && /(consensus|dual.brain|two.brain|dual)/i.test(t)) signals.alwaysDualBrain = true;
+    if (/never (consensus|dual)|skip (review|consensus)|solo/i.test(t)) signals.neverDualBrain = true;
+    // Model preference signals
+    if (/prefer opus|use opus/i.test(t))                           signals.preferModel    = 'opus';
+    if (/prefer sonnet|use sonnet/i.test(t))                       signals.preferModel    = 'sonnet';
+    if (/prefer haiku|use haiku/i.test(t))                         signals.preferModel    = 'haiku';
+  }
+  return signals;
 }
 
 // ─── Exported: decideRoute ────────────────────────────────────────────────────
@@ -425,25 +457,64 @@ export function explainDecision(decision, detection, profile) {
  * @returns {object} Routing decision
  */
 export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
-  const available    = getAvailableModels(profile);
-  const pressure     = estimateBudgetPressure(profile, cwd);
-  const dual         = shouldDualBrain(detection, profile);
+  const available     = getAvailableModels(profile);
+
+  // Parse free-text user preferences into routing signals
+  const prefSignals = parsePreferences(profile.preferences);
+
+  // Apply bias override from preferences (takes precedence over profile.bias)
+  const profileWithEffectiveBias = prefSignals.biasOverride
+    ? { ...profile, mode: prefSignals.biasOverride }
+    : profile;
+
+  // dual-brain: start with the natural shouldDualBrain result, then apply preference overrides
+  let dual = shouldDualBrain(detection, profile);
+  if (prefSignals.alwaysDualBrain) dual = true;
+  if (prefSignals.neverDualBrain)  dual = false;
+
   const { tier = 'execute', risk = 'low' } = detection;
-  const isHighStakes = ['critical', 'high'].includes(risk);
+  const isHighStakes  = ['critical', 'high'].includes(risk);
 
-  // Choose provider
-  const provider = chooseProvider(detection, profile, pressure);
+  // Get health scores for current tier
+  const healthScores = getHealthScores(tier, cwd);
 
-  // Select base model
+  // Choose provider (using the bias-patched profile so chooseProvider sees the right mode)
+  let provider = chooseProvider(detection, profileWithEffectiveBias, healthScores);
+
+  // Apply preferProvider / avoidProvider signals from preferences
+  if (prefSignals.preferProvider) {
+    const preferred = prefSignals.preferProvider;
+    const prefEnabled = profile?.providers?.[preferred]?.enabled && profile?.providers?.[preferred]?.plan;
+    const prefScore   = healthScores[preferred] ?? 0;
+    // Use preferred provider if it is configured and has any health score (even degraded)
+    if (prefEnabled && prefScore > 0) provider = preferred;
+  }
+  if (prefSignals.avoidProvider && provider === prefSignals.avoidProvider) {
+    // Switch to the other provider only if it is configured and healthy
+    const other = prefSignals.avoidProvider === 'claude' ? 'openai' : 'claude';
+    const otherEnabled = profile?.providers?.[other]?.enabled && profile?.providers?.[other]?.plan;
+    const otherScore   = healthScores[other] ?? 0;
+    if (otherEnabled && otherScore > 0) provider = other;
+  }
+
+  // Select base model (use bias-patched profile for model selection too)
   let model = provider === 'claude'
     ? pickClaudeModel(detection, available.claude)
     : pickOpenAIModel(detection, available.openai);
 
-  // Apply budget pressure downgrade
-  model = applyPressureDowngrade(model, pressure[provider], provider, available[provider], isHighStakes);
+  // Apply health-based downgrade (only if score < 50 and not high-stakes)
+  model = applyHealthDowngrade(model, healthScores[provider], provider, available[provider], isHighStakes);
 
-  // Apply profile mode bias (cost-saver / quality-first / preferences)
-  model = applyProfileBias(model, profile, provider, available[provider]);
+  // Apply profile mode bias (cost-saver / quality-first / preferences) using patched profile
+  model = applyProfileBias(model, profileWithEffectiveBias, provider, available[provider]);
+
+  // Apply preferModel signal from preferences (override after all other picks)
+  if (prefSignals.preferModel) {
+    const wantedModel = prefSignals.preferModel;
+    if (available[provider]?.includes(wantedModel)) {
+      model = wantedModel;
+    }
+  }
 
   // Determine effort, modes, sandbox
   const effort  = pickEffort(model, detection);
@@ -459,13 +530,13 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
     modes,
     sandbox,
     explanation: '',
-    _pressure: pressure,
+    _healthScores: healthScores,
   };
 
-  decision.explanation = explainDecision(decision, detection, profile);
+  decision.explanation = explainDecision(decision, detection, profileWithEffectiveBias);
 
   // Remove internal field from public output
-  const { _pressure, ...result } = decision;
+  const { _healthScores, ...result } = decision;
   return result;
 }
 

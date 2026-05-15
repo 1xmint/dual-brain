@@ -1,0 +1,57 @@
+{
+  "name": "refactor",
+  "description": "Safe, verified refactoring: map callers, lock invariants, plan steps, apply, test, and confirm behavior preservation",
+  "matchIntents": ["refactor"],
+  "steps": [
+    {
+      "id": "understand",
+      "title": "Map the Target Code",
+      "goal": "Map the target code: find all callers and call sites, direct and transitive dependencies, existing tests that cover it, and any observable side effects. Document the current behavior contract — what it accepts, what it returns, what it mutates, and what errors it may throw.",
+      "tier": "search",
+      "consensus": false,
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "invariants",
+      "title": "Identify Behavioral Invariants",
+      "goal": "Based on the code map, identify the behavioral invariants that MUST be preserved through the refactor: public API surface (function signatures, exported names), return types and shapes, error handling contracts, ordering guarantees, and any side effects callers depend on. This list is the acceptance criterion for the refactor.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "checklist", "required": true }
+    },
+    {
+      "id": "plan",
+      "title": "Design the Refactor",
+      "goal": "Design the refactoring as a sequence of small, independently verifiable steps. For each step, describe: what changes, what stays the same, and how to verify it didn't break anything. Avoid big-bang rewrites. Each step should leave the codebase in a working state.",
+      "tier": "think",
+      "consensus": true,
+      "gate": { "type": "approval", "requiredWhen": "always" },
+      "output": { "kind": "plan", "required": true }
+    },
+    {
+      "id": "apply",
+      "title": "Apply the Refactoring",
+      "goal": "Implement the refactoring changes following the approved plan. Make minimal edits — do not improve unrelated code, fix unrelated bugs, or change formatting outside the target. Preserve all invariants identified in the invariants step. Commit or stage changes step by step if the plan has multiple stages.",
+      "tier": "execute",
+      "consensus": false,
+      "output": { "kind": "patch", "required": true }
+    },
+    {
+      "id": "verify",
+      "title": "Run Tests and Fix Regressions",
+      "goal": "Run the full existing test suite. For any failures, determine whether they are real regressions (the refactor broke behavior) or expected test updates (tests were asserting on internal structure that legitimately changed). Fix real regressions immediately. Update tests only where the old test was testing implementation detail, not behavior.",
+      "tier": "execute",
+      "consensus": false,
+      "gate": { "type": "test", "requiredWhen": "always" },
+      "output": { "kind": "test", "required": true }
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm Behavior Preservation",
+      "goal": "Review the final diff against the invariants checklist. Confirm each invariant is still satisfied. Summarize: what structural changes were made, what behavioral aspects are provably unchanged, and whether there are any remaining risks or follow-up tasks.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "summary", "required": true }
+    }
+  ]
+}

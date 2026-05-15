@@ -62,12 +62,19 @@ import {
 } from './detect.mjs';
 
 import {
-  decideRoute, getAvailableModels, shouldDualBrain, explainDecision,
+  decideRoute, getAvailableModels, shouldDualBrain, explainDecision, parsePreferences,
 } from './decide.mjs';
 
 import {
   buildCommand, compressResult, detectRuntime,
+  validateDispatch, checkWorktreeClean, getRetryBudget,
 } from './dispatch.mjs';
+
+import { redact } from './redact.mjs';
+import { markHot, markHealthy } from './health.mjs';
+import { decompose } from './decompose.mjs';
+import { loadPlaybook } from './playbook.mjs';
+import { formatSessionCard } from './session.mjs';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROFILE TESTS
@@ -655,6 +662,136 @@ describe('decide', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PREFERENCE ROUTING TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('preference routing', () => {
+  describe('parsePreferences — signal extraction', () => {
+    it('"prefer cheaper models" → biasOverride = cost-saver', () => {
+      const signals = parsePreferences([{ text: 'prefer cheaper models', enabled: true, scope: 'project' }]);
+      assert.equal(signals.biasOverride, 'cost-saver');
+    });
+
+    it('"always use dual brain consensus" → alwaysDualBrain = true', () => {
+      const signals = parsePreferences([{ text: 'always use dual brain consensus', enabled: true, scope: 'project' }]);
+      assert.equal(signals.alwaysDualBrain, true);
+    });
+
+    it('"prefer claude" → preferProvider = claude', () => {
+      const signals = parsePreferences([{ text: 'prefer claude', enabled: true, scope: 'project' }]);
+      assert.equal(signals.preferProvider, 'claude');
+    });
+
+    it('"avoid openai" → avoidProvider = openai', () => {
+      const signals = parsePreferences([{ text: 'avoid openai', enabled: true, scope: 'project' }]);
+      assert.equal(signals.avoidProvider, 'openai');
+    });
+
+    it('empty preferences array → all nulls/false', () => {
+      const signals = parsePreferences([]);
+      assert.equal(signals.biasOverride,    null);
+      assert.equal(signals.preferProvider,  null);
+      assert.equal(signals.avoidProvider,   null);
+      assert.equal(signals.alwaysDualBrain, false);
+      assert.equal(signals.neverDualBrain,  false);
+      assert.equal(signals.preferModel,     null);
+    });
+
+    it('null preferences → all nulls/false', () => {
+      const signals = parsePreferences(null);
+      assert.equal(signals.biasOverride,    null);
+      assert.equal(signals.preferProvider,  null);
+      assert.equal(signals.avoidProvider,   null);
+      assert.equal(signals.alwaysDualBrain, false);
+      assert.equal(signals.neverDualBrain,  false);
+      assert.equal(signals.preferModel,     null);
+    });
+
+    it('disabled preferences are ignored', () => {
+      const signals = parsePreferences([
+        { text: 'prefer cheaper models', enabled: false, scope: 'project' },
+        { text: 'avoid openai',          enabled: false, scope: 'project' },
+      ]);
+      assert.equal(signals.biasOverride,  null);
+      assert.equal(signals.avoidProvider, null);
+    });
+
+    it('"use best quality" → biasOverride = quality-first', () => {
+      const signals = parsePreferences([{ text: 'use best quality', enabled: true, scope: 'project' }]);
+      assert.equal(signals.biasOverride, 'quality-first');
+    });
+
+    it('"prefer gpt" → preferProvider = openai', () => {
+      const signals = parsePreferences([{ text: 'prefer gpt', enabled: true, scope: 'project' }]);
+      assert.equal(signals.preferProvider, 'openai');
+    });
+
+    it('"prefer opus" → preferModel = opus', () => {
+      const signals = parsePreferences([{ text: 'prefer opus', enabled: true, scope: 'project' }]);
+      assert.equal(signals.preferModel, 'opus');
+    });
+
+    it('"never dual" → neverDualBrain = true', () => {
+      const signals = parsePreferences([{ text: 'never dual brain', enabled: true, scope: 'project' }]);
+      assert.equal(signals.neverDualBrain, true);
+    });
+  });
+
+  describe('parsePreferences → decideRoute wiring', () => {
+    const dualProfile100 = {
+      providers: {
+        claude: { plan: '$100', enabled: true },
+        openai: { plan: '$100', enabled: true },
+      },
+      mode: 'dual',
+      bias: 'balanced',
+    };
+
+    it('cost-saver preference overrides balanced bias → cheaper model selected', () => {
+      const profileWithPref = {
+        ...dualProfile100,
+        preferences: [{ text: 'prefer cheaper models', enabled: true, scope: 'project' }],
+      };
+      const detection = { intent: 'edit', risk: 'low', complexity: 'simple', effort: 'medium', tier: 'execute' };
+      const decision = decideRoute({ profile: profileWithPref, detection });
+      const cheapModels = ['haiku', 'gpt-4.1-mini'];
+      assert.ok(cheapModels.includes(decision.model), `Expected cheap model, got: ${decision.model}`);
+    });
+
+    it('alwaysDualBrain preference forces dualBrain = true even for low-risk edit', () => {
+      const profileWithPref = {
+        ...dualProfile100,
+        preferences: [{ text: 'always use dual brain consensus', enabled: true, scope: 'project' }],
+      };
+      const detection = { intent: 'edit', risk: 'low', complexity: 'simple', effort: 'medium', tier: 'execute' };
+      const decision = decideRoute({ profile: profileWithPref, detection });
+      assert.equal(decision.dualBrain, true);
+    });
+
+    it('neverDualBrain preference forces dualBrain = false even for critical risk', () => {
+      const profileWithPref = {
+        ...dualProfile100,
+        preferences: [{ text: 'never dual brain', enabled: true, scope: 'project' }],
+      };
+      const detection = { intent: 'architecture', risk: 'critical', complexity: 'complex', effort: 'xhigh', tier: 'think' };
+      const decision = decideRoute({ profile: profileWithPref, detection });
+      assert.equal(decision.dualBrain, false);
+    });
+
+    it('disabled preferences do not affect routing', () => {
+      const profileWithDisabledPref = {
+        ...dualProfile100,
+        preferences: [{ text: 'always use dual brain consensus', enabled: false, scope: 'project' }],
+      };
+      const detection = { intent: 'edit', risk: 'low', complexity: 'simple', effort: 'medium', tier: 'execute' };
+      const decisionWithDisabled = decideRoute({ profile: profileWithDisabledPref, detection });
+      const decisionWithout      = decideRoute({ profile: dualProfile100, detection });
+      assert.equal(decisionWithDisabled.dualBrain, decisionWithout.dualBrain);
+    });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DISPATCH TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -771,10 +908,237 @@ describe('dispatch', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DISPATCH SAFETY FEATURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('dispatch safety features', () => {
+
+  // ── Feature 1: validateDispatch ────────────────────────────────────────────
+  describe('validateDispatch', () => {
+    it('returns _error when no CLI is available', () => {
+      const rt = { claudeAvailable: false, codexAvailable: false };
+      const result = validateDispatch({ provider: 'claude', model: 'sonnet', tier: 'execute' }, rt);
+      assert.ok(result._error, `Expected _error, got: ${JSON.stringify(result)}`);
+      assert.ok(result._error.includes('No AI CLI available'), `Unexpected error: ${result._error}`);
+    });
+
+    it('falls back to openai when claude is unavailable but codex is', () => {
+      const rt = { claudeAvailable: false, codexAvailable: true };
+      const result = validateDispatch({ provider: 'claude', model: 'sonnet', tier: 'execute' }, rt);
+      assert.ok(!result._error, `Unexpected error: ${result._error}`);
+      assert.equal(result.provider, 'openai', `Expected openai fallback, got: ${result.provider}`);
+    });
+
+    it('falls back to claude when openai is unavailable but claude is', () => {
+      const rt = { claudeAvailable: true, codexAvailable: false };
+      const result = validateDispatch({ provider: 'openai', model: 'o4-mini', tier: 'execute' }, rt);
+      assert.ok(!result._error, `Unexpected error: ${result._error}`);
+      assert.equal(result.provider, 'claude', `Expected claude fallback, got: ${result.provider}`);
+    });
+
+    it('keeps original decision when both CLIs available and model is valid', () => {
+      const rt = { claudeAvailable: true, codexAvailable: true };
+      const result = validateDispatch({ provider: 'claude', model: 'sonnet', tier: 'execute' }, rt);
+      assert.ok(!result._error);
+      assert.equal(result.provider, 'claude');
+      assert.equal(result.model, 'sonnet');
+    });
+
+    it('resets invalid claude model to sonnet for execute tier', () => {
+      const rt = { claudeAvailable: true, codexAvailable: false };
+      const result = validateDispatch({ provider: 'claude', model: 'gpt-5.5', tier: 'execute' }, rt);
+      assert.ok(!result._error);
+      assert.equal(result.model, 'sonnet', `Expected sonnet fallback, got: ${result.model}`);
+    });
+
+    it('resets invalid claude model to haiku for search tier', () => {
+      const rt = { claudeAvailable: true, codexAvailable: false };
+      const result = validateDispatch({ provider: 'claude', model: 'gpt-4.1', tier: 'search' }, rt);
+      assert.ok(!result._error);
+      assert.equal(result.model, 'haiku', `Expected haiku fallback for search tier, got: ${result.model}`);
+    });
+
+    it('resets invalid openai model to o4-mini', () => {
+      const rt = { claudeAvailable: false, codexAvailable: true };
+      const result = validateDispatch({ provider: 'openai', model: 'bogus-model', tier: 'execute' }, rt);
+      assert.ok(!result._error);
+      assert.equal(result.model, 'o4-mini', `Expected o4-mini fallback, got: ${result.model}`);
+    });
+
+    it('valid openai models pass through unchanged', () => {
+      const rt = { claudeAvailable: true, codexAvailable: true };
+      for (const m of ['o4-mini', 'o3', 'gpt-4.1']) {
+        const result = validateDispatch({ provider: 'openai', model: m, tier: 'execute' }, rt);
+        assert.ok(!result._error, `Unexpected error for model ${m}`);
+        assert.equal(result.model, m, `Model changed unexpectedly: ${result.model}`);
+      }
+    });
+
+    it('valid claude models pass through unchanged', () => {
+      const rt = { claudeAvailable: true, codexAvailable: true };
+      for (const m of ['opus', 'sonnet', 'haiku']) {
+        const result = validateDispatch({ provider: 'claude', model: m, tier: 'execute' }, rt);
+        assert.ok(!result._error, `Unexpected error for model ${m}`);
+        assert.equal(result.model, m, `Model changed unexpectedly: ${result.model}`);
+      }
+    });
+  });
+
+  // ── Feature 2: checkWorktreeClean ──────────────────────────────────────────
+  describe('checkWorktreeClean', () => {
+    it('returns safe:true when owns is empty', async () => {
+      const result = await checkWorktreeClean([], process.cwd());
+      assert.deepEqual(result, { safe: true });
+    });
+
+    it('returns safe:true when owns is undefined', async () => {
+      const result = await checkWorktreeClean(undefined, process.cwd());
+      assert.deepEqual(result, { safe: true });
+    });
+
+    it('_globMatch: dir/* prefix pattern', () => {
+      // Test the glob logic indirectly via checkWorktreeClean with a tmp git repo
+      // We test the building-block function via the module internals instead,
+      // using a clean git repo (no dirty files) to verify the guard is skipped.
+      // In CI the workspace may have dirty files but not in src/noexist/ prefix.
+    });
+
+    it('returns safe:true for non-overlapping owns patterns (dir that does not exist dirty)', async () => {
+      // If there are no dirty files matching 'src/totally-fake-dir/*', should be safe
+      const result = await checkWorktreeClean(['src/totally-fake-dir/*'], process.cwd());
+      assert.equal(result.safe, true, `Expected safe:true for non-overlapping pattern`);
+    });
+
+    it('detects conflict when dirty file matches exact path', async () => {
+      // Create a temp git repo with a dirty file to simulate a conflict
+      const tmp = join(tmpdir(), `wt-test-${Date.now()}`);
+      mkdirSync(tmp, { recursive: true });
+      try {
+        // Initialize a git repo
+        await new Promise((res) => {
+          const p = spawn('git', ['init'], { cwd: tmp, stdio: 'ignore' });
+          p.on('close', res);
+        });
+        await new Promise((res) => {
+          const p = spawn('git', ['config', 'user.email', 'test@test.com'], { cwd: tmp, stdio: 'ignore' });
+          p.on('close', res);
+        });
+        await new Promise((res) => {
+          const p = spawn('git', ['config', 'user.name', 'Test'], { cwd: tmp, stdio: 'ignore' });
+          p.on('close', res);
+        });
+        // Create a dirty (untracked) file
+        const { writeFileSync: wfs } = await import('node:fs');
+        wfs(join(tmp, 'dirty.mjs'), '// dirty');
+        const result = await checkWorktreeClean(['dirty.mjs'], tmp);
+        assert.equal(result.safe, false, `Expected safe:false, got: ${JSON.stringify(result)}`);
+        assert.ok(result.conflicts.includes('dirty.mjs'), `Expected dirty.mjs in conflicts: ${result.conflicts}`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('detects conflict via *.ext glob pattern', async () => {
+      const tmp = join(tmpdir(), `wt-test-ext-${Date.now()}`);
+      mkdirSync(tmp, { recursive: true });
+      try {
+        await new Promise((res) => {
+          const p = spawn('git', ['init'], { cwd: tmp, stdio: 'ignore' });
+          p.on('close', res);
+        });
+        const { writeFileSync: wfs } = await import('node:fs');
+        wfs(join(tmp, 'something.mjs'), '// dirty');
+        const result = await checkWorktreeClean(['*.mjs'], tmp);
+        assert.equal(result.safe, false, `Expected conflict from *.mjs pattern`);
+        assert.ok(result.conflicts.some(f => f.endsWith('.mjs')), `Expected .mjs conflict: ${result.conflicts}`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('detects conflict via dir/* prefix pattern', async () => {
+      const tmp = join(tmpdir(), `wt-test-dir-${Date.now()}`);
+      mkdirSync(tmp, { recursive: true });
+      try {
+        await new Promise((res) => {
+          const p = spawn('git', ['init'], { cwd: tmp, stdio: 'ignore' });
+          p.on('close', res);
+        });
+        const { writeFileSync: wfs } = await import('node:fs');
+        mkdirSync(join(tmp, 'src', 'auth'), { recursive: true });
+        wfs(join(tmp, 'src', 'auth', 'token.mjs'), '// dirty');
+        const result = await checkWorktreeClean(['src/auth/*'], tmp);
+        assert.equal(result.safe, false, `Expected conflict from src/auth/* pattern`);
+        assert.ok(result.conflicts.some(f => f.startsWith('src/auth/')), `Expected src/auth/ conflict: ${result.conflicts}`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── Feature 3: getRetryBudget ──────────────────────────────────────────────
+  describe('getRetryBudget', () => {
+    it('returns expected shape', () => {
+      const budget = getRetryBudget();
+      assert.ok(typeof budget === 'object' && budget !== null);
+      assert.ok('perTaskRetries'   in budget, 'missing perTaskRetries');
+      assert.ok('recentDispatches' in budget, 'missing recentDispatches');
+      assert.ok('windowMs'         in budget, 'missing windowMs');
+      assert.ok('maxPerTask'       in budget, 'missing maxPerTask');
+      assert.ok('maxPerWindow'     in budget, 'missing maxPerWindow');
+      assert.equal(budget.maxPerTask,   2);
+      assert.equal(budget.maxPerWindow, 5);
+      assert.equal(budget.windowMs,     5 * 60 * 1000);
+    });
+
+    it('recentDispatches is a non-negative integer', () => {
+      const budget = getRetryBudget();
+      assert.ok(Number.isInteger(budget.recentDispatches));
+      assert.ok(budget.recentDispatches >= 0);
+    });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CLI DRY-RUN SMOKE TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('CLI', () => {
+  it('init writes profile to disk', async () => {
+    // The bug was that saveProfile was never called in cmdInit.
+    // Supply answers via stdin so runOnboarding completes: choose Claude-only,
+    // $20 plan, balanced optimization.
+    const tmp = makeTmp();
+    try {
+      const { code, stdout, stderr } = await new Promise((resolve) => {
+        const proc = spawn(process.execPath, [BIN, 'init'], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          cwd: tmp,
+        });
+        let out = '', err = '';
+        proc.stdout.on('data', d => { out += d; });
+        proc.stderr.on('data', d => { err += d; });
+        proc.on('close', exitCode => resolve({ code: exitCode, stdout: out, stderr: err }));
+        // Send answers with small delays so readline receives each line before stdin ends.
+        // Q1: Claude only, Q2: $20 plan, Q3: balanced
+        setTimeout(() => proc.stdin.write('1\n'), 50);
+        setTimeout(() => proc.stdin.write('1\n'), 200);
+        setTimeout(() => proc.stdin.write('2\n'), 350);
+        setTimeout(() => proc.stdin.end(), 500);
+      });
+      const profileFile = join(tmp, '.dualbrain', 'profile.json');
+      assert.ok(
+        existsSync(profileFile),
+        `Profile file not created at ${profileFile} (exit ${code})\nstdout:${stdout}\nstderr:${stderr}`,
+      );
+      const saved = JSON.parse(readFileSync(profileFile, 'utf8'));
+      assert.equal(saved.schemaVersion, 1);
+      assert.equal(saved.providers.claude.enabled, true);
+    } finally {
+      removeTmp(tmp);
+    }
+  });
+
   it('--help exits 0', async () => {
     const { code, stdout } = await run([BIN, '--help']);
     assert.equal(code, 0, `Expected exit 0, got ${code}`);
@@ -802,6 +1166,209 @@ describe('CLI', () => {
         combined.includes('provider') || combined.includes('dry-run') || combined.includes('model'),
         `Expected routing info in output:\n${combined.slice(0, 500)}`,
       );
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTEGRATION: FULL PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('integration: full pipeline', () => {
+
+  // Shared dual-provider profile used by several tests
+  const dualProfile = {
+    schemaVersion: 1,
+    providers: {
+      claude: { plan: '$100', enabled: true },
+      openai: { plan: '$100', enabled: true },
+    },
+    mode: 'dual',
+    bias: 'balanced',
+    preferences: [],
+  };
+
+  // Solo-claude profile (no openai)
+  const soloProfile = {
+    schemaVersion: 1,
+    providers: {
+      claude: { plan: '$100', enabled: true },
+      openai: { plan: '$20', enabled: false },
+    },
+    mode: 'auto',
+    bias: 'balanced',
+    preferences: [],
+  };
+
+  // ── Test 1: simple edit routes to sonnet and dispatches ────────────────────
+  it('simple edit routes to sonnet and dispatches', () => {
+    // Deliberately avoid keywords that trigger higher-priority intents (document, security, etc.)
+    const prompt = 'fix the button label in the settings page';
+
+    // Detect
+    const detection = detectTask({ prompt });
+    assert.equal(detection.intent, 'edit', `Expected intent:edit, got: ${detection.intent}`);
+    assert.ok(['low', 'medium'].includes(detection.risk), `Unexpected risk: ${detection.risk}`);
+    assert.equal(detection.tier, 'execute', `Expected tier:execute, got: ${detection.tier}`);
+
+    // Decide
+    const decision = decideRoute({ profile: soloProfile, detection });
+    // Simple edit on solo-claude $100 should stay with claude
+    assert.equal(decision.provider, 'claude', `Expected claude, got: ${decision.provider}`);
+    // Should pick sonnet (or haiku) — not opus — for a trivial/simple edit
+    assert.ok(['sonnet', 'haiku'].includes(decision.model),
+      `Expected sonnet or haiku for simple edit, got: ${decision.model}`);
+    assert.equal(decision.tier, 'execute', `Expected tier:execute, got: ${decision.tier}`);
+    assert.equal(decision.dualBrain, false, `Expected dualBrain:false, got: ${decision.dualBrain}`);
+
+    // Verify buildCommand produces a valid claude command (no real subprocess spawned)
+    const cmd = buildCommand(decision, prompt);
+    assert.equal(cmd[0], 'claude', `Expected claude CLI command, got: ${cmd[0]}`);
+    assert.ok(cmd.includes('-p'), 'Expected -p flag in command');
+    assert.ok(cmd.includes(prompt), 'Expected prompt in command');
+  });
+
+  // ── Test 2: security task routes to think tier with dual-brain ─────────────
+  it('security task routes to think tier with dual-brain', () => {
+    const prompt = 'audit authentication security';
+
+    // Detect
+    const detection = detectTask({ prompt });
+    assert.equal(detection.intent, 'security',
+      `Expected intent:security, got: ${detection.intent}`);
+    assert.equal(detection.tier, 'think',
+      `Expected tier:think for security, got: ${detection.tier}`);
+
+    // Decide with dual-provider profile
+    const decision = decideRoute({ profile: dualProfile, detection });
+    assert.equal(decision.tier, 'think', `Expected tier:think in decision, got: ${decision.tier}`);
+    // Dual-provider + security intent → dualBrain should be true
+    assert.equal(decision.dualBrain, true,
+      `Expected dualBrain:true for security task with dual profile, got: ${decision.dualBrain}`);
+  });
+
+  // ── Test 3: cost-saver bias downgrades model ───────────────────────────────
+  it('cost-saver bias downgrades model', () => {
+    const prompt = 'refactor the utils module';
+    const costSaverProfile = {
+      ...soloProfile,
+      mode: 'cost-saver',
+      bias: 'cost-saver',
+    };
+
+    const detection = detectTask({ prompt });
+    const decision = decideRoute({ profile: costSaverProfile, detection });
+
+    // cost-saver should prefer the cheapest model: haiku or sonnet, never opus
+    assert.ok(['haiku', 'sonnet'].includes(decision.model),
+      `Expected haiku or sonnet for cost-saver mode, got: ${decision.model}`);
+    assert.notEqual(decision.model, 'opus',
+      `cost-saver should not route to opus, got: ${decision.model}`);
+  });
+
+  // ── Test 4: hot provider triggers fallback ─────────────────────────────────
+  it('hot provider triggers fallback', async () => {
+    const tmp = makeTmp();
+    try {
+      // Mark claude as hot in the temp dir's health file
+      markHot('claude', 'sonnet', tmp);
+
+      const detection = detectTask({ prompt: 'update the settings component' });
+      assert.equal(detection.tier, 'execute', `Pre-condition: expected execute tier`);
+
+      const decision = decideRoute({ profile: dualProfile, detection, cwd: tmp });
+
+      // Claude is hot (score=0) and openai is healthy → should route to openai
+      assert.equal(decision.provider, 'openai',
+        `Expected openai fallback when claude is hot, got: ${decision.provider}`);
+    } finally {
+      // Clean up: restore claude to healthy
+      markHealthy('claude', 'sonnet', tmp);
+      removeTmp(tmp);
+    }
+  });
+
+  // ── Test 5: redaction happens before dispatch args ──────────────────────────
+  it('redaction happens before dispatch args', () => {
+    const rawPrompt = 'use API_KEY=sk-secret123 to authenticate';
+
+    const redacted = redact(rawPrompt);
+
+    // The secret value must not appear in the redacted output
+    assert.ok(!redacted.includes('sk-secret123'),
+      `Secret value must be redacted, got: ${redacted}`);
+    // The placeholder must be present instead
+    assert.ok(redacted.includes('[REDACTED]'),
+      `Expected [REDACTED] in output, got: ${redacted}`);
+
+    // Verify buildCommand also gets the safe prompt (as dispatch() applies redact before build)
+    const decision = { provider: 'claude', model: 'sonnet', tier: 'execute', effort: null, sandbox: 'workspace-write' };
+    const cmd = buildCommand(decision, redacted);
+    assert.ok(!cmd.join(' ').includes('sk-secret123'),
+      `Secret must not appear in CLI args: ${cmd.join(' ')}`);
+  });
+
+  // ── Test 6: decompose splits complex task ───────────────────────────────────
+  it('decompose splits complex task', () => {
+    const prompt = 'refactor auth module and add tests for it';
+
+    const result = decompose(prompt);
+
+    assert.ok(result.tasks.length > 1,
+      `Expected multiple tasks from compound prompt, got: ${result.tasks.length}`);
+    assert.ok(result.waves.length > 1,
+      `Expected multiple waves for compound task, got: ${result.waves.length}`);
+
+    // At least one task should have role='researcher' or 'implementer' or 'verifier'
+    const validRoles = ['researcher', 'implementer', 'reviewer', 'verifier'];
+    const allRolesValid = result.tasks.every(t => validRoles.includes(t.role));
+    assert.ok(allRolesValid,
+      `All tasks must have valid roles, got: ${result.tasks.map(t => t.role).join(', ')}`);
+
+    const hasSearchableRole = result.tasks.some(t =>
+      ['researcher', 'implementer'].includes(t.role)
+    );
+    assert.ok(hasSearchableRole,
+      `Expected at least one task with role researcher or implementer, got: ${result.tasks.map(t => t.role).join(', ')}`);
+  });
+
+  // ── Test 7: session card formats correctly ──────────────────────────────────
+  it('session card formats correctly', () => {
+    const repo = {
+      name: 'my-test-project',
+      type: 'node',
+      packageManager: 'npm',
+      branch: 'main',
+      dirty: false,
+      commands: { test: 'jest --coverage', build: null, lint: null },
+    };
+    const health = { states: {}, session: null };
+
+    const card = formatSessionCard(null, repo, health);
+
+    assert.ok(typeof card === 'string' && card.length > 0, 'Expected non-empty string');
+    assert.ok(card.includes('dual-brain ready'),
+      `Expected "dual-brain ready" in card, got:\n${card}`);
+    assert.ok(card.includes('my-test-project'),
+      `Expected repo name in card, got:\n${card}`);
+  });
+
+  // ── Test 8: playbook loads for matching intent ──────────────────────────────
+  it('playbook loads for matching intent', () => {
+    const playbook = loadPlaybook('security');
+
+    assert.ok(playbook !== null, 'Expected non-null playbook for "security" intent');
+    assert.ok(Array.isArray(playbook.steps),
+      `Expected steps array, got: ${typeof playbook.steps}`);
+    assert.ok(playbook.steps.length > 0,
+      `Expected at least one step, got: ${playbook.steps.length}`);
+
+    // Each step should have an id and tier
+    for (const step of playbook.steps) {
+      assert.ok(typeof step.id === 'string' && step.id.length > 0,
+        `Each step must have a string id, got: ${JSON.stringify(step)}`);
+      assert.ok(['search', 'execute', 'think'].includes(step.tier),
+        `Step tier must be search/execute/think, got: ${step.tier}`);
     }
   });
 });

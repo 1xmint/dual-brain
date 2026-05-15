@@ -1,0 +1,38 @@
+{
+  "name": "security-audit",
+  "description": "Structured security audit workflow: inventory, threat model, vulnerability scan, remediation plan",
+  "matchIntents": ["security"],
+  "steps": [
+    {
+      "id": "inventory",
+      "title": "Asset Inventory",
+      "goal": "Identify all security-sensitive files, endpoints, auth flows, and secret storage locations in the codebase",
+      "tier": "search",
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "threat-model",
+      "title": "Threat Model",
+      "goal": "Map attack surfaces identified in inventory to STRIDE threat categories; call out critical trust boundaries and privilege escalation paths",
+      "tier": "think",
+      "consensus": true,
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "vuln-scan",
+      "title": "Vulnerability Scan",
+      "goal": "Review each high-risk file from inventory for concrete vulnerabilities: injection, insecure defaults, secret leakage, broken auth, missing input validation",
+      "tier": "execute",
+      "output": { "kind": "findings", "required": true }
+    },
+    {
+      "id": "remediation-plan",
+      "title": "Remediation Plan",
+      "goal": "Produce a prioritised remediation plan: severity, affected file/line, recommended fix, and estimated effort for each finding",
+      "tier": "think",
+      "consensus": true,
+      "gate": "human-review",
+      "output": { "kind": "plan", "required": true }
+    }
+  ]
+}

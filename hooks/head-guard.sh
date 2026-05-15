@@ -80,6 +80,12 @@ if [[ "${TOOL}" == "Bash" ]]; then
         exit 2
     fi
 
+    # Interpreter one-liners that can write files (node -e, python -c, perl -e, ruby -e)
+    if printf '%s' "${CMD}" | grep -qE '(^|[[:space:];|&])(node[[:space:]]+(--eval|-e)|python3?[[:space:]]+-c|perl[[:space:]]+-e|ruby[[:space:]]+-e)[[:space:]]'; then
+        echo "HEAD cannot implement directly (interpreter one-liner). Use: node hooks/dispatch.mjs --task \"description\"" >&2
+        exit 2
+    fi
+
     # mv / cp where the destination looks like a source code file
     if printf '%s' "${CMD}" | grep -qE '(^|[[:space:];|&])(mv|cp)[[:space:]].*\.(js|mjs|cjs|ts|tsx|py|sh|json|yaml|yml|toml|rb|go|rs|java|c|cpp|h|css|html|sql)([[:space:]]|$)'; then
         echo "HEAD cannot implement directly (mv/cp to source file). Use: node hooks/dispatch.mjs --task \"description\"" >&2

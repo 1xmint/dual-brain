@@ -3,17 +3,48 @@
 // Takes a routing decision and launches the agent via Claude CLI or Codex CLI.
 // CLI: node src/dispatch.mjs --dry-run --provider claude --model sonnet --prompt "fix the bug"
 //      node src/dispatch.mjs --detect-runtime
-// Exports: dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain
+// Exports: dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain,
+//          validateDispatch, checkWorktreeClean, getRetryBudget
 
 import { spawn } from 'node:child_process';
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { markHot, markDegraded, markHealthy, recordDispatch } from './health.mjs';
+import { redact } from './redact.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
 const TIER_TIMEOUT_MS = { search: 60_000, execute: 120_000, think: 180_000 };
 const CLAUDE_MODEL_IDS = { opus: 'claude-opus-4-5', sonnet: 'claude-sonnet-4-5', haiku: 'claude-haiku-4-5' };
+
+// ─── Median dispatch time tracker (in-process, for slow-response detection) ──
+// Rolling window of recent dispatch durations keyed by "provider:modelClass"
+const _durationHistory = new Map();
+const DURATION_WINDOW  = 10; // keep last N durations per model class
+
+function recordDuration(provider, model, durationMs) {
+  const k = `${provider}:${model}`;
+  if (!_durationHistory.has(k)) _durationHistory.set(k, []);
+  const arr = _durationHistory.get(k);
+  arr.push(durationMs);
+  if (arr.length > DURATION_WINDOW) arr.shift();
+}
+
+function medianDuration(provider, model) {
+  const k = `${provider}:${model}`;
+  const arr = _durationHistory.get(k);
+  if (!arr || arr.length < 3) return null; // not enough data
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+// Rate-limit error keywords
+const RATE_LIMIT_PATTERNS = /rate.?limit|quota|capacity|too many requests|overloaded|throttl/i;
 
 // ─── Runtime detection (cached) ───────────────────────────────────────────────
 
@@ -43,6 +74,182 @@ async function detectRuntime() {
 
   _runtimeCache = { claudeAvailable, codexAvailable, runtime };
   return _runtimeCache;
+}
+
+// ─── Feature 1: Model validation + graceful fallback ─────────────────────────
+
+/** Valid CLI model flags per provider */
+const VALID_MODELS = {
+  claude: ['opus', 'sonnet', 'haiku'],
+  openai: ['o4-mini', 'o3', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-5.2', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-5.5'],
+};
+
+/** Safest default model for a given provider + tier */
+function _safeModel(provider, tier) {
+  if (provider === 'claude') {
+    return tier === 'search' ? 'haiku' : 'sonnet';
+  }
+  return 'o4-mini';
+}
+
+/**
+ * Validate a routing decision against CLI availability and valid model lists.
+ * Returns either a (possibly corrected) decision object, or an error sentinel
+ * `{ _error: string }` when no CLI is available at all.
+ *
+ * @param {object} decision
+ * @param {{ claudeAvailable: boolean, codexAvailable: boolean }} rt  Runtime info
+ * @returns {object}  Corrected decision or `{ _error: string }`
+ */
+function validateDispatch(decision, rt) {
+  let { provider = 'claude', model, tier = 'execute' } = decision;
+
+  // ── CLI availability ──────────────────────────────────────────────────────
+  const claudeOk = rt.claudeAvailable;
+  const codexOk  = rt.codexAvailable;
+
+  if (!claudeOk && !codexOk) {
+    return { _error: 'No AI CLI available. Install claude or codex CLI.' };
+  }
+
+  if (provider === 'claude' && !claudeOk && codexOk) {
+    process.stderr.write('[dual-brain] Claude unavailable, falling back to OpenAI (codex)\n');
+    provider = 'openai';
+  } else if (provider === 'openai' && !codexOk && claudeOk) {
+    process.stderr.write('[dual-brain] OpenAI unavailable, falling back to Claude (claude)\n');
+    provider = 'claude';
+  }
+
+  // ── Model validation ──────────────────────────────────────────────────────
+  const validList = VALID_MODELS[provider] ?? [];
+  if (model && !validList.includes(model)) {
+    const safe = _safeModel(provider, tier);
+    process.stderr.write(`[dual-brain] Model "${model}" not valid for ${provider} CLI; defaulting to "${safe}"\n`);
+    model = safe;
+  }
+
+  return { ...decision, provider, model };
+}
+
+// ─── Feature 2: Dirty-worktree guard ─────────────────────────────────────────
+
+/**
+ * Simple glob match:
+ *  - `dir/*`  → prefix match on `dir/`
+ *  - `*.ext`  → suffix match on `.ext`
+ *  - otherwise → exact match
+ */
+function _globMatch(pattern, filePath) {
+  if (pattern.endsWith('/*')) {
+    const prefix = pattern.slice(0, -1); // 'src/auth/'
+    return filePath.startsWith(prefix);
+  }
+  if (pattern.startsWith('*.')) {
+    const suffix = pattern.slice(1); // '.mjs'
+    return filePath.endsWith(suffix);
+  }
+  return filePath === pattern;
+}
+
+/**
+ * Check whether dirty worktree files overlap with the agent's ownership globs.
+ *
+ * @param {string[]} owns  Glob patterns for files the agent will touch
+ * @param {string}   cwd   Working directory for git
+ * @returns {Promise<{ safe: boolean, conflicts?: string[] }>}
+ */
+async function checkWorktreeClean(owns, cwd) {
+  if (!owns || owns.length === 0) return { safe: true };
+
+  const dirty = await new Promise((resolve) => {
+    const proc = spawn('git', ['status', '--porcelain', '-u'], {
+      cwd: cwd || process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d; });
+    proc.on('close', () => {
+      // Each line: "XY path" — grab the path part (columns 4+, after "XY ")
+      const files = out.split('\n')
+        .map(l => l.slice(3).trim())
+        .filter(Boolean);
+      resolve(files);
+    });
+    proc.on('error', () => resolve([])); // git not available → skip guard
+  });
+
+  if (dirty.length === 0) return { safe: true };
+
+  const conflicts = dirty.filter(f =>
+    owns.some(pattern => _globMatch(pattern, f))
+  );
+
+  if (conflicts.length > 0) return { safe: false, conflicts };
+  return { safe: true };
+}
+
+// ─── Feature 3: Retry budget ──────────────────────────────────────────────────
+
+/** Per-prompt retry count (keyed by first 16 hex chars of SHA-256 of prompt) */
+const _retryCount = new Map();
+
+/** Recent dispatch timestamps for the 5-minute window rate-limit */
+const _recentDispatches = [];
+
+const MAX_RETRIES_PER_TASK    = 2;
+const MAX_DISPATCHES_PER_5MIN = 5;
+const WINDOW_MS = 5 * 60 * 1000;
+
+function _promptKey(prompt) {
+  return createHash('sha256').update(String(prompt)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Check whether this dispatch is within budget.
+ * @param {string} prompt
+ * @returns {{ allowed: boolean, reason?: string }}
+ */
+function _checkRetryBudget(prompt) {
+  const now = Date.now();
+
+  // Evict dispatch timestamps older than 5 minutes
+  while (_recentDispatches.length > 0 && now - _recentDispatches[0] > WINDOW_MS) {
+    _recentDispatches.shift();
+  }
+
+  if (_recentDispatches.length >= MAX_DISPATCHES_PER_5MIN) {
+    return { allowed: false, reason: 'Retry budget exhausted. Wait or adjust task.' };
+  }
+
+  const key   = _promptKey(prompt);
+  const count = _retryCount.get(key) ?? 0;
+  if (count > MAX_RETRIES_PER_TASK) {
+    return { allowed: false, reason: 'Retry budget exhausted. Wait or adjust task.' };
+  }
+
+  return { allowed: true };
+}
+
+function _recordDispatchBudget(prompt) {
+  _recentDispatches.push(Date.now());
+  const key = _promptKey(prompt);
+  _retryCount.set(key, (_retryCount.get(key) ?? 0) + 1);
+}
+
+/**
+ * Return current retry budget state for status display.
+ * @returns {object}
+ */
+function getRetryBudget() {
+  const now = Date.now();
+  const active = _recentDispatches.filter(t => now - t <= WINDOW_MS).length;
+  return {
+    perTaskRetries:   Object.fromEntries(_retryCount),
+    recentDispatches: active,
+    windowMs:         WINDOW_MS,
+    maxPerTask:       MAX_RETRIES_PER_TASK,
+    maxPerWindow:     MAX_DISPATCHES_PER_5MIN,
+  };
 }
 
 // ─── Command builder ──────────────────────────────────────────────────────────
@@ -140,28 +347,82 @@ function runProcess(cmd, cwd, timeoutMs) {
 
 // ─── Main dispatch ────────────────────────────────────────────────────────────
 async function dispatch(input = {}) {
-  const { decision = {}, prompt, files = [], cwd = process.cwd(), dryRun = false } = input;
+  const { decision = {}, files = [], cwd = process.cwd(), dryRun = false } = input;
+  let { prompt } = input;
 
   if (!prompt) throw new Error('prompt is required');
 
-  const provider = decision.provider ?? 'claude';
-  const model    = decision.model ?? 'sonnet';
+  // Safety gate: redact secrets before anything reaches a subprocess or log
+  prompt = redact(prompt);
+
   const tier     = decision.tier ?? 'execute';
   const timeoutMs = TIER_TIMEOUT_MS[tier] ?? 120_000;
 
+  // ── Feature 3: Retry budget check ────────────────────────────────────────
+  const budget = _checkRetryBudget(prompt);
+  if (!budget.allowed) {
+    return {
+      status: 'error',
+      provider: decision.provider ?? 'claude',
+      model: decision.model ?? 'sonnet',
+      command: null,
+      exitCode: null,
+      summary: budget.reason,
+      durationMs: 0,
+      usage: null,
+      error: budget.reason,
+    };
+  }
+
+  // ── Feature 1: Validate dispatch (CLI availability + model) ──────────────
   const rt = await detectRuntime();
+  const validated = validateDispatch({ ...decision, tier }, rt);
 
-  // Determine actual provider if preferred CLI is missing
-  let effectiveProvider = provider;
-  if (provider === 'claude' && !rt.claudeAvailable && rt.codexAvailable) effectiveProvider = 'openai';
-  if (provider === 'openai' && !rt.codexAvailable && rt.claudeAvailable) effectiveProvider = 'claude';
+  if (validated._error) {
+    return {
+      status: 'error',
+      provider: decision.provider ?? 'claude',
+      model: decision.model ?? 'sonnet',
+      command: null,
+      exitCode: null,
+      summary: validated._error,
+      durationMs: 0,
+      usage: null,
+      error: validated._error,
+    };
+  }
 
-  const effectiveDecision = { ...decision, provider: effectiveProvider };
+  const effectiveProvider = validated.provider;
+  const effectiveModel    = validated.model ?? decision.model ?? 'sonnet';
+  const effectiveDecision = { ...validated };
+
+  // ── Feature 2: Dirty-worktree guard for execute-tier dispatches ──────────
+  if (tier === 'execute' && decision.owns && !decision._force) {
+    const wtCheck = await checkWorktreeClean(decision.owns, cwd);
+    if (!wtCheck.safe) {
+      const msg = `Uncommitted changes conflict with agent scope: ${wtCheck.conflicts.join(', ')}. Commit or stash before dispatching.`;
+      return {
+        status: 'error',
+        provider: effectiveProvider,
+        model: effectiveModel,
+        command: null,
+        exitCode: null,
+        summary: msg,
+        durationMs: 0,
+        usage: null,
+        error: msg,
+      };
+    }
+  }
+
   const command = buildCommand(effectiveDecision, prompt, files, cwd);
 
   if (dryRun) {
-    return { status: 'dry-run', provider: effectiveProvider, model, command, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
+    return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, command, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
   }
+
+  // Record this dispatch against the budget
+  _recordDispatchBudget(prompt);
 
   const { exitCode, stdout, stderr, durationMs } = await runProcess(command, cwd, timeoutMs);
 
@@ -175,11 +436,30 @@ async function dispatch(input = {}) {
   } catch {}
 
   const success = exitCode === 0;
+  const errorText = (stderr || stdout).slice(0, 500);
   const summary = success ? compressResult(stdout) : compressResult(stderr || stdout);
+
+  // ── Health tracking ──────────────────────────────────────────────────────
+  if (success) {
+    recordDuration(effectiveProvider, effectiveModel, durationMs);
+    const median = medianDuration(effectiveProvider, effectiveModel);
+    if (median !== null && durationMs > median * 3) {
+      markDegraded(effectiveProvider, effectiveModel, cwd);
+    } else {
+      markHealthy(effectiveProvider, effectiveModel, cwd);
+    }
+    const totalTokens = (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+    recordDispatch(effectiveProvider, effectiveModel, totalTokens, cwd);
+  } else {
+    if (RATE_LIMIT_PATTERNS.test(errorText)) {
+      markHot(effectiveProvider, effectiveModel, cwd);
+    }
+  }
+  // ── End health tracking ──────────────────────────────────────────────────
 
   recordUsage({
     provider: effectiveProvider,
-    model,
+    model: effectiveModel,
     tier,
     durationMs,
     inputTokens:  usage?.inputTokens  ?? null,
@@ -190,29 +470,43 @@ async function dispatch(input = {}) {
   return {
     status:     success ? 'completed' : 'failed',
     provider:   effectiveProvider,
-    model,
+    model:      effectiveModel,
     command,
     exitCode,
     summary,
     durationMs,
     usage,
-    error: success ? null : (stderr || stdout).slice(0, 200),
+    error: success ? null : errorText.slice(0, 200),
   };
 }
 
 // ─── Dual-brain dispatch (parallel) ───────────────────────────────────────────
 async function dispatchDualBrain(input = {}) {
-  const { decision = {}, prompt, files = [], cwd = process.cwd(), dryRun = false } = input;
+  const { decision = {}, files = [], cwd = process.cwd(), dryRun = false } = input;
+  let { prompt } = input;
   if (!prompt) throw new Error('prompt is required');
 
+  // Safety gate: redact secrets before sending to either provider
+  prompt = redact(prompt);
+
+  // Feature 1: Validate both sub-decisions before spawning anything
+  const rt = await detectRuntime();
   const tier = decision.tier ?? 'execute';
 
-  const claudeDecision = { ...decision, provider: 'claude', model: decision.model ?? 'sonnet' };
-  const openaiDecision = { ...decision, provider: 'openai', model: decision.openaiModel ?? 'o4-mini' };
+  const claudeDecision = { ...decision, provider: 'claude', model: decision.model ?? 'sonnet', tier };
+  const _oaiDefault = tier === 'think' ? 'gpt-5.5' : tier === 'search' ? 'o4-mini' : 'gpt-5.4';
+  const openaiDecision = { ...decision, provider: 'openai', model: decision.openaiModel ?? _oaiDefault, tier };
+
+  const validatedClaude = validateDispatch(claudeDecision, rt);
+  const validatedOpenai = validateDispatch(openaiDecision, rt);
 
   const [claudeResult, openaiResult] = await Promise.all([
-    dispatch({ decision: claudeDecision, prompt, files, cwd, dryRun }),
-    dispatch({ decision: openaiDecision, prompt, files, cwd, dryRun }),
+    validatedClaude._error
+      ? Promise.resolve({ status: 'error', provider: 'claude', model: claudeDecision.model, command: null, exitCode: null, summary: validatedClaude._error, durationMs: 0, usage: null, error: validatedClaude._error })
+      : dispatch({ decision: validatedClaude, prompt, files, cwd, dryRun }),
+    validatedOpenai._error
+      ? Promise.resolve({ status: 'error', provider: 'openai', model: openaiDecision.model, command: null, exitCode: null, summary: validatedOpenai._error, durationMs: 0, usage: null, error: validatedOpenai._error })
+      : dispatch({ decision: validatedOpenai, prompt, files, cwd, dryRun }),
   ]);
 
   return {
@@ -261,4 +555,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   }
 }
 
-export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain };
+export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget };

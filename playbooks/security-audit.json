@@ -1,0 +1,57 @@
+{
+  "name": "security-audit",
+  "description": "Systematic security review: inventory, threat model, vulnerability scan, ranked findings, remediation plan",
+  "matchIntents": ["security"],
+  "steps": [
+    {
+      "id": "inventory",
+      "title": "Inventory Security-Sensitive Files",
+      "goal": "Identify all security-sensitive files in the codebase: auth modules, secret storage, .env files, API key usage, token handling, encryption routines, and permission checks. List each file with a one-line note on its security role.",
+      "tier": "search",
+      "consensus": false,
+      "output": { "kind": "checklist", "required": true }
+    },
+    {
+      "id": "threat-model",
+      "title": "Threat Model",
+      "goal": "Analyze the attack surface of this codebase. Identify threat actors (external users, internal users, third-party services), attack vectors (inputs, APIs, files, network), and trust boundaries. Categorize threats using STRIDE (Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege) or a similar framework. Produce a structured threat model.",
+      "tier": "think",
+      "consensus": true,
+      "gate": { "type": "risk", "requiredWhen": "always" },
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "vulnerability-scan",
+      "title": "Vulnerability Scan",
+      "goal": "Check the identified security-sensitive files for common vulnerabilities: hardcoded secrets or API keys, SQL injection, cross-site scripting (XSS), cross-site request forgery (CSRF), insecure deserialization, path traversal, missing or insufficient input validation, and improper error handling that leaks internals. List each finding with file, line reference, and a brief description.",
+      "tier": "search",
+      "consensus": false,
+      "output": { "kind": "checklist", "required": true }
+    },
+    {
+      "id": "exploitability-rank",
+      "title": "Exploitability Ranking",
+      "goal": "Rank the findings from the vulnerability scan by exploitability and impact using CVSS-style severity (Critical, High, Medium, Low). For each finding, estimate attack complexity and potential blast radius. Filter out false positives and explain your reasoning. Produce a ranked list with severity labels.",
+      "tier": "think",
+      "consensus": true,
+      "gate": { "type": "risk", "requiredWhen": "always" },
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "remediation-plan",
+      "title": "Remediation Plan",
+      "goal": "For each confirmed vulnerability, propose a specific fix: name the exact file and line range, describe the code change needed, and explain why it closes the vulnerability. Prioritize fixes by severity (Critical first). Where a fix introduces new risk, call it out.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "plan", "required": true }
+    },
+    {
+      "id": "summary",
+      "title": "Risk Assessment Summary",
+      "goal": "Produce a final risk assessment: total counts by severity (Critical/High/Medium/Low), top 3 priorities that must be addressed before the next release, and an estimate of residual risk after all proposed fixes are applied. Keep it concise — this is the executive summary.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "summary", "required": true }
+    }
+  ]
+}

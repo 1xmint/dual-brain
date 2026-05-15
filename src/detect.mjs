@@ -12,7 +12,7 @@ const INTENTS = {
   format:       /\b(format|lint|prettier|style|indent|whitespace|typo|typos|comment[s]?|reformat)\b/i,
   planning:     /\b(plan|roadmap|strategy|prioritize|break down|decompose|prioritise)\b/i,
   architecture: /\b(design|architect|architecture|propose|how should we|system design|system architecture)\b/i,
-  security:     /\b(auth|credential|secret|token|password|encrypt|permission[s]?|vulnerability|vulnerabilities|CVE|oauth|jwt|api.?key)\b/i,
+  security:     /\b(auth(?:enticat\w*)?|credential|secret|token|password|encrypt|permission[s]?|vulnerability|vulnerabilities|CVE|oauth|jwt|api.?key)\b/i,
   review:       /\b(review|audit|check for issues|evaluate|assess|inspect code|code review)\b/i,
   debug:        /\b(debug|investigate|why (is|does|isn't|doesn't)|trace|diagnose|figure out|broken|not working|failing|regression)\b/i,
   test:         /\b(test[s]?|spec[s]?|add test|fix test|test coverage|unit test|e2e|integration test|jest|vitest|mocha)\b/i,

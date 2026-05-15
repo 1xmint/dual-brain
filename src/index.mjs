@@ -10,6 +10,12 @@ export { loadProfile, ensureProfile, runOnboarding, rememberPreference, forgetPr
 export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths } from './detect.mjs';
 export { decideRoute, getModelCapabilities, getAvailableModels, estimateBudgetPressure, shouldDualBrain, explainDecision } from './decide.mjs';
 export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain } from './dispatch.mjs';
+export { loadPlaybook, listPlaybooks, executePlaybook, createRunArtifact } from './playbook.mjs';
+export { getHealth, markHot, markDegraded, markHealthy, checkCooldown, getProviderScore, recordDispatch, getSessionStats, resetHealth, remainingCooldownMinutes } from './health.mjs';
+export { detectRepo, loadRepoCache, getTestCommand, getLintCommand } from './repo.mjs';
+export { loadSession, saveSession, updateSession, clearSession, formatSessionCard } from './session.mjs';
+export { decompose, isSimpleTask, taskGraphToWaves } from './decompose.mjs';
+export { generateBrief, compressPriorResults, listRoles } from './brief.mjs';
 
 // Top-level convenience function
 export async function orchestrate({ prompt, files, cwd, dryRun }) {

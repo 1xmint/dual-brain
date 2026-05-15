@@ -1,0 +1,49 @@
+{
+  "name": "debug",
+  "description": "Structured bug resolution: reproduce, isolate, hypothesize root cause, fix minimally, verify with tests",
+  "matchIntents": ["debug", "fix"],
+  "steps": [
+    {
+      "id": "reproduce",
+      "title": "Reproduce the Failure",
+      "goal": "Find the failing code path. Identify the error message, stack trace, or unexpected behavior being reported. Locate the relevant source files, the entry point where the failure originates, and any existing tests that exercise this path. Confirm you understand the expected vs actual behavior.",
+      "tier": "search",
+      "consensus": false,
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "isolate",
+      "title": "Isolate the Root Cause",
+      "goal": "Narrow down the root cause to a specific file, function, or line range. Trace the data flow from the failing callsite back to where the incorrect value or state originates. Check recent git changes to this code path. Identify the single most likely source of the problem before moving on.",
+      "tier": "search",
+      "consensus": false,
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "hypothesize",
+      "title": "Form a Root Cause Hypothesis",
+      "goal": "Based on the isolated evidence, form a clear hypothesis about why the bug occurs. Consider: edge cases not handled, race conditions or ordering issues, incorrect assumptions about inputs or state, stale or shared mutable state, off-by-one errors, or API contract mismatches. State your hypothesis explicitly and explain what evidence supports it.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "fix",
+      "title": "Implement the Minimal Fix",
+      "goal": "Implement the smallest change that fixes the bug according to the hypothesis. Do not refactor surrounding code, rename things, or improve unrelated areas. If a regression test for this bug does not exist, add one. The fix should be easy to review and easy to revert if wrong.",
+      "tier": "execute",
+      "consensus": false,
+      "gate": { "type": "diff-review", "requiredWhen": "high-risk" },
+      "output": { "kind": "patch", "required": true }
+    },
+    {
+      "id": "verify",
+      "title": "Verify Fix and Check for Regressions",
+      "goal": "Run the full test suite. Confirm the bug is no longer reproducible. Confirm no previously passing tests now fail. If regressions are found, determine whether they are related to the fix or pre-existing. Summarize: the root cause in one sentence, the fix applied, and the test evidence that the bug is resolved.",
+      "tier": "execute",
+      "consensus": false,
+      "gate": { "type": "test", "requiredWhen": "always" },
+      "output": { "kind": "summary", "required": true }
+    }
+  ]
+}

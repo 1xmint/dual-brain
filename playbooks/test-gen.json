@@ -1,0 +1,48 @@
+{
+  "name": "test-gen",
+  "description": "Targeted test generation: analyze behavior, design test cases, write tests, run them, and report coverage gaps",
+  "matchIntents": ["test"],
+  "steps": [
+    {
+      "id": "analyze",
+      "title": "Analyze Target Behavior",
+      "goal": "Identify the target code's observable behavior: all inputs and their valid ranges, outputs and their shapes, side effects (writes, network calls, mutations), error paths and what triggers them, and edge cases implied by the logic. Check existing test coverage to avoid duplicating what already exists.",
+      "tier": "search",
+      "consensus": false,
+      "output": { "kind": "analysis", "required": true }
+    },
+    {
+      "id": "design",
+      "title": "Design the Test Cases",
+      "goal": "Choose the appropriate test strategy: unit tests for isolated logic, integration tests for module boundaries, or end-to-end tests for full flows. Enumerate the specific test cases to write: happy path scenarios, edge cases (empty input, max values, nulls), error and exception paths, and boundary value cases. Justify the strategy choice based on what will give the most signal per test.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "plan", "required": true }
+    },
+    {
+      "id": "generate",
+      "title": "Write the Tests",
+      "goal": "Write the tests following the design plan. Match the existing test framework, file naming conventions, describe/it or test() structure, assertion style, and helper patterns already used in this project. Each test should have a clear name that describes the scenario, not the implementation. Do not test internal state — test observable behavior.",
+      "tier": "execute",
+      "consensus": false,
+      "output": { "kind": "test", "required": true }
+    },
+    {
+      "id": "run",
+      "title": "Run Tests and Fix Test Bugs",
+      "goal": "Run the newly generated tests. If any fail, determine whether the failure is a bug in the test (wrong assertion, bad setup, incorrect expectation) or a real bug in the code under test. Fix test bugs only — do not change production code here unless a genuine pre-existing bug is discovered (if so, note it and leave it for a separate fix step). Ensure all generated tests pass.",
+      "tier": "execute",
+      "consensus": false,
+      "gate": { "type": "test", "requiredWhen": "always" },
+      "output": { "kind": "test", "required": true }
+    },
+    {
+      "id": "coverage",
+      "title": "Coverage Summary and Gap Analysis",
+      "goal": "Summarize the test coverage added: how many new test cases, which behaviors are now verified, and which code paths are exercised. Identify remaining gaps: behaviors that are hard to test (external dependencies, time-dependent logic, non-determinism) and explain why. Recommend follow-up tests if any critical paths remain untested.",
+      "tier": "think",
+      "consensus": false,
+      "output": { "kind": "summary", "required": true }
+    }
+  ]
+}

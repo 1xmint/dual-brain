@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -12,7 +12,14 @@
     "./profile": "./src/profile.mjs",
     "./detect": "./src/detect.mjs",
     "./decide": "./src/decide.mjs",
-    "./dispatch": "./src/dispatch.mjs"
+    "./dispatch": "./src/dispatch.mjs",
+    "./playbook": "./src/playbook.mjs",
+    "./health": "./src/health.mjs",
+    "./repo": "./src/repo.mjs",
+    "./session": "./src/session.mjs",
+    "./decompose": "./src/decompose.mjs",
+    "./brief": "./src/brief.mjs",
+    "./redact": "./src/redact.mjs"
   },
   "keywords": [
     "claude-code",
@@ -33,7 +40,7 @@
   "scripts": {
     "test": "node hooks/test-orchestrator.mjs",
     "test:core": "node --test src/test.mjs",
-    "postinstall": "node install.mjs"
+    "postinstall": "echo 'dual-brain installed. Run: dual-brain install (in your project) to set up hooks.'"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -49,6 +56,7 @@
     "review-rules.md",
     "CLAUDE.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "playbooks/*.json"
   ]
 }
