@@ -644,6 +644,23 @@ function _prependDispatchMarker(prompt) {
   return `<!-- dual-brain-dispatch: ${runId} -->\n${prompt}`;
 }
 
+// ─── Related session age label ────────────────────────────────────────────────
+
+/**
+ * Human-readable age label for a related session date string.
+ * @param {string} isoDate
+ * @returns {string}
+ */
+function _relatedSessionAge(isoDate) {
+  const diff = Date.now() - Date.parse(isoDate);
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 // ─── Main dispatch ────────────────────────────────────────────────────────────
 async function dispatch(input = {}) {
   const { files = [], cwd = process.cwd(), dryRun = false, verbose = false } = input;
@@ -654,6 +671,32 @@ async function dispatch(input = {}) {
 
   // Safety gate: redact secrets before anything reaches a subprocess or log
   prompt = redact(prompt);
+
+  // ── Related session context injection ────────────────────────────────────────
+  // Find past sessions related to this task and prepend a context block.
+  // Only injected when confidence is high (score > 5). Fast: index-only, no JSONL parsing.
+  if (!input._skipRelatedContext) {
+    try {
+      const { findRelatedSessions } = await import('./session.mjs');
+      const related = findRelatedSessions(prompt, files, cwd);
+      const highConfidence = related.filter(r => r.score > 5);
+      if (highConfidence.length > 0) {
+        const lines = highConfidence.map(r => {
+          const dateLabel = r.date ? _relatedSessionAge(r.date) : null;
+          const datePart  = dateLabel ? `, ${dateLabel}` : '';
+          const msgPart   = r.messageCount > 0 ? `, ${r.messageCount} messages` : '';
+          const fileList  = r.matchedFiles.length > 0
+            ? `: touched ${r.matchedFiles.map(f => f.split('/').pop()).join(', ')}`
+            : '';
+          return `- "${r.smartName}"${datePart}${msgPart}${fileList}`;
+        });
+        const contextBlock = `[Prior context from related sessions:]\n${lines.join('\n')}\n[End prior context]\n\n`;
+        prompt = contextBlock + prompt;
+        if (verbose) process.stderr.write(`[dual-brain] injected related session context (${highConfidence.length} sessions)\n`);
+      }
+    } catch { /* non-fatal — never block dispatch */ }
+  }
+  // ── End related session context ──────────────────────────────────────────────
 
   // Stamp the prompt with the dispatch marker so enforce-tier.mjs can recognise
   // that this agent call came through the official pipeline.

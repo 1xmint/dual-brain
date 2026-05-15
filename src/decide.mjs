@@ -6,21 +6,40 @@
  * to use and explains why in one sentence.
  *
  * Exports: decideRoute, getModelCapabilities, getAvailableModels,
- *          estimateBudgetPressure, shouldDualBrain, explainDecision, getFailoverOrder
+ *          estimateBudgetPressure, shouldDualBrain, explainDecision, getFailoverOrder,
+ *          getOptimalSub
  *
  * CLI: node src/decide.mjs --profile /path/to/profile.json \
  *        --detection '{"intent":"edit","risk":"low","complexity":"simple","effort":"medium","tier":"execute"}'
  */
 
-import { existsSync, readFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getProviderScore, checkCooldown } from './health.mjs';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const WORKSPACE   = join(__dirname, '..');
-const USAGE_DIR   = join(WORKSPACE, '.dualbrain', 'usage');
-const FIVE_HRS_MS = 5 * 60 * 60 * 1000;
+const __dirname  = dirname(fileURLToPath(import.meta.url));
+const WORKSPACE  = join(__dirname, '..');
+const USAGE_DIR  = join(WORKSPACE, '.dualbrain', 'usage');
+const AUDIT_DIR  = join(WORKSPACE, '.dualbrain', 'audit');
+const FIVE_HRS_MS  = 5 * 60 * 60 * 1000;
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+// ─── Subscription token quotas (mirrors budget-balancer.mjs) ─────────────────
+
+/** Per-plan aggregate token budgets for the two rolling windows. */
+const SUB_QUOTAS = {
+  claude: {
+    '$20':  { fiveHr: 402_500,   weekly: 2_750_000  },
+    '$100': { fiveHr: 1_638_000, weekly: 11_100_000  },
+    '$200': { fiveHr: 4_120_000, weekly: 27_500_000  },
+  },
+  openai: {
+    '$20':  { fiveHr: 400_000,   weekly: 2_700_000  },
+    '$100': { fiveHr: 1_050_000, weekly: 6_750_000  },
+    '$200': { fiveHr: 1_900_000, weekly: 17_500_000  },
+  },
+};
 
 // ─── Slim Model Capabilities (routing-relevant only) ─────────────────────────
 
@@ -470,6 +489,217 @@ export function parsePreferences(preferences) {
   return signals;
 }
 
+// ─── Exported: getOptimalSub ─────────────────────────────────────────────────
+
+/**
+ * Read usage log entries within a given window (ms).
+ * Scans .dualbrain/usage/usage-YYYY-MM-DD.jsonl files.
+ * @param {number} windowMs
+ * @returns {Array<object>}
+ */
+function _readUsageInWindow(windowMs) {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  const entries = [];
+  const daysBack = Math.ceil(windowMs / 86_400_000) + 1;
+  const seen = new Set();
+  for (let i = 0; i < daysBack; i++) {
+    const date = new Date(now - i * 86_400_000).toISOString().slice(0, 10);
+    if (seen.has(date)) continue;
+    seen.add(date);
+    const file = join(USAGE_DIR, `usage-${date}.jsonl`);
+    if (!existsSync(file)) continue;
+    let raw;
+    try { raw = readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      const ts = Date.parse(rec.timestamp);
+      if (!isNaN(ts) && ts >= cutoff) entries.push(rec);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Sum tokens used by a specific provider from usage entries.
+ * @param {Array<object>} entries
+ * @param {string} provider
+ * @returns {number}
+ */
+function _sumProviderTokens(entries, provider) {
+  let total = 0;
+  for (const e of entries) {
+    if (e.provider !== provider) continue;
+    const inp = e.input_tokens ?? 0;
+    const out = e.output_tokens ?? 0;
+    total += inp + out > 0 ? inp + out : 8_000; // fallback estimate
+  }
+  return total;
+}
+
+/**
+ * Log an autopilot routing decision to .dualbrain/audit/budget-autopilot.jsonl.
+ * @param {object} entry
+ */
+function _logAutopilot(entry) {
+  try {
+    if (!existsSync(AUDIT_DIR)) mkdirSync(AUDIT_DIR, { recursive: true });
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
+    appendFileSync(join(AUDIT_DIR, 'budget-autopilot.jsonl'), line + '\n', 'utf8');
+  } catch {
+    // Non-fatal: logging should never block routing
+  }
+}
+
+/**
+ * Given a provider and profile, pick the subscription with the most remaining
+ * quota — use-it-or-lose-it scoring: `remaining * (1 / hoursUntilReset)`.
+ *
+ * Handles single-sub and multi-sub profiles uniformly. When only one sub
+ * exists, returns it immediately (no log written for single-sub case since
+ * there is no real routing decision to make).
+ *
+ * @param {'claude'|'openai'} provider
+ * @param {'search'|'execute'|'think'} tier
+ * @param {object} profile
+ * @returns {{
+ *   subIndex: number,
+ *   plan: string,
+ *   label: string|null,
+ *   fiveHrUsed: number,
+ *   weeklyUsed: number,
+ *   fiveHrQuota: number,
+ *   weeklyQuota: number,
+ *   fiveHrRemaining: number,
+ *   weeklyRemaining: number,
+ *   score: number,
+ *   reason: string,
+ * }|null}
+ */
+export function getOptimalSub(provider, tier, profile) {
+  const providerCfg = profile?.providers?.[provider];
+  if (!providerCfg) return null;
+
+  // Normalise to an array of subs
+  const subs = providerCfg.subs?.length
+    ? providerCfg.subs
+    : providerCfg.plan
+      ? [{ plan: providerCfg.plan, label: providerCfg.label || null }]
+      : [];
+
+  if (subs.length === 0) return null;
+
+  // Short-circuit for single-sub: skip usage read and logging overhead
+  if (subs.length === 1) {
+    const s = subs[0];
+    const plan = s.plan || '$100';
+    const quotas = SUB_QUOTAS[provider]?.[plan] ?? { fiveHr: 1_000_000, weekly: 7_000_000 };
+    return {
+      subIndex: 0,
+      plan,
+      label: s.label ?? null,
+      fiveHrUsed: 0,
+      weeklyUsed: 0,
+      fiveHrQuota: quotas.fiveHr,
+      weeklyQuota: quotas.weekly,
+      fiveHrRemaining: quotas.fiveHr,
+      weeklyRemaining: quotas.weekly,
+      score: quotas.fiveHr,
+      reason: 'only sub available',
+    };
+  }
+
+  // Multi-sub: read usage logs once for both windows
+  const fiveHrEntries = _readUsageInWindow(FIVE_HRS_MS);
+  const weeklyEntries = _readUsageInWindow(SEVEN_DAY_MS);
+
+  // We cannot distinguish sub-level usage from the log (no subIndex field),
+  // so we divide total provider usage evenly across subs as a best-effort proxy.
+  const fiveHrTotal = _sumProviderTokens(fiveHrEntries, provider);
+  const weeklyTotal = _sumProviderTokens(weeklyEntries, provider);
+  const perSubFiveHr = Math.round(fiveHrTotal / subs.length);
+  const perSubWeekly = Math.round(weeklyTotal / subs.length);
+
+  // Score each sub
+  const now = Date.now();
+  const fiveHrResetMs = FIVE_HRS_MS; // window always resets from now in a rolling sense
+  const weeklyResetMs = SEVEN_DAY_MS;
+
+  let best = null;
+  let bestScore = -Infinity;
+  const alternatives = [];
+
+  subs.forEach((s, i) => {
+    const plan = s.plan || '$100';
+    const quotas = SUB_QUOTAS[provider]?.[plan] ?? { fiveHr: 1_000_000, weekly: 7_000_000 };
+
+    const fiveHrRemaining = Math.max(0, quotas.fiveHr - perSubFiveHr);
+    const weeklyRemaining = Math.max(0, quotas.weekly - perSubWeekly);
+
+    // Binding constraint: whichever window is tighter
+    const remaining = Math.min(fiveHrRemaining, weeklyRemaining);
+
+    // Hours until the tighter window resets (rolling → effectively "now + window")
+    const hoursUntilReset = fiveHrRemaining <= weeklyRemaining
+      ? (fiveHrResetMs / 3_600_000)
+      : (weeklyResetMs / 3_600_000);
+
+    // Use-it-or-lose-it: higher score = more remaining + resets sooner
+    const score = hoursUntilReset > 0 ? remaining * (1 / hoursUntilReset) : remaining;
+
+    const pctRemaining = quotas.fiveHr > 0
+      ? Math.round((fiveHrRemaining / quotas.fiveHr) * 100)
+      : 100;
+    const resets = fiveHrRemaining <= weeklyRemaining ? '5h' : '7d';
+    const reason = `${pctRemaining}% remaining, resets in ${resets === '5h' ? 5 : 168}h`;
+
+    const info = {
+      subIndex: i,
+      plan,
+      label: s.label ?? null,
+      fiveHrUsed: perSubFiveHr,
+      weeklyUsed: perSubWeekly,
+      fiveHrQuota: quotas.fiveHr,
+      weeklyQuota: quotas.weekly,
+      fiveHrRemaining,
+      weeklyRemaining,
+      score,
+      reason,
+    };
+
+    alternatives.push(info);
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = info;
+    }
+  });
+
+  // Log the autopilot decision
+  if (best) {
+    _logAutopilot({
+      provider,
+      tier,
+      subIndex: best.subIndex,
+      plan: best.plan,
+      label: best.label,
+      reason: best.reason,
+      alternatives: alternatives.map(a => ({
+        subIndex: a.subIndex,
+        plan: a.plan,
+        label: a.label,
+        score: Math.round(a.score),
+        fiveHrRemaining: a.fiveHrRemaining,
+        weeklyRemaining: a.weeklyRemaining,
+      })),
+    });
+  }
+
+  return best;
+}
+
 // ─── Internal: safety floor for critical-risk tasks ───────────────────────────
 
 /**
@@ -582,6 +812,9 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
   );
   const degradedDualBrain = !!(dual && detection.designImpact && !hasBothProviders);
 
+  // Budget autopilot: pick optimal sub when multiple subs exist for chosen provider
+  const optimalSub = getOptimalSub(provider, tier, profile);
+
   const decision = {
     provider,
     model,
@@ -589,6 +822,8 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
     tier,
     dualBrain: dual,
     ...(degradedDualBrain && { degradedDualBrain: true }),
+    ...(optimalSub && optimalSub.label != null && { subLabel: optimalSub.label }),
+    ...(optimalSub && { subIndex: optimalSub.subIndex }),
     modes,
     sandbox,
     explanation: '',

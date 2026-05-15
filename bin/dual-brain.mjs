@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // dual-brain — CLI entry point. Commands: init, go, status, remember, forget
 
-import { appendFileSync, existsSync, readFileSync, mkdirSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { appendFileSync, existsSync, readFileSync, mkdirSync, writeFileSync, statSync, readdirSync, unlinkSync, watch as fsWatch } from 'node:fs';
+import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawnSync as _spawnSyncTop } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -177,6 +177,8 @@ Commands:
   security "task"           Force Security specialist for the task
     --dry-run               (specialist commands) Show routing without executing
     --files a,b             (specialist commands) Provide file context
+  watch [dir]               Monitor file changes and suggest actions
+    --auto                  Auto-execute safe suggestions (tests, install)
   shell-hook                Output bash snippet to add dual-brain to your shell
                             Usage: dual-brain shell-hook >> ~/.bashrc
 
@@ -419,6 +421,7 @@ async function cmdGo(args) {
       nextAction:   null,
     }, cwd);
     if (result.status !== 'completed') process.exit(1);
+    await offerAutoCommit(cwd);
   }
 }
 
@@ -1000,6 +1003,61 @@ function loadTerminalState(cwd, terminalId) {
   } catch { return null; }
 }
 
+// ─── PR Detection ─────────────────────────────────────────────────────────────
+
+/**
+ * Detect open PRs using the gh CLI.
+ * Gracefully returns [] if gh is not installed, no remote, no auth, or no PRs.
+ *
+ * @param {string} cwd
+ * @returns {Promise<Array>}
+ */
+async function detectOpenPRs(cwd) {
+  try {
+    // 1. Check if gh CLI exists (1s timeout)
+    const ghCheck = _spawnSyncTop('which', ['gh'], {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 1000,
+    });
+    if (ghCheck.status !== 0) return [];
+
+    // 2. Check if repo has a GitHub remote
+    const remoteCheck = _spawnSyncTop('git', ['remote', 'get-url', 'origin'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 1000,
+    });
+    if (remoteCheck.status !== 0) return [];
+    const remoteUrl = (remoteCheck.stdout || '').trim();
+    if (!remoteUrl.includes('github.com')) return [];
+
+    // 3. Fetch open PRs (3s timeout)
+    const prResult = _spawnSyncTop('gh', [
+      'pr', 'list',
+      '--state', 'open',
+      '--json', 'number,title,reviewDecision,reviewRequests,additions,deletions,changedFiles,headRefName',
+      '--limit', '5',
+    ], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 3000,
+    });
+
+    if (prResult.status !== 0) return [];
+    const raw = (prResult.stdout || '').trim();
+    if (!raw) return [];
+
+    const prs = JSON.parse(raw);
+    if (!Array.isArray(prs)) return [];
+    return prs;
+  } catch {
+    return [];
+  }
+}
+
 // ─── Dashboard box helpers ────────────────────────────────────────────────────
 
 /**
@@ -1048,13 +1106,15 @@ function detectRepoState(cwd) {
 /**
  * Build action card rows for the dashboard based on repo state.
  * Returns an array of box row strings (may be empty).
+ * openPRs is optional — if provided, a PR card is included.
  */
-function buildActionRows(repoState, rowFn) {
+function buildActionRows(repoState, rowFn, openPRs = []) {
   if (!repoState.isGitRepo) return [];
 
   const YELLOW = '\x1b[33m';
   const RED    = '\x1b[31m';
   const GREEN  = '\x1b[32m';
+  const CYAN   = '\x1b[36m';
   const DIM    = '\x1b[2m';
   const RESET  = '\x1b[0m';
 
@@ -1070,6 +1130,15 @@ function buildActionRows(repoState, rowFn) {
 
   if (repoState.lastCommitAgeDays >= 3) {
     cards.push(`${YELLOW}⚡${RESET} ${repoState.lastCommitAgeDays} day${repoState.lastCommitAgeDays === 1 ? '' : 's'} since last commit`);
+  }
+
+  // PR card — show a summary of open PRs when gh is available
+  if (openPRs.length > 0) {
+    const prSummary = openPRs.slice(0, 2)
+      .map(pr => `#${pr.number} ${String(pr.title).slice(0, 22)}`)
+      .join(', ');
+    const trunc = openPRs.length > 2 ? ` +${openPRs.length - 2}` : '';
+    cards.push(`${CYAN}⇅${RESET} ${openPRs.length} open PR${openPRs.length === 1 ? '' : 's'}: ${prSummary}${trunc}`);
   }
 
   if (cards.length === 0) {
@@ -1172,15 +1241,107 @@ function detectInterruptedWork(sessions, cwd) {
   };
 }
 
+// ─── Budget sparkline helpers ─────────────────────────────────────────────────
+
+/** Token quotas per plan (5-hour window aggregate). Mirrors src/decide.mjs SUB_QUOTAS. */
+const _SPARKLINE_QUOTAS = {
+  claude: { '$20': 402_500, '$100': 1_638_000, '$200': 4_120_000 },
+  openai: { '$20': 400_000, '$100': 1_050_000, '$200': 1_900_000 },
+};
+
+const _PLAN_PRICE_MAP = {
+  pro: '$20', max5: '$100', max20: '$200',
+  plus: '$20', pro100: '$100', pro200: '$200',
+};
+
+/**
+ * Read 5-hour usage entries from .dualbrain/usage/ logs.
+ * @param {string} cwd
+ * @returns {Array<object>}
+ */
+function _readFiveHrUsage(cwd) {
+  const FIVE_HRS_MS = 5 * 60 * 60 * 1000;
+  const now    = Date.now();
+  const cutoff = now - FIVE_HRS_MS;
+  const usageDir = join(cwd, '.dualbrain', 'usage');
+  const entries = [];
+  for (let i = 0; i <= 1; i++) {
+    const date = new Date(now - i * 86_400_000).toISOString().slice(0, 10);
+    const file = join(usageDir, `usage-${date}.jsonl`);
+    if (!existsSync(file)) continue;
+    let raw;
+    try { raw = readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      const ts = Date.parse(rec.timestamp);
+      if (!isNaN(ts) && ts >= cutoff) entries.push(rec);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Build a 5-char sparkline bar: \u2593\u2593\u2593\u2591\u2591 where \u2593 = used quota.
+ * @param {number} used  tokens used
+ * @param {number} quota total token quota
+ * @returns {string}
+ */
+function _sparkBar(used, quota) {
+  if (!quota || quota <= 0) return '\u2591\u2591\u2591\u2591\u2591';
+  const filled = Math.min(5, Math.round((used / quota) * 5));
+  return '\u2593'.repeat(filled) + '\u2591'.repeat(5 - filled);
+}
+
+/**
+ * Return per-sub usage bar strings for a provider.
+ * @param {string} provKey  'claude' | 'openai'
+ * @param {object} profile
+ * @param {Array<object>} fiveHrEntries
+ * @returns {string}  e.g. "$100 \u2593\u2593\u2591\u2591\u2591  $100 \u2593\u2591\u2591\u2591\u2591"
+ */
+function _buildSubBars(provKey, profile, fiveHrEntries) {
+  const providerCfg = profile?.providers?.[provKey];
+  if (!providerCfg) return '';
+
+  const rawSubs = providerCfg.subs?.length
+    ? providerCfg.subs
+    : providerCfg.plan
+      ? [{ plan: providerCfg.plan }]
+      : [];
+  if (rawSubs.length === 0) return '';
+
+  let totalUsed = 0;
+  for (const e of fiveHrEntries) {
+    if (e.provider !== provKey) continue;
+    const inp = e.input_tokens ?? 0;
+    const out = e.output_tokens ?? 0;
+    totalUsed += inp + out > 0 ? inp + out : 8_000;
+  }
+  const perSub = rawSubs.length > 1 ? Math.round(totalUsed / rawSubs.length) : totalUsed;
+
+  return rawSubs.map(s => {
+    const planKey   = _PLAN_PRICE_MAP[s.plan] || s.plan || '$100';
+    const quota     = _SPARKLINE_QUOTAS[provKey]?.[planKey] ?? 1_000_000;
+    const sparkline = _sparkBar(perSub, quota);
+    return `${planKey} ${sparkline}`;
+  }).join('  ');
+}
+
 /**
  * Build a provider status string for the dashboard status line.
- * Returns a string like: "🟢 Claude $100×2 $20×1  🟢 OpenAI $100"
+ * Shows per-sub usage sparkline bars: "\u25cf Claude $100 \u2593\u2593\u2591\u2591\u2591  \u25cf OpenAI $100 \u2593\u2591\u2591\u2591\u2591"
  * Uses ANSI color codes for the dots (no emoji width issues).
  */
 function buildProviderStatusLine(profile, auth) {
-  const GREEN = '\x1b[32m●\x1b[0m';
-  const RED   = '\x1b[31m●\x1b[0m';
+  const GREEN = '\x1b[32m\u25cf\x1b[0m';
+  const RED   = '\x1b[31m\u25cf\x1b[0m';
   const now   = Date.now();
+  const cwd   = process.cwd();
+
+  let fiveHrEntries = [];
+  try { fiveHrEntries = _readFiveHrUsage(cwd); } catch {}
 
   function providerSegment(provKey, displayName) {
     const sub    = profile?.providers?.[provKey];
@@ -1190,16 +1351,11 @@ function buildProviderStatusLine(profile, auth) {
     const expired = sub?.expiresAt && Date.parse(sub.expiresAt) < now;
     if (expired)  return `${RED} ${displayName}: expired`;
 
-    const dot = GREEN;
-    // Multi-sub: show aggregated plan amounts
-    const subs = sub?.subs;
-    if (subs && subs.length > 0) {
-      const agg = aggregatePlans(subs);
-      return `${dot} ${displayName} ${agg}`;
-    }
-    // Single plan
-    const planPrice = PLAN_PRICES[sub?.plan] || sub?.plan || 'connected';
-    return `${dot} ${displayName} ${planPrice}`;
+    const dot  = GREEN;
+    const bars = _buildSubBars(provKey, profile, fiveHrEntries);
+    return bars
+      ? `${dot} ${displayName} ${bars}`
+      : `${dot} ${displayName}: connected`;
   }
 
   const parts = [];
@@ -1396,9 +1552,46 @@ async function mainScreen(rl, ask) {
     statusRows.push(row(`\x1b[2m📦 data-tools v${dtVersion}\x1b[0m`));
   }
 
-  // ── Action cards (git state) ──────────────────────────────────────────────
+  // ── Action cards (git state + open PRs) ──────────────────────────────────
   const repoState  = detectRepoState(cwd);
-  const actionRows = buildActionRows(repoState, row);
+  const openPRs    = await detectOpenPRs(cwd);
+  const actionRows = buildActionRows(repoState, row, openPRs);
+
+  // ── Related sessions hint (only when no continuation card is showing) ─────
+  if (!interrupted && recentSessions.length > 0) {
+    try {
+      const { findRelatedSessions } = await import('../src/session.mjs');
+      const mostRecent = recentSessions[0];
+      // Build a pseudo-prompt from the most recent session's name/objective
+      const recentPrompt = mostRecent.name || '';
+      // Load session index to get files for the most recent session
+      const indexPath = join(cwd, '.dualbrain', 'session-index.json');
+      let recentFiles = [];
+      try {
+        const idx = JSON.parse(readFileSync(indexPath, 'utf8'));
+        recentFiles = idx[mostRecent.id]?.files || [];
+      } catch {}
+      const related = findRelatedSessions(recentPrompt, recentFiles, cwd);
+      if (related.length > 0) {
+        const relAgeLabel = (isoDate) => {
+          if (!isoDate) return '';
+          const diff  = Date.now() - Date.parse(isoDate);
+          const days  = Math.floor(diff / 86400000);
+          const hours = Math.floor(diff / 3600000);
+          if (days >= 1) return `${days}d`;
+          return `${hours}h ago`;
+        };
+        const relatedParts = related.slice(0, 2).map(r => {
+          const age = relAgeLabel(r.date);
+          return age ? `${r.smartName} (${age})` : r.smartName;
+        });
+        const DIM   = '\x1b[2m';
+        const RESET = '\x1b[0m';
+        actionRows.push(row(`${DIM}📎 Related: ${relatedParts.join(', ')}${RESET}`));
+      }
+    } catch { /* non-fatal */ }
+  }
+  // ── End related sessions hint ─────────────────────────────────────────────
 
   // ── Sessions section ──────────────────────────────────────────────────────
   const sessionRows = [];
@@ -1452,7 +1645,8 @@ async function mainScreen(rl, ask) {
   }
 
   // ── Actions bar ───────────────────────────────────────────────────────────
-  const actionsContent = '↵ Resume  n New  / Search  i Import  s Settings  q Quit';
+  const actionsBase    = '↵ Resume  n New  / Search  i Import  s Settings  q Quit';
+  const actionsContent = openPRs.length > 0 ? `${actionsBase}  p PRs` : actionsBase;
   const actionsRow     = row(actionsContent);
 
   // ── Print the full box ────────────────────────────────────────────────────
@@ -1560,7 +1754,9 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        if (lower === 'n' || lower === 's' || lower === 'q' || lower === '/' || lower === 'i') {
+        const singleKeySet = new Set(['n', 's', 'q', '/', 'i']);
+        if (lower === 'p' && openPRs.length > 0) singleKeySet.add('p');
+        if (singleKeySet.has(lower)) {
           cleanup();
           process.stdout.write('\n');
           resolve(lower);
@@ -1666,6 +1862,7 @@ async function mainScreen(rl, ask) {
 
   if (choice === 's') { return { next: 'settings' }; }
   if (choice === 'i') { return { next: 'import-picker' }; }
+  if (choice === 'p' && openPRs.length > 0) { return { next: 'pr-triage', openPRs }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
   return { next: 'main' };
@@ -1932,6 +2129,234 @@ async function importPickerScreen() {
   return { next: 'main' };
 }
 
+// ─── Screen: prTriageScreen ───────────────────────────────────────────────────
+
+/**
+ * PR Triage screen. Lists open PRs, lets the user select one, checkout + fetch
+ * comments, then dispatch fixes through the dual-brain pipeline.
+ *
+ * ctx.openPRs is the pre-fetched array from detectOpenPRs().
+ */
+async function prTriageScreen(rl, ask, ctx = {}) {
+  const cwd    = process.cwd();
+  const prs    = ctx.openPRs || [];
+
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 60);
+  const W     = boxW - 4;
+
+  const top = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot = `└${'─'.repeat(boxW - 2)}┘`;
+  const row = (content) => makeBoxRow(content, W);
+
+  if (prs.length === 0) {
+    process.stdout.write('\n');
+    process.stdout.write(top + '\n');
+    process.stdout.write(row('PR Triage') + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row('No open PRs found.') + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(row('[q] Back') + '\n');
+    process.stdout.write(bot + '\n\n');
+    await ask('  Press Enter to go back...');
+    return { next: 'main' };
+  }
+
+  // Helper: get review decision label
+  function reviewLabel(rd) {
+    if (!rd) return 'pending review';
+    const map = {
+      APPROVED: 'approved',
+      CHANGES_REQUESTED: 'changes_requested',
+      REVIEW_REQUIRED: 'review_required',
+    };
+    return map[rd] || rd.toLowerCase();
+  }
+
+  // ── Render PR list ─────────────────────────────────────────────────────────
+  process.stdout.write('\n');
+  process.stdout.write(top + '\n');
+  process.stdout.write(row('PR Triage') + '\n');
+  process.stdout.write(sep + '\n');
+
+  prs.forEach((pr, i) => {
+    const title    = String(pr.title || '').slice(0, W - 6);
+    const decision = reviewLabel(pr.reviewDecision);
+    const diff     = `+${pr.additions || 0} -${pr.deletions || 0}`;
+    const files    = pr.changedFiles ? `${pr.changedFiles} file${pr.changedFiles === 1 ? '' : 's'}` : '';
+    const numStr   = `#${pr.number}`;
+
+    process.stdout.write(row(`[${i + 1}] ${numStr} ${title}`) + '\n');
+    process.stdout.write(row(`    ${decision} · ${diff}${files ? ' · ' + files : ''}`) + '\n');
+    if (pr.headRefName) {
+      process.stdout.write(row(`    Branch: ${pr.headRefName}`) + '\n');
+    }
+    if (i < prs.length - 1) {
+      process.stdout.write(row('') + '\n');
+    }
+  });
+
+  process.stdout.write(sep + '\n');
+  process.stdout.write(row('[1-9] Select PR  [q] Back') + '\n');
+  process.stdout.write(bot + '\n\n');
+
+  const pick = (await ask('  Choice: ')).trim().toLowerCase();
+
+  if (pick === 'q' || pick === 'b' || pick === '') return { next: 'main' };
+
+  const idx = parseInt(pick, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= prs.length) return { next: 'pr-triage', openPRs: prs };
+
+  const selectedPR = prs[idx];
+
+  // ── PR detail: checkout + fetch comments ──────────────────────────────────
+  process.stdout.write(`\n  Checking out PR #${selectedPR.number}...\n`);
+
+  const checkoutResult = _spawnSyncTop('gh', ['pr', 'checkout', String(selectedPR.number)], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 15000,
+  });
+
+  if (checkoutResult.status !== 0) {
+    process.stdout.write(`  Could not checkout PR: ${(checkoutResult.stderr || '').slice(0, 100)}\n`);
+    await ask('  Press Enter to continue...');
+    return { next: 'pr-triage', openPRs: prs };
+  }
+
+  process.stdout.write(`  Fetching comments...\n`);
+
+  let comments = [];
+  try {
+    const commentsResult = _spawnSyncTop('gh', [
+      'pr', 'view', String(selectedPR.number),
+      '--comments',
+      '--json', 'comments',
+    ], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    });
+
+    if (commentsResult.status === 0 && commentsResult.stdout) {
+      const parsed = JSON.parse(commentsResult.stdout.trim());
+      comments = parsed?.comments || [];
+    }
+  } catch {}
+
+  // ── Show PR detail: comments grouped by file ──────────────────────────────
+  process.stdout.write('\n');
+  process.stdout.write(top + '\n');
+  process.stdout.write(row(`#${selectedPR.number} ${String(selectedPR.title).slice(0, W - 6)}`) + '\n');
+  process.stdout.write(sep + '\n');
+
+  if (comments.length === 0) {
+    process.stdout.write(row('No review comments.') + '\n');
+  } else {
+    // Group comments by their file path (body comments have no path)
+    const grouped = {};
+    for (const c of comments) {
+      const file = c.path || '(general)';
+      if (!grouped[file]) grouped[file] = [];
+      grouped[file].push(c);
+    }
+    for (const [file, fileCmts] of Object.entries(grouped)) {
+      const fileLabel = file.length > W - 4 ? '...' + file.slice(-(W - 7)) : file;
+      process.stdout.write(row(`  ${fileLabel}`) + '\n');
+      for (const c of fileCmts.slice(0, 3)) {
+        const body = String(c.body || '').replace(/\s+/g, ' ').slice(0, W - 6);
+        process.stdout.write(row(`    → ${body}`) + '\n');
+      }
+      if (fileCmts.length > 3) {
+        process.stdout.write(row(`    ... +${fileCmts.length - 3} more`) + '\n');
+      }
+    }
+  }
+
+  process.stdout.write(sep + '\n');
+  process.stdout.write(row('[f] Dispatch fixes  [v] View full diff  [b] Back') + '\n');
+  process.stdout.write(bot + '\n\n');
+
+  const action = (await ask('  Action: ')).trim().toLowerCase();
+
+  if (action === 'v') {
+    // Show full diff via gh pr diff
+    process.stdout.write('\n');
+    const diffResult = _spawnSyncTop('gh', ['pr', 'diff', String(selectedPR.number)], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10000,
+    });
+    const diffOut = (diffResult.stdout || '').slice(0, 3000);
+    process.stdout.write(diffOut || '  (no diff output)\n');
+    process.stdout.write('\n');
+    await ask('  Press Enter to continue...');
+    return { next: 'pr-triage', openPRs: prs };
+  }
+
+  if (action === 'f') {
+    // Dispatch each comment as a fix task through detect→decide→dispatch
+    if (comments.length === 0) {
+      process.stdout.write('  No comments to fix.\n\n');
+      await ask('  Press Enter to continue...');
+      return { next: 'pr-triage', openPRs: prs };
+    }
+
+    process.stdout.write(`\n  Dispatching ${comments.length} comment fix${comments.length === 1 ? '' : 's'} through dual-brain...\n\n`);
+
+    // Collect the PR files for context
+    const prFiles = [];
+    try {
+      const filesResult = _spawnSyncTop('gh', [
+        'pr', 'view', String(selectedPR.number),
+        '--json', 'files',
+      ], {
+        cwd,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      });
+      if (filesResult.status === 0) {
+        const pf = JSON.parse(filesResult.stdout || '{}');
+        (pf.files || []).forEach(f => prFiles.push(f.path));
+      }
+    } catch {}
+
+    const profile = loadProfile(cwd);
+
+    for (let ci = 0; ci < comments.length; ci++) {
+      const c = comments[ci];
+      const taskPrompt = c.path
+        ? `Fix review comment in ${c.path}: ${c.body}`
+        : `Fix PR review comment: ${c.body}`;
+
+      process.stdout.write(`  [${ci + 1}/${comments.length}] ${taskPrompt.slice(0, 60)}...\n`);
+
+      try {
+        const detection = detectTask({ prompt: taskPrompt, files: prFiles });
+        const decision  = decideRoute({ profile, detection, cwd });
+        const result    = await dispatch({ decision, prompt: taskPrompt, files: prFiles, cwd });
+        const status    = result.status === 'completed' ? '✓' : '✗';
+        process.stdout.write(`  ${status} ${result.status} (${(result.durationMs / 1000).toFixed(1)}s)\n`);
+        if (result.summary) process.stdout.write(`    ${result.summary.slice(0, 80)}\n`);
+      } catch (e) {
+        process.stdout.write(`  ✗ Error: ${e.message.slice(0, 80)}\n`);
+      }
+    }
+
+    process.stdout.write('\n  All fixes dispatched.\n\n');
+    await ask('  Press Enter to continue...');
+    return { next: 'pr-triage', openPRs: prs };
+  }
+
+  // 'b' or anything else → back to PR list
+  return { next: 'pr-triage', openPRs: prs };
+}
+
 // ─── Screen: settingsScreen ───────────────────────────────────────────────────
 
 async function settingsScreen(rl, ask) {
@@ -1947,6 +2372,9 @@ async function settingsScreen(rl, ask) {
   const bot = `└${'─'.repeat(boxW - 2)}┘`;
   const row = (content) => makeBoxRow(content, W);
 
+  // Detect if gh is available + has PRs for the PR triage option
+  const settingsPRs = await detectOpenPRs(cwd);
+
   const lines = [
     top,
     row('Settings'),
@@ -1957,6 +2385,7 @@ async function settingsScreen(rl, ask) {
     row('[d] Switch to data-tools'),
     row('[?] Help & shortcuts'),
     row('[x] Diagnostics'),
+    ...(settingsPRs.length > 0 ? [row(`[p] PR triage (${settingsPRs.length} open)`)] : []),
     row(''),
     row('[Esc/b] Back to dashboard'),
     bot,
@@ -1972,6 +2401,10 @@ async function settingsScreen(rl, ask) {
 
   if (choice === 'i') {
     return { next: 'import-picker' };
+  }
+
+  if (choice === 'p' && settingsPRs.length > 0) {
+    return { next: 'pr-triage', openPRs: settingsPRs };
   }
 
   if (choice === 'd') {
@@ -3248,6 +3681,257 @@ async function sessionManageScreen(rl, ask, ctx = {}) {
   return { next: 'session-manage', session: sess };
 }
 
+
+// ─── Auto-commit drafting ─────────────────────────────────────────────────────
+
+/**
+ * Detect uncommitted changes in cwd.
+ * Returns { hasChanges, files, statOutput, diffSnippet } or null.
+ */
+function detectUncommittedChanges(cwd) {
+  try {
+    execSync('git rev-parse --git-dir', { cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe' });
+  } catch { return null; }
+
+  let statOutput = '';
+  try {
+    statOutput = execSync('git diff --stat HEAD', { cwd, encoding: 'utf8', timeout: 3000, stdio: 'pipe' }).trim();
+  } catch { return null; }
+
+  let statusOutput = '';
+  try {
+    statusOutput = execSync('git status --porcelain', { cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe' }).trim();
+  } catch {}
+
+  if (!statOutput && !statusOutput) return null;
+
+  const statFiles = statOutput
+    .split('\n')
+    .filter(l => l.includes('|'))
+    .map(l => l.split('|')[0].trim())
+    .filter(Boolean);
+
+  const statusFiles = statusOutput
+    .split('\n')
+    .filter(Boolean)
+    .map(l => l.slice(3).trim())
+    .filter(f => f && !statFiles.includes(f));
+
+  const files = [...new Set([...statFiles, ...statusFiles])];
+
+  let diffSnippet = '';
+  try {
+    const full = execSync('git diff HEAD', { cwd, encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
+    diffSnippet = full.slice(0, 2000);
+  } catch {}
+
+  return { hasChanges: true, files, statOutput, diffSnippet };
+}
+
+/**
+ * Build a conventional commit message from file list + diff snippet.
+ * Deterministic — no AI calls.
+ */
+function generateCommitMessage(files, diffSnippet) {
+  if (!files || files.length === 0) return 'chore: update files';
+
+  const testFiles   = files.filter(f =>
+    /\.(test|spec)\.[jt]sx?$/.test(f) || /\/(test|tests|__tests__)\//i.test(f)
+  );
+  const docFiles    = files.filter(f => /\.(md|txt|rst|adoc)$/i.test(f) || /docs?\//i.test(f));
+  const configFiles = files.filter(f =>
+    /\.(json|yaml|yml|toml|ini)$/i.test(f) ||
+    /^\.?(eslint|prettier|babel|jest|tsconfig|package)/i.test(f.replace(/.*\//, ''))
+  );
+  const srcFiles    = files.filter(f =>
+    !testFiles.includes(f) && !docFiles.includes(f) && !configFiles.includes(f)
+  );
+
+  let type = 'feat';
+  if (diffSnippet) {
+    const lower = diffSnippet.toLowerCase();
+    if (['fix', 'bug', 'error', 'issue', 'resolve', 'patch', 'correct', 'repair'].some(w => lower.includes(w))) {
+      type = 'fix';
+    } else if (['refactor', 'cleanup', 'simplify', 'reorganize'].some(w => lower.includes(w))) {
+      type = 'refactor';
+    }
+  }
+
+  const dominantFile = files[0].replace(/.*\//, '');
+
+  if (testFiles.length === files.length) {
+    const mod = testFiles[0].replace(/\.(test|spec)\.[jt]sx?$/, '').replace(/.*\//, '');
+    return `test: add/fix tests for ${mod}`;
+  }
+  if (docFiles.length === files.length) {
+    return `docs: update ${docFiles[0].replace(/.*\//, '')}`;
+  }
+  if (configFiles.length === files.length) {
+    return `chore: update ${configFiles[0].replace(/.*\//, '')}`;
+  }
+  if (srcFiles.length > 0 && testFiles.length > 0) {
+    const dom = srcFiles[0].replace(/.*\//, '').replace(/\.[jt]sx?$/, '');
+    return `${type}: ${dom} with tests`;
+  }
+  if (files.length === 1) {
+    return `${type}: update ${dominantFile.replace(/\.[jt]sx?$/, '')}`;
+  }
+
+  const dirs = files.map(f => (f.includes('/') ? f.split('/').slice(-2, -1)[0] : ''));
+  const commonDir = dirs[0] && dirs.every(d => d === dirs[0]) ? dirs[0] : null;
+  if (commonDir) return `${type}: update ${commonDir}`;
+
+  return `${type}: update ${dominantFile.replace(/\.[jt]sx?$/, '')}`;
+}
+
+/**
+ * Show a commit card after task completion and handle user action.
+ * Enter  -> git add -A && git commit -m "message"
+ * e      -> prompt for custom message, then commit
+ * d      -> show full diff, then return to card
+ * s      -> skip
+ *
+ * Only shown on TTY. Never auto-commits — the card is the offer.
+ * Returns true if a commit was made.
+ */
+async function offerAutoCommit(cwd) {
+  if (!process.stdout.isTTY) return false;
+
+  try {
+    const claude = parseInt(execSync('pgrep -x claude 2>/dev/null | wc -l', { encoding: 'utf8' }).trim(), 10) || 0;
+    const codex  = parseInt(execSync('pgrep -x codex 2>/dev/null | wc -l',  { encoding: 'utf8' }).trim(), 10) || 0;
+    if (claude > 0 || codex > 0) return false;
+  } catch {}
+
+  try {
+    const sessionPath = join(cwd, '.dualbrain', 'session.json');
+    if (existsSync(sessionPath)) {
+      const sess = JSON.parse(readFileSync(sessionPath, 'utf8'));
+      if (sess?.lastResult?.status === 'failure') return false;
+    }
+  } catch {}
+
+  const changes = detectUncommittedChanges(cwd);
+  if (!changes) return false;
+
+  let finalMsg = generateCommitMessage(changes.files, changes.diffSnippet);
+
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 54);
+  const W     = boxW - 4;
+
+  const top = `\u250c${'\u2500'.repeat(boxW - 2)}\u2510`;
+  const sep = `\u251c${'\u2500'.repeat(boxW - 2)}\u2524`;
+  const bot = `\u2514${'\u2500'.repeat(boxW - 2)}\u2518`;
+
+  const padLine = (s) => {
+    const plain = s.replace(/\x1b\[[0-9;]*m/g, '');
+    return `\u2502 ${s}${ ' '.repeat(Math.max(0, W - plain.length))} \u2502`;
+  };
+
+  const filesLabel = changes.files.length <= 3
+    ? changes.files.join(', ')
+    : `${changes.files.slice(0, 3).join(', ')} +${changes.files.length - 3} more`;
+  const fileCountLabel = `${changes.files.length} file${changes.files.length === 1 ? '' : 's'} changed: ${filesLabel}`;
+  const fileLineTrunc  = fileCountLabel.length > W ? fileCountLabel.slice(0, W - 3) + '...' : fileCountLabel;
+
+  const actLine1 = '[Enter] Commit  [e] Edit message  [d] Full diff';
+  const actLine2 = '[s] Skip';
+
+  const printCard = (msg) => {
+    const msgLine = msg.length > W ? msg.slice(0, W - 3) + '...' : msg;
+    process.stdout.write(top + '\n');
+    process.stdout.write(padLine('\x1b[33m\u{1F4DD} Ready to commit?\x1b[0m') + '\n');
+    process.stdout.write(sep + '\n');
+    process.stdout.write(padLine(msgLine) + '\n');
+    process.stdout.write(padLine('') + '\n');
+    process.stdout.write(padLine(fileLineTrunc) + '\n');
+    process.stdout.write(padLine('') + '\n');
+    process.stdout.write(padLine(actLine1) + '\n');
+    process.stdout.write(padLine(actLine2) + '\n');
+    process.stdout.write(bot + '\n');
+  };
+
+  const readlinemod = await import('node:readline');
+  readlinemod.emitKeypressEvents(process.stdin);
+
+  const waitKey = () => new Promise((resolve) => {
+    const wasRaw = process.stdin.isRaw;
+    const canRaw = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+    if (canRaw) process.stdin.setRawMode(true);
+
+    const cleanup = () => {
+      process.stdin.removeListener('keypress', onKey);
+      if (canRaw) { try { process.stdin.setRawMode(wasRaw || false); } catch {} }
+    };
+
+    const onKey = (str, key) => {
+      if (!key) return;
+      const name = key.name || '';
+      const seq  = key.sequence || str || '';
+
+      if (key.ctrl && (name === 'c' || name === 'd')) {
+        cleanup(); process.stdout.write('\n'); resolve('s'); return;
+      }
+      if (name === 'return' || name === 'enter' || seq === '\r' || seq === '\n') {
+        cleanup(); process.stdout.write('\n'); resolve('commit'); return;
+      }
+      if (!str || str.length === 0) return;
+      const lower = str.toLowerCase();
+      if (lower === 'e' || lower === 'd' || lower === 's') {
+        cleanup(); process.stdout.write('\n'); resolve(lower); return;
+      }
+    };
+
+    process.stdin.on('keypress', onKey);
+  });
+
+  process.stdout.write('\n');
+  printCard(finalMsg);
+
+  let committed = false;
+  let done = false;
+
+  while (!done) {
+    const choice = await waitKey();
+
+    if (choice === 'commit') {
+      try {
+        execSync('git add -A', { cwd, stdio: 'pipe' });
+        execSync(`git commit -m ${JSON.stringify(finalMsg)}`, { cwd, stdio: 'pipe' });
+        process.stdout.write(`\n  \x1b[32m\u2713 Committed:\x1b[0m ${finalMsg}\n\n`);
+        committed = true;
+      } catch (e) {
+        process.stderr.write(`  Commit failed: ${e.message}\n`);
+      }
+      done = true;
+
+    } else if (choice === 'e') {
+      const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+      const edited = await new Promise(res => rl2.question('\n  Commit message: ', res));
+      rl2.close();
+      if (edited.trim()) finalMsg = edited.trim();
+      process.stdout.write('\n');
+      printCard(finalMsg);
+
+    } else if (choice === 'd') {
+      process.stdout.write('\n');
+      try {
+        const fullDiff = execSync('git diff HEAD', { cwd, encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
+        process.stdout.write(fullDiff || '(no diff output)\n');
+      } catch { process.stdout.write('(could not read diff)\n'); }
+      process.stdout.write('\n');
+      printCard(finalMsg);
+
+    } else {
+      process.stdout.write('  Skipped.\n\n');
+      done = true;
+    }
+  }
+
+  return committed;
+}
+
 // ─── Screen state machine ─────────────────────────────────────────────────────
 
 const SCREENS = {
@@ -3256,6 +3940,7 @@ const SCREENS = {
   'new-session':    newSessionScreen,
   settings:         settingsScreen,
   'import-picker':  importPickerScreen,
+  'pr-triage':      prTriageScreen,
   subscriptions:    subscriptionsScreen,
   dashboard:        dashboardScreen,
   auth:             authScreen,
@@ -3294,6 +3979,7 @@ async function runScreens(startScreen = 'dashboard') {
       if (freshSessions.length > 0) {
         saveTerminalState(cwd, getTerminalId(), freshSessions[0].id, launchTool);
       }
+      await offerAutoCommit(cwd);
       current = 'main';
       ctx = {};
       continue;
@@ -3304,9 +3990,10 @@ async function runScreens(startScreen = 'dashboard') {
     try {
       const result = await screen(rl, ask, ctx);
       current = result?.next || 'exit';
-      // Pass through context (e.g. selected session, typed prompt) to next screen
-      ctx = result?.session ? { session: result.session }
-          : result?.prompt  ? { prompt: result.prompt }
+      // Pass through context (e.g. selected session, typed prompt, openPRs) to next screen
+      ctx = result?.session   ? { session: result.session }
+          : result?.prompt    ? { prompt: result.prompt }
+          : result?.openPRs   ? { openPRs: result.openPRs }
           : {};
     } catch (e) {
       console.error(`Error: ${e.message}`);
@@ -3316,6 +4003,309 @@ async function runScreens(startScreen = 'dashboard') {
   }
   rl.close();
 }
+
+
+// ─── Watch mode ──────────────────────────────────────────────────────────────
+
+/**
+ * Suggest an action for a batch of changed files.
+ * Returns { label, cmd, safe } or null (no suggestion needed).
+ * Deterministic — no AI calls.
+ */
+function suggestAction(changedFiles, cwd) {
+  // .env changes — highest priority warning
+  const envChanged = changedFiles.some(f => {
+    const b = basename(f);
+    return b === '.env' || b.startsWith('.env.');
+  });
+  if (envChanged) {
+    return { label: '⚠  Environment changed — restart services', cmd: null, safe: false };
+  }
+
+  // package.json → npm install
+  if (changedFiles.some(f => basename(f) === 'package.json')) {
+    return { label: 'npm install (dependencies may have changed)', cmd: 'npm install', safe: true };
+  }
+
+  // Config files → restart dev server
+  const configChanged = changedFiles.some(f => {
+    const b = basename(f);
+    return /\.config\.(m?js|ts|cjs|json)$/.test(b)
+      || b === 'tsconfig.json'
+      || b === '.eslintrc'
+      || b === '.babelrc'
+      || b === 'vite.config.js'
+      || b === 'webpack.config.js';
+  });
+  if (configChanged) {
+    return { label: 'Restart dev server (config changed)', cmd: null, safe: false };
+  }
+
+  // Test/spec files themselves changed → run them
+  const testChanged = changedFiles.filter(f => /\.(test|spec)\.(m?js|ts|cjs)$/.test(f));
+  if (testChanged.length > 0) {
+    let testCmd = 'npm test';
+    try {
+      const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
+      if (!pkg.scripts?.test) testCmd = null;
+    } catch {}
+    const fileList = testChanged.map(f => basename(f)).join(', ');
+    return testCmd ? { label: `Run tests: ${fileList}`, cmd: testCmd, safe: true } : null;
+  }
+
+  // Markdown → no suggestion
+  if (changedFiles.every(f => extname(f) === '.md')) {
+    return null;
+  }
+
+  // Source file changed → look for related test file
+  const sourceChanged = changedFiles.filter(f =>
+    /\.(m?js|ts|cjs|py|rb|go|rs)$/.test(f) && !/\.(test|spec)\./.test(f)
+  );
+  if (sourceChanged.length > 0) {
+    const testDirs = ['test', 'tests', '__tests__', 'spec', 'src'];
+    for (const srcFile of sourceChanged) {
+      const srcBase   = basename(srcFile);
+      const srcExt    = extname(srcFile);
+      const srcStem   = srcBase.slice(0, -srcExt.length);
+      const testExts  = [...new Set([srcExt, '.js', '.ts', '.mjs'])];
+      const srcDirAbs = join(cwd, dirname(srcFile));
+
+      for (const dir of testDirs) {
+        for (const ext of testExts) {
+          const candidates = [
+            join(cwd, dir, `${srcStem}.test${ext}`),
+            join(cwd, dir, `${srcStem}.spec${ext}`),
+            join(srcDirAbs, `${srcStem}.test${ext}`),
+            join(srcDirAbs, `${srcStem}.spec${ext}`),
+          ];
+          for (const c of candidates) {
+            if (existsSync(c)) {
+              const rel = c.replace(cwd + '/', '');
+              let testCmd = 'npm test';
+              try {
+                const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
+                const scripts = pkg.scripts?.test ?? '';
+                const dev = { ...pkg.devDependencies, ...pkg.dependencies };
+                if (scripts.includes('jest') || dev.jest)         testCmd = `npx jest ${rel}`;
+                else if (scripts.includes('vitest') || dev.vitest) testCmd = `npx vitest run ${rel}`;
+                else if (scripts.includes('mocha') || dev.mocha)   testCmd = `npx mocha ${rel}`;
+              } catch {}
+              return { label: `Run related tests: ${rel}`, cmd: testCmd, safe: true };
+            }
+          }
+        }
+      }
+    }
+
+    // No test file found — suggest generic test run
+    let testCmd = 'npm test';
+    try {
+      const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
+      if (!pkg.scripts?.test) testCmd = null;
+    } catch { testCmd = null; }
+
+    if (testCmd) {
+      const fileList = sourceChanged.map(f => basename(f)).join(', ');
+      return { label: `Run tests (${fileList} changed)`, cmd: testCmd, safe: true };
+    }
+  }
+
+  return null;
+}
+
+const W_RESET  = '\x1b[0m';
+const W_BOLD   = '\x1b[1m';
+const W_DIM    = '\x1b[2m';
+const W_YELLOW = '\x1b[33m';
+const W_CYAN   = '\x1b[36m';
+const W_GREEN  = '\x1b[32m';
+const W_RED    = '\x1b[31m';
+
+function watchRedraw(header, logLines, prompt) {
+  process.stdout.write('\x1b[2J\x1b[H');
+  process.stdout.write(header + '\n\n');
+  const visible = logLines.slice(-8);
+  for (let i = 0; i < visible.length; i++) {
+    const dim = i < visible.length - 4;
+    if (dim) process.stdout.write(W_DIM);
+    process.stdout.write(visible[i] + '\n');
+    if (dim) process.stdout.write(W_RESET);
+  }
+  if (prompt) process.stdout.write('\n' + prompt);
+}
+
+async function cmdWatch(rawArgs) {
+  const cwd    = process.cwd();
+  const auto   = rawArgs.includes('--auto');
+  const dirArg = rawArgs.find(a => !a.startsWith('-')) ?? '.';
+  const watchDir = join(cwd, dirArg);
+
+  if (!existsSync(watchDir)) {
+    process.stderr.write(`Error: Directory not found: ${watchDir}\n`);
+    process.exit(1);
+  }
+
+  const relDir  = watchDir === cwd ? '.' : watchDir.replace(cwd + '/', '');
+  const modeStr = auto ? `${W_YELLOW}--auto${W_RESET}` : 'interactive';
+  const header  = `${W_BOLD}${W_CYAN}Watching${W_RESET} ${relDir}  ${W_DIM}(${modeStr}${W_DIM}, q or Ctrl+C to exit)${W_RESET}`;
+
+  const logLines = [];
+  function addLog(line) {
+    const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    logLines.push(`${W_DIM}${ts}${W_RESET}  ${line}`);
+  }
+
+  addLog(`${W_DIM}Ready — waiting for file changes...${W_RESET}`);
+  watchRedraw(header, logLines);
+
+  let resolvePending = null;
+  let watcherRef     = null;
+
+  function cleanup() {
+    try { if (watcherRef) watcherRef.close(); } catch {}
+    try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch {}
+    try { watchRl.close(); } catch {}
+    process.stdout.write('\n');
+    process.exit(0);
+  }
+
+  const watchRl = createInterface({ input: process.stdin, output: process.stdout });
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+  }
+
+  process.stdin.on('data', (key) => {
+    if (key === 'q' || key === '') { cleanup(); return; }
+    if (resolvePending) { resolvePending(key); resolvePending = null; }
+  });
+
+  process.on('SIGINT',  cleanup);
+  process.on('SIGTERM', cleanup);
+
+  function waitForKey() {
+    return new Promise(resolve => { resolvePending = resolve; });
+  }
+
+  let processing = false;
+  async function processBatch(files) {
+    if (processing) return;
+    processing = true;
+    try {
+      const fileList = [...files];
+      files.clear();
+      const relFiles = fileList.map(f =>
+        f.replace(cwd + '/', '').replace(cwd + '\\', '')
+      );
+
+      for (const f of relFiles) addLog(`  ${W_CYAN}${f}${W_RESET} saved`);
+
+      const suggestion = suggestAction(relFiles, cwd);
+
+      if (!suggestion) {
+        addLog(`  ${W_DIM}(no action suggested)${W_RESET}`);
+        watchRedraw(header, logLines);
+        return;
+      }
+
+      addLog(`  ${W_YELLOW}Suggestion:${W_RESET} ${suggestion.label}`);
+
+      if (auto) {
+        if (!suggestion.safe || !suggestion.cmd) {
+          addLog(`  ${W_DIM}[auto] Skipping — not auto-safe${W_RESET}`);
+          watchRedraw(header, logLines);
+          return;
+        }
+        addLog(`  ${W_GREEN}[auto] Running:${W_RESET} ${suggestion.cmd}`);
+        watchRedraw(header, logLines);
+        try {
+          const out = execSync(suggestion.cmd, { cwd, encoding: 'utf8', stdio: 'pipe', timeout: 60000 });
+          for (const l of out.trim().split('\n').slice(-5)) addLog(`    ${W_DIM}${l}${W_RESET}`);
+          addLog(`  ${W_GREEN}done${W_RESET}`);
+        } catch (e) {
+          const msg = (e.stderr || e.stdout || e.message || '').trim();
+          for (const l of msg.split('\n').slice(-3)) addLog(`    ${W_RED}${l}${W_RESET}`);
+          addLog(`  ${W_RED}command failed${W_RESET}`);
+        }
+        watchRedraw(header, logLines);
+        return;
+      }
+
+      // Interactive prompt
+      const promptLine = suggestion.cmd
+        ? `  ${W_BOLD}[Enter]${W_RESET} Run  ${W_BOLD}[s]${W_RESET} Skip  ${W_BOLD}[q]${W_RESET} Quit\n  > `
+        : `  ${W_BOLD}[s]${W_RESET} Dismiss  ${W_BOLD}[q]${W_RESET} Quit\n  > `;
+      watchRedraw(header, logLines, promptLine);
+
+      const key = await waitForKey();
+
+      if (key === 'q' || key === '') { cleanup(); return; }
+
+      if ((key === '\r' || key === '\n' || key === ' ') && suggestion.cmd) {
+        addLog(`  ${W_GREEN}Running:${W_RESET} ${suggestion.cmd}`);
+        watchRedraw(header, logLines);
+        try {
+          const out = execSync(suggestion.cmd, { cwd, encoding: 'utf8', stdio: 'pipe', timeout: 60000 });
+          for (const l of out.trim().split('\n').slice(-8)) addLog(`    ${W_DIM}${l}${W_RESET}`);
+          addLog(`  ${W_GREEN}done${W_RESET}`);
+        } catch (e) {
+          const msg = (e.stderr || e.stdout || e.message || '').trim();
+          for (const l of msg.split('\n').slice(-5)) addLog(`    ${W_RED}${l}${W_RESET}`);
+          addLog(`  ${W_RED}command failed${W_RESET}`);
+        }
+      } else {
+        addLog(`  ${W_DIM}skipped${W_RESET}`);
+      }
+      watchRedraw(header, logLines);
+    } finally {
+      processing = false;
+    }
+  }
+
+  let debounceTimer = null;
+  const pendingFiles = new Set();
+
+  try {
+    watcherRef = fsWatch(watchDir, { recursive: true }, (_eventType, filename) => {
+      if (!filename) return;
+      if (
+        filename.includes('node_modules') ||
+        filename.includes('.git')         ||
+        filename.includes('.dualbrain')   ||
+        /package-lock\.json$/.test(filename) ||
+        /yarn\.lock$/.test(filename)         ||
+        /pnpm-lock\.yaml$/.test(filename)
+      ) return;
+
+      pendingFiles.add(join(watchDir, filename));
+
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        processBatch(pendingFiles).catch(e => {
+          addLog(`  ${W_RED}Watch error: ${e.message}${W_RESET}`);
+          watchRedraw(header, logLines);
+        });
+      }, 2000);
+    });
+  } catch (e) {
+    if (e.code === 'ENOSPC') {
+      process.stderr.write(
+        '\nError: Too many file watchers (ENOSPC).\n' +
+        'Increase the limit:\n' +
+        '  echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p\n'
+      );
+      process.exit(1);
+    }
+    throw e;
+  }
+
+  // Keep alive — stdin events drive everything, cleanup() calls process.exit
+  await new Promise(() => {});
+}
+
 
 // ─── Specialist commands ──────────────────────────────────────────────────────
 
@@ -3601,6 +4591,8 @@ async function main() {
     process.exit(0);
   }
 
+  if (cmd === 'watch') { await cmdWatch(args.slice(1)); return; }
+
   if (cmd === 'shell-hook') {
     // Output a bash snippet users can add to their .bashrc or source directly.
     const hook = `
@@ -3621,7 +4613,7 @@ fi
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
     'init', 'install', 'auth', 'go', 'status', 'hot', 'cool',
-    'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook',
+    'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),
   ]);

@@ -1208,6 +1208,112 @@ export function searchSessions(query, cwd = process.cwd()) {
 }
 
 /**
+ * Find sessions related to a new task prompt and file list.
+ * Uses the session index (topics + files) — does not parse full JSONL files.
+ *
+ * Scoring:
+ *   +3 for each file in common between the new task and a past session
+ *   +2 for each topic keyword in common
+ *   +1 for matching intent words (fix, refactor, test, etc.)
+ *
+ * Returns top 3 matches with score > 3, sorted by score desc.
+ * Excludes sessions from the last hour (likely the current session).
+ *
+ * @param {string}   prompt  New task prompt
+ * @param {string[]} files   File paths from the new task
+ * @param {string}   [cwd]
+ * @returns {Array<{
+ *   sessionId: string, smartName: string, score: number,
+ *   matchedFiles: string[], matchedTopics: string[],
+ *   date: string|null, messageCount: number
+ * }>}
+ */
+export function findRelatedSessions(prompt, files = [], cwd = process.cwd()) {
+  const indexPath = join(cwd, '.dualbrain', 'session-index.json');
+  let index = {};
+  try { index = JSON.parse(readFileSync(indexPath, 'utf8')); } catch { return []; }
+
+  if (Object.keys(index).length === 0) return [];
+
+  // Intent words for +1 scoring
+  const INTENT_WORDS = ['fix', 'refactor', 'test', 'add', 'update', 'review', 'debug', 'build', 'remove', 'migrate', 'deploy', 'implement', 'create'];
+
+  // Normalize the new task's prompt into words
+  const promptLower = (prompt || '').toLowerCase();
+  const promptWords = new Set(promptLower.split(/\W+/).filter(w => w.length > 3));
+
+  // Normalize the new task's file paths for comparison
+  const normalizeFile = (f) => (f || '').split('/').pop().toLowerCase().replace(/\.[^.]+$/, '');
+  const newFileNames = new Set((files || []).map(normalizeFile).filter(Boolean));
+
+  // One-hour cutoff for excluding likely-current session
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+
+  const results = [];
+
+  for (const session of Object.values(index)) {
+    // Skip archived sessions
+    if (session.archived) continue;
+
+    // Skip sessions from the last hour
+    const sessionTs = session.date ? Date.parse(session.date) : 0;
+    if (sessionTs > oneHourAgo) continue;
+
+    let score = 0;
+    const matchedFiles = [];
+    const matchedTopics = [];
+
+    // +3 for each file in common
+    for (const sessionFile of (session.files || [])) {
+      const sessionFileName = normalizeFile(sessionFile);
+      if (sessionFileName && newFileNames.has(sessionFileName)) {
+        score += 3;
+        matchedFiles.push(sessionFile);
+      }
+    }
+
+    // +2 for each topic keyword in common with prompt words
+    for (const topic of (session.topics || [])) {
+      if (topic && promptWords.has(topic)) {
+        score += 2;
+        matchedTopics.push(topic);
+      }
+    }
+
+    // +1 for matching intent words found in both prompt and session topics/prompts
+    const sessionText = [
+      ...(session.topics || []),
+      session.prompts?.first || '',
+      session.prompts?.last  || '',
+    ].join(' ').toLowerCase();
+
+    for (const word of INTENT_WORDS) {
+      if (promptLower.includes(word) && sessionText.includes(word)) {
+        score += 1;
+        break; // only +1 total for intent words
+      }
+    }
+
+    if (score > 3) {
+      results.push({
+        sessionId:     session.id,
+        smartName:     session.smartName || session.prompts?.first?.slice(0, 40) || session.id.slice(0, 8),
+        score,
+        matchedFiles,
+        matchedTopics,
+        date:          session.date,
+        messageCount:  session.messageCount || 0,
+      });
+    }
+  }
+
+  // Return top 3 sorted by score descending
+  return results
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+}
+
+/**
  * Get detailed context for a session (for smart resume preview).
  * Reads the last 20 lines of the session JSONL to surface the most recent prompt
  * and files touched.
