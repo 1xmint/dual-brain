@@ -10,7 +10,7 @@
  *   formatSessionCard(session, repo, health) → compact status card string (≤5 lines)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -195,6 +195,124 @@ export function formatSessionCard(session, repo, health) {
   }
 
   return lines.join('\n');
+}
+
+// ─── Replit-tools session import ──────────────────────────────────────────────
+
+/**
+ * Human-readable time-ago string from a Unix timestamp (ms).
+ * @param {number} timestamp
+ * @returns {string}
+ */
+function timeAgo(timestamp) {
+  const diff = Date.now() - timestamp;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/**
+ * Import sessions from replit-tools history.jsonl.
+ * Returns an array of session summary objects, sorted most-recent first.
+ * Returns [] gracefully if replit-tools is not present.
+ *
+ * @param {string} cwd
+ * @returns {Array<{
+ *   id: string, name: string, project: string,
+ *   promptCount: number, lastActive: string,
+ *   isActive: boolean, source: string, age: string
+ * }>}
+ */
+export function importReplitSessions(cwd = process.cwd()) {
+  const sessions = [];
+  const replitBase = join(cwd, '.replit-tools', '.claude-persistent');
+
+  // Read history.jsonl
+  const historyPath = join(replitBase, 'history.jsonl');
+  if (!existsSync(historyPath)) return sessions;
+
+  let lines;
+  try {
+    lines = readFileSync(historyPath, 'utf8').split('\n').filter(Boolean);
+  } catch { return sessions; }
+
+  const bySession = new Map(); // sessionId → { entries, firstPrompt, lastTimestamp }
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (!entry.sessionId) continue;
+
+      if (!bySession.has(entry.sessionId)) {
+        bySession.set(entry.sessionId, {
+          sessionId: entry.sessionId,
+          project: entry.project,
+          entries: [],
+          firstPrompt: null,
+          lastTimestamp: 0,
+        });
+      }
+
+      const sess = bySession.get(entry.sessionId);
+      sess.entries.push(entry);
+      if (entry.timestamp > sess.lastTimestamp) sess.lastTimestamp = entry.timestamp;
+
+      // Find first meaningful user prompt (not slash commands, not login, not pastes)
+      if (!sess.firstPrompt && entry.display
+          && !entry.display.startsWith('/')
+          && !entry.display.startsWith('login')
+          && !entry.display.startsWith('[Pasted')) {
+        sess.firstPrompt = entry.display;
+      }
+    } catch { continue; }
+  }
+
+  // Read active terminal sessions
+  const sessionsDir = join(cwd, '.replit-tools', '.claude-sessions');
+  const activeSessionIds = new Set();
+  if (existsSync(sessionsDir)) {
+    try {
+      for (const f of readdirSync(sessionsDir)) {
+        try {
+          const data = JSON.parse(readFileSync(join(sessionsDir, f), 'utf8'));
+          if (data.sessionId) activeSessionIds.add(data.sessionId);
+        } catch { continue; }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // Build session list
+  for (const [id, sess] of bySession) {
+    // Derive display name
+    let name = sess.firstPrompt;
+    if (!name) {
+      // Fallback: use first non-login display
+      const firstReal = sess.entries.find(e => e.display && e.display !== 'login');
+      name = firstReal?.display || `Session ${id.slice(0, 8)}`;
+    }
+    // Truncate long names
+    if (name.length > 60) name = name.slice(0, 57) + '...';
+
+    sessions.push({
+      id: sess.sessionId,
+      name,
+      project: sess.project,
+      promptCount: sess.entries.length,
+      lastActive: new Date(sess.lastTimestamp).toISOString(),
+      isActive: activeSessionIds.has(id),
+      source: 'replit-tools',
+      age: timeAgo(sess.lastTimestamp),
+    });
+  }
+
+  // Sort by most recent first
+  sessions.sort((a, b) => new Date(b.lastActive) - new Date(a.lastActive));
+
+  return sessions;
 }
 
 // ─── CLI (direct invocation) ──────────────────────────────────────────────────

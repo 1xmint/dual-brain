@@ -876,6 +876,94 @@ if (isMain) main().catch(e => { process.stderr.write(e.message + '\n'); process.
 // Exports
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Auto-setup (1-click, no user input required)
+// ---------------------------------------------------------------------------
+
+/**
+ * Attempt to configure a profile entirely from detected state — no user input.
+ *
+ * Returns:
+ *   {
+ *     confident: boolean,   // true when at least one provider was found
+ *     profile: object|null, // fully-built profile ready to save, or null
+ *     warnings: string[],   // non-fatal issues (e.g. missing provider)
+ *     actions: string[],    // human-readable lines for the summary box
+ *   }
+ *
+ * IMPORTANT: this function NEVER stores credentials — it only reads what's
+ * already present on disk / in environment variables.
+ */
+async function autoSetup(cwd) {
+  const env  = detectEnvironment();
+  const auth = await detectAuth();
+  const plans = detectPlans();
+
+  const result = {
+    confident: false,
+    profile: null,
+    warnings: [],
+    actions: [],
+  };
+
+  // Need at least one provider authenticated
+  if (!auth.claude.found && !auth.openai.found) {
+    result.warnings.push('No provider credentials found');
+    return result;
+  }
+
+  // Build profile from detected state
+  const profile = defaultProfile();
+
+  // Claude
+  if (auth.claude.found) {
+    profile.providers.claude.enabled = true;
+    profile.providers.claude.plan    = plans.claude || '$20';
+    const planLabel = {
+      '$20':  'Claude Pro ($20)',
+      '$100': 'Claude Max x5 ($100)',
+      '$200': 'Claude Max x20 ($200)',
+    }[profile.providers.claude.plan] || profile.providers.claude.plan;
+    result.actions.push(`${planLabel} via ${auth.claude.source}`);
+  } else {
+    profile.providers.claude.enabled = false;
+    result.warnings.push('Claude not authenticated');
+  }
+
+  // OpenAI
+  if (auth.openai.found) {
+    profile.providers.openai.enabled = true;
+    profile.providers.openai.plan    = plans.openai || '$20';
+    const planLabel = {
+      '$20':  'ChatGPT Plus ($20)',
+      '$100': 'ChatGPT Pro ($100)',
+      '$200': 'ChatGPT Pro ($200)',
+    }[profile.providers.openai.plan] || profile.providers.openai.plan;
+    result.actions.push(`${planLabel} via ${auth.openai.source}`);
+  } else {
+    profile.providers.openai.enabled = false;
+    result.warnings.push('OpenAI not authenticated');
+  }
+
+  // Mode
+  const enabledCount = [auth.claude.found, auth.openai.found].filter(Boolean).length;
+  profile.mode = enabledCount >= 2 ? 'dual'
+    : auth.claude.found ? 'solo-claude'
+    : 'solo-openai';
+  profile.bias = 'balanced';
+
+  // Environment note
+  if (env.isReplit && env.hasReplitTools) {
+    result.actions.push('Replit + replit-tools detected');
+  } else if (env.isReplit) {
+    result.actions.push('Replit environment detected');
+  }
+
+  result.confident = true;
+  result.profile   = profile;
+  return result;
+}
+
 export {
   loadProfile, saveProfile, ensureProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
@@ -884,4 +972,5 @@ export {
   detectAuth, detectEnvironment,
   setupAuth, saveAuthKey, loadAuthKeys,
   getActiveKey, removeAuthKey, disableKey, rotateToNextKey,
+  defaultProfile, autoSetup,
 };
