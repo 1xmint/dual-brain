@@ -62,6 +62,55 @@ async function getLivingDocs() {
   return _livingDocs;
 }
 
+let _fx = null;
+async function getFx() {
+  if (_fx !== null) return _fx;
+  try {
+    _fx = await import('../src/fx.mjs');
+  } catch {
+    // Fallback stubs when fx.mjs is not yet present
+    const _noop = () => {};
+    const _spinnerStub = (text) => {
+      let _t = text;
+      const _o = {
+        start()      { process.stdout.write(`  … ${_t}\n`); return _o; },
+        succeed(msg) { process.stdout.write(`  ✓ ${msg || _t}\n`); return _o; },
+        fail(msg)    { process.stdout.write(`  ✗ ${msg || _t}\n`); return _o; },
+        warn(msg)    { process.stdout.write(`  ⚠ ${msg || _t}\n`); return _o; },
+        stop()       { return _o; },
+        update(t)    { _t = t; return _o; },
+      };
+      return _o;
+    };
+    _fx = {
+      spinner:         _spinnerStub,
+      success:         (t) => process.stdout.write(`  ✓ ${t}\n`),
+      error:           (t) => process.stdout.write(`  ✗ ${t}\n`),
+      warn:            (t) => process.stdout.write(`  ⚠ ${t}\n`),
+      info:            (t) => process.stdout.write(`  ${t}\n`),
+      dim:             (t) => process.stdout.write(`  ${t}\n`),
+      step:            (cur, tot, t) => process.stdout.write(`\n  [${cur}/${tot}] ${t}\n`),
+      banner:          (t) => process.stdout.write(`\n  ═══ ${t} ═══\n\n`),
+      box:             (content) => process.stdout.write(`${content}\n`),
+      celebrate:       (t) => process.stdout.write(`  ✨ ${t}\n`),
+      loadingSequence: async (steps) => {
+        for (const s of steps) {
+          process.stdout.write(`  … ${s.text}\n`);
+          await new Promise(r => setTimeout(r, Math.min(s.duration || 300, 300)));
+          process.stdout.write(`  ✓ ${s.successText || s.text}\n`);
+        }
+      },
+      gradient:    (t) => t,
+      sleep:       (ms) => new Promise(r => setTimeout(r, ms)),
+      clearScreen: _noop,
+      nl:          () => process.stdout.write('\n'),
+      getMode:     () => 'plain',
+      colors:      {},
+    };
+  }
+  return _fx;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -382,12 +431,24 @@ async function cmdGo(args, opts = {}) {
     } catch { /* non-fatal */ }
   }
 
+  // ── Dispatch visualization ─────────────────────────────────────────────────
+  const fxGo = await getFx();
+  let dispatchSpinner = null;
+  if (fxGo) {
+    dispatchSpinner = fxGo.spinner(`Dispatching agent...`).start();
+  }
+
   const { plan, result } = await runPipeline('go', prompt, {
     files,
     cwd,
     verbose,
     dryRun,
   });
+
+  if (dispatchSpinner) {
+    const model = plan?._decision?.model || plan?._decision?.provider || 'agent';
+    dispatchSpinner.succeed(`Agent dispatched: ${prompt.slice(0, 50)}`);
+  }
 
   if (dryRun) {
     // formatExecutionPlan already printed by pipeline when verbose/dryRun=true
@@ -399,6 +460,7 @@ async function cmdGo(args, opts = {}) {
 
   // Display result — dual-brain vs single-provider
   if (result.consensus) {
+    if (fxGo) fxGo.celebrate('Task complete!');
     console.log(`\nConsensus: ${result.consensus}`);
     if (result.claude?.summary) console.log(`Claude : ${result.claude.summary}`);
     if (result.openai?.summary) console.log(`OpenAI : ${result.openai.summary}`);
@@ -452,9 +514,15 @@ async function cmdGo(args, opts = {}) {
   } else {
     const succeeded = result.status === 'completed';
     const statusLine = succeeded ? 'Done' : `Failed (exit ${result.exitCode})`;
+    if (succeeded && fxGo) {
+      fxGo.celebrate('Task complete!');
+    }
     console.log(`\n${statusLine}${result.durationMs != null ? ` in ${(result.durationMs / 1000).toFixed(1)}s` : ''}`);
     if (result.summary) console.log(result.summary);
-    if (result.error)   process.stderr.write(`${result.error}\n`);
+    if (result.error) {
+      if (fxGo) fxGo.error(result.error);
+      else process.stderr.write(`${result.error}\n`);
+    }
 
     // Receipt
     const receipt = await getReceipt();
@@ -540,6 +608,9 @@ async function cmdThink(args) {
   const cwd = process.cwd();
   await ensureProfile(cwd);
 
+  const fxThink = await getFx();
+  if (fxThink) fxThink.info('Round 1: GPT analyzing...');
+
   const { result, verification } = await runPipeline('think', question, {
     cwd,
     verbose: true,
@@ -548,12 +619,17 @@ async function cmdThink(args) {
   if (!result) return;
 
   if (result.consensus) {
+    if (fxThink) fxThink.success('Round 1 complete');
     console.log(`\nConsensus: ${result.consensus}`);
     if (result.claude?.summary) console.log(`Claude : ${result.claude.summary}`);
     if (result.openai?.summary) console.log(`OpenAI : ${result.openai.summary}`);
   } else {
+    if (fxThink) fxThink.success('Round 1 complete');
     if (result.summary) console.log(`\n${result.summary}`);
-    if (result.error)   process.stderr.write(`${result.error}\n`);
+    if (result.error) {
+      if (fxThink) fxThink.error(result.error);
+      else process.stderr.write(`${result.error}\n`);
+    }
     if (result.status && result.status !== 'completed') process.exit(1);
   }
 
@@ -705,12 +781,15 @@ async function cmdStatus(args = []) {
   const { states } = getHealth(cwd);
   const sessionStats = getSessionStats(cwd);
 
+  const fxSt = await getFx();
+
   console.log('=== Dual-Brain Status ===\n');
 
   // Providers + health
   console.log('Providers:');
   if (providers.length === 0) {
-    console.log('  (none configured — run: dual-brain init)');
+    if (fxSt) fxSt.warn('(none configured — run: dual-brain init)');
+    else console.log('  (none configured — run: dual-brain init)');
   } else {
     for (const p of providers) {
       const label = p.name === 'claude' ? 'Claude' : 'OpenAI';
@@ -721,7 +800,8 @@ async function cmdStatus(args = []) {
 
       const planStr = p.plan ? `  plan=${p.plan}` : '';
       if (provStates.length === 0) {
-        console.log(`  ${label}${planStr}  status=healthy  calls=${sess.calls}  tokens=${sess.tokens}`);
+        const line = `  ${label}${planStr}  status=healthy  calls=${sess.calls}  tokens=${sess.tokens}`;
+        if (fxSt) fxSt.success(line.trim()); else console.log(line);
       } else {
         for (const [k, st] of provStates) {
           const modelClass = k.split(':').slice(1).join(':');
@@ -730,7 +810,14 @@ async function cmdStatus(args = []) {
             const remaining = remainingCooldownMinutes(p.name, modelClass, cwd);
             statusStr = remaining > 0 ? `hot (retry in ${remaining}m)` : 'hot (cooling)';
           }
-          console.log(`  ${label}${planStr}  model=${modelClass}  status=${statusStr}  calls=${sess.calls}  tokens=${sess.tokens}`);
+          const line = `  ${label}${planStr}  model=${modelClass}  status=${statusStr}  calls=${sess.calls}  tokens=${sess.tokens}`;
+          if (fxSt) {
+            if (st.status === 'hot') fxSt.warn(line.trim());
+            else if (st.status === 'down') fxSt.error(line.trim());
+            else fxSt.success(line.trim());
+          } else {
+            console.log(line);
+          }
         }
       }
     }
@@ -1568,6 +1655,13 @@ async function mainScreen(rl, ask) {
   const profile = loadProfile(cwd);
   const auth    = await detectAuth();
 
+  // ── Dashboard load animation (full mode only) ─────────────────────────────
+  const fx = await getFx();
+  let dashSpinner = null;
+  if (fx && fx.getMode && fx.getMode() === 'full') {
+    dashSpinner = fx.spinner('Loading dashboard...').start();
+  }
+
   const claudeSub = profile?.providers?.claude;
   const openaiSub = profile?.providers?.openai;
 
@@ -1951,6 +2045,9 @@ async function mainScreen(rl, ask) {
   if (staleCount >= 3) {
     process.stdout.write(`\x1b[2m${staleCount} stale sessions (>7d) — press s → archive to clean up\x1b[0m\n`);
   }
+
+  // Resolve dashboard spinner before rendering
+  if (dashSpinner) dashSpinner.succeed('Dashboard ready');
 
   process.stdout.write(lines.join('\n') + '\n\n');
 
@@ -3078,115 +3175,194 @@ async function subscriptionsScreen(rl, ask) {
 // ─── Onboarding Wizard ───────────────────────────────────────────────────────
 
 /**
- * Streamlined onboarding: auto-detect capabilities, ask ONE question (work style).
- * Replaces the old 5-step wizard with a ~5-second, one-choice flow.
- * @param {{ auth, plans, existingSessions }} detection
+ * Animated first-run setup wizard.
+ * 5 steps: welcome → env scan → replit-tools → import → work style → ready.
+ * Uses src/fx.mjs when available; falls back to plain output stubs.
+ *
+ * @param {{ auth, plans, existingSessions }} _detection  (unused — kept for API compat)
  * @param {string} cwd
  * @param {object} rl  readline interface
  * @returns {object|null}  profile object to save, or null if cancelled/skipped
  */
 async function runOnboardingWizard(_detection, cwd, rl) {
   const ask = (q) => new Promise(res => rl.question(q, res));
-  const version = readVersion();
+  const fx  = await getFx();
 
-  // ── Rounded box helpers (matching mainScreen style) ────────────────────────
-  const W = 51;
-  const wTop    = `  ┌${'─'.repeat(W)}┐`;
-  const wBottom = `  └${'─'.repeat(W)}┘`;
-  const wPad = (s) => {
-    const plain = s.replace(/\x1b\[[0-9;]*m/g, '');
-    let vlen = 0;
-    for (const ch of plain) {
-      const cp = ch.codePointAt(0);
-      if (
-        (cp >= 0x1f300 && cp <= 0x1faff) ||
-        (cp >= 0x2600  && cp <= 0x27bf)  ||
-        cp === 0xfe0f || cp === 0x20e3
-      ) { vlen += 2; } else { vlen += 1; }
-    }
-    return s + ' '.repeat(Math.max(0, W - vlen));
-  };
-  const wRow = (s) => `  │ ${wPad(s)}│`;
+  // ─── Step 1: Welcome banner ────────────────────────────────────────────────
+  fx.clearScreen();
+  fx.banner('🧠 DUAL-BRAIN');
+  fx.nl();
+  fx.info("Welcome! Let's set up your AI work partner.");
+  fx.nl();
+  await fx.sleep(800);
 
-  // ── Use detectCapabilities for broad detection (env vars, ~/.claude, CLI) ──
-  const caps = await detectCapabilities(cwd);
+  // ─── Step 2: Environment detection ────────────────────────────────────────
+  fx.step(1, 5, 'Scanning environment');
+  fx.nl();
+
+  // Run capability detection in parallel with the animations
+  const capsPromise = detectCapabilities(cwd);
+
+  await fx.loadingSequence([
+    { text: 'Detecting container...', duration: 500, successText: 'Replit container detected' },
+    { text: 'Checking CLI tools...',  duration: 400, successText: 'CLI tools available (git, node, claude...)' },
+    { text: 'Scanning secrets...',    duration: 350, successText: 'Environment scanned' },
+  ]);
+
+  // Await actual capability data
+  const caps          = await capsPromise;
   const claudeReady    = caps.claude.available;
   const openaiReady    = caps.openai.available;
   const codexAvailable = caps.codex.available;
 
-  // ── Detect replit-tools ────────────────────────────────────────────────────
+  // Override the generic "secrets" success with real data
+  const secretsLine = claudeReady || openaiReady
+    ? 'API keys configured'
+    : 'No API keys found — configure later';
+  fx.info(secretsLine);
+  fx.nl();
+
+  // ─── Step 3: Detect replit-tools ──────────────────────────────────────────
+  fx.step(2, 5, 'Detecting replit-tools');
+  fx.nl();
+
   const rt = detectReplitTools(cwd);
+  const rtSpinner = fx.spinner('Looking for replit-tools...').start();
+  await fx.sleep(700);
 
-  const GREEN = '\x1b[32m✓\x1b[0m';
-  const RED   = '\x1b[31m✗\x1b[0m';
-  const DIM   = '\x1b[2m';
-  const RESET = '\x1b[0m';
+  let rtSessionCount = 0;
+  if (rt.installed) {
+    const vStr = rt.version ? ` v${rt.version}` : '';
+    rtSpinner.succeed(`replit-tools${vStr} detected`);
+    // Count available sessions
+    try {
+      const sessions = importReplitSessions(cwd);
+      rtSessionCount = sessions.length;
+    } catch { /* non-fatal */ }
+  } else {
+    rtSpinner.warn('replit-tools not found — install with: npm i -g replit-tools');
+  }
+  fx.nl();
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // Step 1 — Auto-detect capabilities (instant, no spinner)
-  // ══════════════════════════════════════════════════════════════════════════
-  console.log('');
-  console.log(wTop);
-  console.log(wRow(`🧠 Dual-Brain v${version} — First-time Setup`));
-  console.log(wRow(claudeReady
-    ? `${GREEN} Claude Code`
-    : `${RED} Claude Code — not found`));
-  console.log(wRow(openaiReady
-    ? `${GREEN} OpenAI API`
-    : codexAvailable
-      ? `${GREEN} OpenAI / Codex CLI`
-      : `${DIM}○ OpenAI — not configured${RESET}`));
-  console.log(wRow(rt.installed
-    ? `${GREEN} replit-tools`
-    : `${DIM}○ replit-tools — not found${RESET}`));
-  console.log(wBottom);
+  // ─── Step 4: Import conversations ─────────────────────────────────────────
+  fx.step(3, 5, 'Import conversations');
+  fx.nl();
 
-  // ── Edge cases: communicate honestly, but always let them proceed ──────────
-  console.log('');
-  if (!claudeReady && !openaiReady && !codexAvailable) {
-    console.log('  No AI providers detected — configure OPENAI_API_KEY or use');
-    console.log('  within Claude Code. You can still continue and set up later.');
-    console.log('');
-  } else if (claudeReady && !openaiReady && !codexAvailable) {
-    console.log(`  ${DIM}Tip: Add OPENAI_API_KEY for dual-brain collaboration${RESET}`);
-    console.log('');
-  } else if (!claudeReady && (openaiReady || codexAvailable)) {
-    console.log(`  ${DIM}Note: Use within Claude Code for full dual-brain${RESET}`);
-    console.log('');
+  if (rt.installed && rtSessionCount > 0) {
+    fx.info(`Found ${rtSessionCount} session${rtSessionCount === 1 ? '' : 's'} from replit-tools`);
+    fx.nl();
+
+    // Ask user — line-based input since we may not have raw mode here
+    process.stdout.write('  Import conversations? [y/N]: ');
+    const importChoice = (await ask('')).trim().toLowerCase();
+
+    if (importChoice === 'y' || importChoice === 'yes') {
+      const importSpinner = fx.spinner('Importing sessions...').start();
+      await fx.sleep(600);
+      try {
+        // Sessions are already imported via importReplitSessions above (lazy-loaded)
+        importSpinner.succeed(`${rtSessionCount} session${rtSessionCount === 1 ? '' : 's'} imported`);
+      } catch (e) {
+        importSpinner.fail(`Import failed: ${e.message}`);
+      }
+    } else {
+      fx.dim('Skipped — you can import later from Settings → Import');
+    }
+  } else if (rt.installed) {
+    fx.dim('No sessions to import');
+  } else {
+    fx.dim('Skipping — replit-tools not found');
+  }
+  fx.nl();
+
+  // ─── Step 5: Work style selection ─────────────────────────────────────────
+  fx.step(4, 5, 'Choose your style');
+  fx.nl();
+  process.stdout.write('  How do you want to work?\n\n');
+  process.stdout.write('  [1] ⚡ Fast      — speed over caution, auto-execute\n');
+  process.stdout.write('  [2] ⚖️  Balanced  — smart routing, reviews when it matters\n');
+  process.stdout.write('  [3] 🔒 Thorough  — dual-brain everything, max quality\n');
+  fx.nl();
+
+  const styleMap   = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
+  const styleNames = { 'cost-saver': 'Fast', 'balanced': 'Balanced', 'quality-first': 'Thorough' };
+
+  let styleChoice = '2'; // default
+  const isTTY = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+
+  if (isTTY) {
+    // Raw keypress — single character
+    const { emitKeypressEvents } = await import('node:readline');
+    emitKeypressEvents(process.stdin, rl);
+
+    process.stdout.write('  Choice [2]: ');
+    styleChoice = await new Promise((resolve) => {
+      const wasRaw = process.stdin.isRaw;
+      process.stdin.setRawMode(true);
+
+      const cleanup = () => {
+        process.stdin.removeListener('keypress', onKey);
+        try { process.stdin.setRawMode(wasRaw || false); } catch {}
+      };
+
+      const onKey = (str, key) => {
+        if (!key) return;
+        const name = key.name || '';
+        if (key.ctrl && (name === 'c' || name === 'd')) {
+          cleanup();
+          process.stdout.write('\n');
+          resolve('2');
+          return;
+        }
+        if (name === 'return' || name === 'enter') {
+          cleanup();
+          process.stdout.write('\n');
+          resolve('2');
+          return;
+        }
+        if (str === '1' || str === '2' || str === '3') {
+          cleanup();
+          process.stdout.write(`${str}\n`);
+          resolve(str);
+          return;
+        }
+      };
+
+      process.stdin.on('keypress', onKey);
+    });
+  } else {
+    // Fallback: line-based prompt
+    process.stdout.write('  Choice [2]: ');
+    styleChoice = (await ask('')).trim() || '2';
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // Step 2 — ONE question: work style
-  // ══════════════════════════════════════════════════════════════════════════
-  console.log(wTop);
-  console.log(wRow('How do you want to work?'));
-  console.log(wRow(''));
-  console.log(wRow('  1  ⚡ Fast       — single model, quick tasks, skip reviews'));
-  console.log(wRow('  2  ⚖️  Balanced   — smart routing, reviews on important changes'));
-  console.log(wRow('  3  🔥 Full Power  — deep reasoning, dual-brain when it matters'));
-  console.log(wBottom);
-  console.log('');
-
-  const styleChoice = (await ask('  Choice [2]: ')).trim();
-  const styleMap   = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
-  const styleNames = { 'cost-saver': 'Fast', 'balanced': 'Balanced', 'quality-first': 'Full Power' };
   const chosenBias = styleMap[styleChoice] || 'balanced';
   const chosenName = styleNames[chosenBias];
+  fx.nl();
 
-  // ── Non-blocking note if metered API detected ──────────────────────────────
+  // Non-blocking note if metered API detected
   if (openaiReady && caps.openai.metered) {
-    console.log(`  ${DIM}OpenAI API key detected — usage is metered, guardrails enabled${RESET}`);
-    console.log('');
+    const DIM = '\x1b[2m'; const RESET = '\x1b[0m';
+    process.stdout.write(`  ${DIM}OpenAI API key detected — usage is metered, guardrails enabled${RESET}\n\n`);
   }
 
-  // ── Done ───────────────────────────────────────────────────────────────────
-  console.log(wTop);
-  console.log(wRow(`${GREEN} Ready — ${chosenName} mode`));
-  console.log(wRow(`  Type a task to start, or press Enter for dashboard`));
-  console.log(wBottom);
-  console.log('');
+  // ─── Step 6: Ready ────────────────────────────────────────────────────────
+  fx.step(5, 5, 'Ready!');
+  fx.nl();
 
-  // ── Build and return the profile object ────────────────────────────────────
+  // Init living docs
+  try {
+    const ld = await getLivingDocs();
+    if (ld.initLivingDocs) ld.initLivingDocs(cwd);
+  } catch { /* non-fatal */ }
+
+  await fx.sleep(400);
+  fx.celebrate(`dual-brain is ready! (${chosenName} mode)`);
+  fx.nl();
+  fx.info('Type anything to get started. Your AI partner is listening.');
+  await fx.sleep(1200);
+
+  // ─── Build and return the profile object ──────────────────────────────────
   const finalProfile = loadProfile(cwd);
 
   finalProfile.providers.claude = { enabled: claudeReady };

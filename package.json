@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "7.1.28",
+  "version": "7.1.29",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -80,6 +80,7 @@
     "src/install-hooks.mjs",
     "src/update-check.mjs",
     "src/prompt-intel.mjs",
+    "src/fx.mjs",
     "bin/*.mjs",
     "hooks/enforce-tier.mjs",
     "hooks/cost-logger.mjs",
