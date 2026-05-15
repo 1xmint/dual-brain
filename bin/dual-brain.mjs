@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dual-brain — CLI entry point. Commands: init, go, status, remember, forget
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawnSync as _spawnSyncTop } from 'node:child_process';
@@ -41,9 +41,59 @@ const PKG_PATH  = join(__dirname, '..', 'package.json');
 function readVersion() {
   try { return JSON.parse(readFileSync(PKG_PATH, 'utf8')).version; } catch { return '0.0.0'; }
 }
+async function checkForUpdates(currentVersion) {
+  try {
+    const { execSync } = await import('node:child_process');
+    const latest = execSync('npm view dual-brain version 2>/dev/null', {
+      encoding: 'utf8',
+      timeout: 3000
+    }).trim();
+    if (latest && latest !== currentVersion) {
+      return latest;
+    }
+  } catch {}
+  return null;
+}
 function flag(args, name) { const i = args.indexOf(name); return i !== -1 ? (args[i + 1] ?? true) : null; }
 function err(msg) { process.stderr.write(`Error: ${msg}\n`); process.exit(1); }
 function vtrace(msg) { process.stderr.write(`[verbose] ${msg}\n`); }
+
+// ─── Loop-prevention markers ──────────────────────────────────────────────────
+
+function checkLoopMarker(cwd) {
+  const markerPath = join(cwd, '.dualbrain', `.prompt-shown-${process.pid}`);
+  if (existsSync(markerPath)) {
+    try {
+      const age = Date.now() - statSync(markerPath).mtimeMs;
+      if (age < 3600000) return true; // Not stale, skip prompt
+    } catch {}
+  }
+  return false;
+}
+
+function setLoopMarker(cwd) {
+  const dir = join(cwd, '.dualbrain');
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `.prompt-shown-${process.pid}`), String(Date.now()));
+  } catch {}
+}
+
+function cleanStaleMarkers(cwd) {
+  const dir = join(cwd, '.dualbrain');
+  try {
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith('.prompt-shown-')) continue;
+      const pid = f.replace('.prompt-shown-', '');
+      try {
+        process.kill(parseInt(pid, 10), 0);
+      } catch {
+        // Process dead, remove marker
+        try { unlinkSync(join(dir, f)); } catch {}
+      }
+    }
+  } catch {}
+}
 
 function daysUntil(isoDate) {
   if (!isoDate) return null;
@@ -790,6 +840,42 @@ async function welcomeScreen(rl, ask) {
   return { next: 'main' };
 }
 
+// ─── Running-instance + terminal helpers ─────────────────────────────────────
+
+function countRunningInstances() {
+  try {
+    const claude = parseInt(execSync('pgrep -x claude 2>/dev/null | wc -l', { encoding: 'utf8' }).trim(), 10) || 0;
+    const codex  = parseInt(execSync('pgrep -x codex 2>/dev/null | wc -l',  { encoding: 'utf8' }).trim(), 10) || 0;
+    return { claude, codex };
+  } catch { return { claude: 0, codex: 0 }; }
+}
+
+function getTerminalId() {
+  try {
+    const tty = execSync('tty 2>/dev/null', { encoding: 'utf8' }).trim();
+    if (tty && tty !== 'not a tty') {
+      return tty.replace('/dev/', '').replace(/\//g, '-');
+    }
+  } catch {}
+  return `shell-${process.pid}`;
+}
+
+function saveTerminalState(cwd, terminalId, sessionId, tool) {
+  const dir = join(cwd, '.dualbrain');
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `terminal-${terminalId}.json`), JSON.stringify({
+      sessionId, tool, terminalId, timestamp: Math.floor(Date.now() / 1000),
+    }));
+  } catch {}
+}
+
+function loadTerminalState(cwd, terminalId) {
+  try {
+    return JSON.parse(readFileSync(join(cwd, '.dualbrain', `terminal-${terminalId}.json`), 'utf8'));
+  } catch { return null; }
+}
+
 // ─── Screen: mainScreen ───────────────────────────────────────────────────────
 
 async function mainScreen(rl, ask) {
@@ -831,6 +917,11 @@ async function mainScreen(rl, ask) {
   ];
 
   console.log(`📦 DATA Tools - Dual Brain v${version}`);
+  const latestVersion = await checkForUpdates(version);
+  if (latestVersion) {
+    console.log(`  ⬆️  Update available: v${version} → v${latestVersion}`);
+    console.log(`     Run: npx -y dual-brain@latest`);
+  }
   console.log('');
 
   // Help shortcuts box (matching data-tools style)
@@ -929,11 +1020,21 @@ async function mainScreen(rl, ask) {
   console.log(brandBottom);
   console.log('');
 
+  const running = countRunningInstances();
+  const runningParts = [];
+  if (running.claude > 0) runningParts.push(`${running.claude} claude`);
+  if (running.codex > 0)  runningParts.push(`${running.codex} codex`);
+  if (runningParts.length > 0) {
+    console.log(`  (${runningParts.join(', ')} running)`);
+    console.log('');
+  }
+
   console.log('  [c] Continue last session');
   console.log('  [n] New session');
   if (recentSessions.length > 0) {
     console.log('  [1-9] Resume numbered above');
   }
+  console.log('  [r] Resume (full list)');
   console.log('  [e] Manage sessions');
   console.log('  [i] Import from replit-tools');
   console.log('  [m] Manage subscriptions');
@@ -947,15 +1048,24 @@ async function mainScreen(rl, ask) {
   if (choice === 'n') { return { next: 'new-session' }; }
 
   if (choice === 'c') {
-    const sessions = importReplitSessions(cwd);
-    if (sessions.length === 0) {
+    const termId    = getTerminalId();
+    const termState = loadTerminalState(cwd, termId);
+    const sessions  = importReplitSessions(cwd);
+
+    // Priority: terminal-specific last session, then global last session
+    const targetId = termState?.sessionId || (sessions.length > 0 ? sessions[0].id : null);
+
+    if (!targetId) {
       console.log('\n  No recent sessions found.\n');
       await ask('  Press Enter to continue...');
       return { next: 'main' };
     }
+
     const { spawnSync } = await import('node:child_process');
-    console.log(`\n  Launching: claude --resume ${sessions[0].id}\n`);
-    spawnSync('claude', ['--resume', sessions[0].id], { stdio: 'inherit' });
+    const tool = termState?.tool || 'claude';
+    console.log(`\n  Resuming: ${tool} --resume ${targetId}\n`);
+    spawnSync(tool === 'codex' ? 'codex' : 'claude', ['--resume', targetId], { stdio: 'inherit' });
+    saveTerminalState(cwd, termId, targetId, tool);
     return { next: 'main' };
   }
 
@@ -965,6 +1075,37 @@ async function mainScreen(rl, ask) {
     const { spawnSync } = await import('node:child_process');
     console.log(`\n  Launching: claude --resume ${sess.id}\n`);
     spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
+    return { next: 'main' };
+  }
+
+  if (choice === 'r') {
+    const allSessions = enrichSessions(importReplitSessions(cwd), cwd);
+    if (allSessions.length === 0) {
+      console.log('\n  No sessions found.\n');
+      await ask('  Press Enter to continue...');
+      return { next: 'main' };
+    }
+
+    console.log('\n  All Sessions:');
+    allSessions.forEach((sess, i) => {
+      const pin    = sess.pinned ? '📌 ' : '   ';
+      const active = sess.isActive ? ' ●' : '';
+      const cat    = sess.category ? `  [${sess.category}]` : '';
+      const tool   = (sess.tool === 'codex') ? 'cdx' : 'cld';
+      console.log(`  [${String(i + 1).padStart(2)}] ${pin}${tool}  ${sess.age.padEnd(8)} ${sess.name}${active}${cat}`);
+    });
+    console.log('');
+
+    const pick = (await ask('  Enter number to resume (or Enter to cancel): ')).trim();
+    const num = parseInt(pick, 10);
+    if (!isNaN(num) && num >= 1 && num <= allSessions.length) {
+      const sess = allSessions[num - 1];
+      const { spawnSync } = await import('node:child_process');
+      const tool = sess.tool === 'codex' ? 'codex' : 'claude';
+      console.log(`\n  Launching: ${tool} --resume ${sess.id}\n`);
+      spawnSync(tool, ['--resume', sess.id], { stdio: 'inherit' });
+    }
     return { next: 'main' };
   }
 
@@ -1017,10 +1158,17 @@ async function newSessionScreen(rl, ask) {
   console.log(`  Reason: ${decision.explanation}\n`);
 
   const { spawnSync } = await import('node:child_process');
-  if (decision.provider === 'openai') {
+  const launchTool = decision.provider === 'openai' ? 'codex' : 'claude';
+  if (launchTool === 'codex') {
     spawnSync('codex', [input], { stdio: 'inherit' });
   } else {
     spawnSync('claude', ['-p', input], { stdio: 'inherit' });
+  }
+
+  // After session ends, capture the most-recent session ID so [c] can resume it
+  const freshSessions = importReplitSessions(cwd);
+  if (freshSessions.length > 0) {
+    saveTerminalState(cwd, getTerminalId(), freshSessions[0].id, launchTool);
   }
 
   return { next: 'main' };
@@ -1952,6 +2100,11 @@ async function main() {
   if (!cmd) {
     if (isInteractive) {
       const cwd = process.cwd();
+      cleanStaleMarkers(cwd);
+      if (!process.argv.includes('--force') && checkLoopMarker(cwd)) {
+        process.exit(0);
+      }
+      setLoopMarker(cwd);
       if (profileExists(cwd)) {
         await runScreens('main');
       } else {
