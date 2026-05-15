@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // dual-brain — CLI entry point. Commands: init, go, status, remember, forget
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
@@ -67,7 +67,17 @@ Options:
 // ─── Card command (default) ──────────────────────────────────────────────────
 
 async function cmdCard() {
-  const cwd     = process.cwd();
+  const cwd = process.cwd();
+  const { homedir } = await import('node:os');
+  const globalPath  = join(homedir(), '.config', 'dual-brain', 'profile.json');
+  const projectPath = join(cwd, '.dualbrain', 'profile.json');
+
+  if (!existsSync(projectPath) && !existsSync(globalPath)) {
+    console.log('Welcome to dual-brain! Let\'s set up your profile.\n');
+    await cmdInit();
+    return;
+  }
+
   const repo    = loadRepoCache(cwd);
   const session = loadSession(cwd);
   const health  = getHealth(cwd);
