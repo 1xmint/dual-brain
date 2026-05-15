@@ -909,7 +909,7 @@ function cmdBreakGlass(reason) {
 // ─── Screen helpers ───────────────────────────────────────────────────────────
 
 /**
- * Render the data-tools-style rounded header box for the main screen.
+ * Render the dual-brain-style rounded header box for the main screen.
  * Inner width is 39 chars. Lines are padded with spaces to fill the box.
  */
 function renderHeader(version, providerLines, dtVersion) {
@@ -924,11 +924,11 @@ function renderHeader(version, providerLines, dtVersion) {
   const bottom = `  └${'─'.repeat(W)}┘`;
 
   const title  = `🧠 Dual Brain v${version}`;
-  const credit = `by Steve Moraco + dual-brain`;
+  const credit = `dual-brain`;
 
   const allProviderLines = [...providerLines];
   if (dtVersion) {
-    allProviderLines.push(`📦 data-tools v${dtVersion} detected`);
+    allProviderLines.push(`📦 replit-tools v${dtVersion} detected`);
   }
 
   const lines = [top];
@@ -1711,7 +1711,7 @@ async function mainScreen(rl, ask) {
 
   const statusRows = [row(providerLine)];
   if (dtVersion) {
-    statusRows.push(row(`\x1b[2m📦 data-tools v${dtVersion}\x1b[0m`));
+    statusRows.push(row(`\x1b[2m📦 replit-tools v${dtVersion}\x1b[0m`));
   }
 
   // ── Observer observations (top 2, high priority first) ───────────────────
@@ -1843,7 +1843,7 @@ async function mainScreen(rl, ask) {
 
   // ── Print the full box ────────────────────────────────────────────────────
   // Include action cards between status and sessions (with separators only when non-empty)
-  const poweredByRow = row('\x1b[2mPowered by data-tools · Steve Moraco\x1b[0m');
+  const poweredByRow = row('\x1b[2mPowered by dual-brain\x1b[0m');
   const lines = [
     top,
     ...statusRows,
