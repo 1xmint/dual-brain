@@ -1483,9 +1483,9 @@ function detectInterruptedWork(sessions, cwd) {
  * Shows: "● Claude  ● OpenAI  ⚖️  Balanced"
  * Uses ANSI color codes for the dots — no dollar amounts or usage bars.
  */
-function buildProviderStatusLine(profile, auth, maxWidth = 54) {
-  const GREEN = '[32m●[0m';
-  const RED   = '[31m●[0m';
+function buildProviderStatusLine(profile, auth) {
+  const GREEN = '\x1b[32m●\x1b[0m';
+  const RED   = '\x1b[31m●\x1b[0m';
 
   const claudeDot = auth.claude.found ? GREEN : RED;
   const openaiDot = auth.openai.found ? GREEN : RED;
@@ -1498,30 +1498,11 @@ function buildProviderStatusLine(profile, auth, maxWidth = 54) {
     'solo-claude':   '⚡ Fast',
     'solo-openai':   '⚡ Fast',
   };
-  const WORK_STYLE_TIPS = {
-    'auto':          'adapts routing by task risk',
-    'cost-saver':    'single model, minimal reviews',
-    'balanced':      'smart routing, reviews when needed',
-    'quality-first': 'dual-brain on everything important',
-    'solo-claude':   'Claude only, no GPT dispatch',
-    'solo-openai':   'OpenAI only, no Claude dispatch',
-  };
   const bias  = profile?.bias || profile?.mode || 'balanced';
   const label = WORK_STYLE_LABELS[bias] || '⚖️  Balanced';
-  const fullTip = WORK_STYLE_TIPS[bias] || 'smart routing, reviews when needed';
 
-  // Trim tip to fit within box width (measure visible chars: strip ANSI + variation selectors)
-  const labelPlain = label.replace(/[︀-️]/g, '').replace(/[[0-9;]*m/g, '');
-  const prefixLen = ('● Claude  ● OpenAI  ' + labelPlain + ' — ').length;
-  const tipMax = maxWidth - prefixLen;
-  const tip = tipMax >= 6
-    ? (fullTip.length > tipMax ? fullTip.slice(0, tipMax - 1) + '…' : fullTip)
-    : '';
-
-  const suffix = tip ? `[2m — ${tip}[0m` : '';
-  return `${claudeDot} Claude  ${openaiDot} OpenAI  ${label}${suffix}`;
+  return `${claudeDot} Claude     ${openaiDot} OpenAI     ${label}`;
 }
-
 /**
  * Render a box row padded to inner width W (stripping ANSI for length calculation).
  * Returns a string like: "│ content padded to W │"
@@ -1609,25 +1590,6 @@ async function mainScreen(rl, ask) {
 
   const row = (content) => makeBoxRow(content, W);
 
-  // ── Header: one line above the box ────────────────────────────────────────
-  process.stdout.write(`\n🧠 dual-brain v${version}\n`);
-  {
-    let gitName = '';
-    try {
-      const { execSync } = await import('node:child_process');
-      gitName = execSync('git config user.name', { encoding: 'utf8', stdio: ['pipe','pipe','pipe'] }).trim();
-    } catch { /* ignore */ }
-    if (gitName) {
-      const hour = new Date().getHours();
-      let greet;
-      if (hour >= 5 && hour <= 11)  greet = 'Good morning';
-      else if (hour >= 12 && hour <= 16) greet = 'Good afternoon';
-      else if (hour >= 17 && hour <= 21) greet = 'Good evening';
-      else                               greet = 'Late night';
-      process.stdout.write(`\x1b[2m${greet}, ${gitName}\x1b[0m\n`);
-    }
-  }
-
   // ── Continuation card (interrupted work) ─────────────────────────────────
   if (interrupted) {
     const ctop = `┌${'─'.repeat(boxW - 2)}┐`;
@@ -1706,15 +1668,74 @@ async function mainScreen(rl, ask) {
     // 's' → fall through to normal dashboard
   }
 
-  // ── Status section ────────────────────────────────────────────────────────
-  const providerLine = buildProviderStatusLine(profile, auth, W);
+  // ── Box 1 — Header row data ─────────────────────────────────────────────
+  const providerLine = buildProviderStatusLine(profile, auth);
 
-  const statusRows = [row(providerLine)];
-  if (dtVersion) {
-    statusRows.push(row(`\x1b[2m📦 replit-tools v${dtVersion}\x1b[0m`));
+  // ── Box 2 — Workspace: gather git data ───────────────────────────────────
+  let gitBranch       = 'unknown';
+  let gitUncommitted  = 0;
+  let gitAheadCount   = 0;
+  let gitLastMsg      = '';
+  let gitLastAgo      = '';
+
+  try {
+    gitBranch = execSync('git rev-parse --abbrev-ref HEAD 2>/dev/null', {
+      cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe',
+    }).trim() || 'unknown';
+  } catch {}
+
+  try {
+    const status = execSync('git status --porcelain 2>/dev/null', {
+      cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe',
+    });
+    gitUncommitted = status.trim().split('\n').filter(Boolean).length;
+  } catch {}
+
+  try {
+    const aheadOut = execSync('git rev-list @{u}..HEAD 2>/dev/null | wc -l', {
+      cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe',
+    });
+    gitAheadCount = parseInt(aheadOut.trim(), 10) || 0;
+  } catch {}
+
+  try {
+    const logOut = execSync('git log -1 --format="%s|%ct" 2>/dev/null', {
+      cwd, encoding: 'utf8', timeout: 2000, stdio: 'pipe',
+    }).trim();
+    if (logOut) {
+      const [msg, ts] = logOut.split('|');
+      gitLastMsg = (msg || '').slice(0, 38);
+      const ageMs  = Date.now() - (parseInt(ts, 10) * 1000);
+      const ageMin = Math.floor(ageMs / 60000);
+      if (ageMin < 60)         gitLastAgo = `${ageMin}m ago`;
+      else if (ageMin < 1440)  gitLastAgo = `${Math.floor(ageMin / 60)}h ago`;
+      else                     gitLastAgo = `${Math.floor(ageMin / 1440)}d ago`;
+    }
+  } catch {}
+
+  // ── Box 2 rows ────────────────────────────────────────────────────────────
+  const uncommittedPart = gitUncommitted > 0 ? ` · ${gitUncommitted} uncommitted` : '';
+  const aheadPart       = gitAheadCount  > 0 ? ` · ${gitAheadCount} ahead`       : '';
+  const workspaceLine1  = `${gitBranch}${uncommittedPart}${aheadPart}`;
+  const workspaceLine2  = gitLastMsg
+    ? `Last: ${gitLastMsg} (${gitLastAgo})`
+    : '';
+
+  // Open PRs
+  const repoState = detectRepoState(cwd);
+  const openPRs   = await detectOpenPRs(cwd);
+
+  const workspaceRows = [row(workspaceLine1)];
+  if (workspaceLine2) workspaceRows.push(row(workspaceLine2));
+  if (openPRs.length > 0) {
+    workspaceRows.push(row(`${openPRs.length} open PR${openPRs.length === 1 ? '' : 's'}`));
   }
 
-  // ── Observer observations (top 2, high priority first) ───────────────────
+  // ── Box 3 — Awareness: observer + roadmap + risk ──────────────────────────
+  let awarenessLine1 = '\x1b[2m💡\x1b[0m Ready to work';
+  let awarenessLine2 = '\x1b[2m📋 No roadmap yet\x1b[0m';
+  let awarenessLine3 = '\x1b[32m✓\x1b[0m No risk flags';
+
   let quickObservations = [];
   try {
     const observerMod = await import('../src/observer.mjs');
@@ -1724,64 +1745,39 @@ async function mainScreen(rl, ask) {
       const sorted = [...quickState.observations].sort(
         (a, b) => (PRIO[a.priority] ?? 2) - (PRIO[b.priority] ?? 2)
       );
-      quickObservations = sorted.slice(0, 2);
-      for (const obs of quickObservations) {
-        let prefix;
-        if (obs.priority === 'high')   prefix = '🔴';
-        else if (obs.priority === 'medium') prefix = '🟡';
-        else                                prefix = '\x1b[2m💡\x1b[0m';
-        statusRows.push(row(`${prefix} ${obs.message}`));
+      quickObservations = sorted.slice(0, 3);
+      const top = quickObservations[0];
+      if (top) {
+        const prefix = top.priority === 'high' ? '🔴' : top.priority === 'medium' ? '🟡' : '\x1b[2m💡\x1b[0m';
+        awarenessLine1 = `${prefix} ${top.message}`;
+      }
+      const hasHighRisk = quickObservations.some(o => o.priority === 'high');
+      if (hasHighRisk) {
+        awarenessLine3 = '\x1b[31m⚠\x1b[0m  Risk flags detected — run: dual-brain review';
       }
     }
-  } catch { /* non-fatal — module may not exist yet */ }
+  } catch { /* non-fatal — observer may not exist */ }
 
-  // ── Action cards (git state + open PRs) ──────────────────────────────────
-  const repoState  = detectRepoState(cwd);
-  const openPRs    = await detectOpenPRs(cwd);
-  const actionRows = buildActionRows(repoState, row, openPRs);
-
-  // ── High-priority observer action cards ───────────────────────────────────
-  if (quickObservations.some(o => o.priority === 'high')) {
-    const DIM   = '\x1b[2m';
-    const RESET = '\x1b[0m';
-    actionRows.push(row(`${DIM}[r] Security review  [t] Run tests  [c] Commit${RESET}`));
-  }
-
-  // ── Related sessions hint (only when no continuation card is showing) ─────
-  if (!interrupted && recentSessions.length > 0) {
-    try {
-      const { findRelatedSessions } = await import('../src/session.mjs');
-      const mostRecent = recentSessions[0];
-      // Build a pseudo-prompt from the most recent session's name/objective
-      const recentPrompt = mostRecent.name || '';
-      // Load session index to get files for the most recent session
-      const indexPath = join(cwd, '.dualbrain', 'session-index.json');
-      let recentFiles = [];
-      try {
-        const idx = JSON.parse(readFileSync(indexPath, 'utf8'));
-        recentFiles = idx[mostRecent.id]?.files || [];
-      } catch {}
-      const related = findRelatedSessions(recentPrompt, recentFiles, cwd);
-      if (related.length > 0) {
-        const relAgeLabel = (isoDate) => {
-          if (!isoDate) return '';
-          const diff  = Date.now() - Date.parse(isoDate);
-          const days  = Math.floor(diff / 86400000);
-          const hours = Math.floor(diff / 3600000);
-          if (days >= 1) return `${days}d`;
-          return `${hours}h ago`;
-        };
-        const relatedParts = related.slice(0, 2).map(r => {
-          const age = relAgeLabel(r.date);
-          return age ? `${r.smartName} (${age})` : r.smartName;
-        });
-        const DIM   = '\x1b[2m';
-        const RESET = '\x1b[0m';
-        actionRows.push(row(`${DIM}📎 Related: ${relatedParts.join(', ')}${RESET}`));
+  // Try roadmap file
+  try {
+    const roadmapPath = join(cwd, '.dual-brain', 'roadmap.md');
+    if (existsSync(roadmapPath)) {
+      const roadmapText = readFileSync(roadmapPath, 'utf8');
+      const lines = roadmapText.split('\n').filter(Boolean);
+      // Skip heading lines, grab first non-heading line
+      const firstItem = lines.find(l => !l.startsWith('#') && l.trim().length > 0);
+      if (firstItem) {
+        const clean = firstItem.replace(/^[-*>]+\s*/, '').trim().slice(0, 45);
+        awarenessLine2 = `\x1b[2m📋\x1b[0m ${clean}`;
       }
-    } catch { /* non-fatal */ }
-  }
-  // ── End related sessions hint ─────────────────────────────────────────────
+    }
+  } catch { /* non-fatal */ }
+
+  const awarenessRows = [
+    row(awarenessLine1),
+    row(awarenessLine2),
+    row(awarenessLine3),
+  ];
 
   // ── Sessions section ──────────────────────────────────────────────────────
   const sessionRows = [];
@@ -1837,23 +1833,28 @@ async function mainScreen(rl, ask) {
     });
   }
 
-  // ── Actions bar — navigation only (pipeline verbs are internal stages, not menu items) ─
-  const actionsContent = 'n New session  / Search  q Quit';
+  // ── Box 5 — Input bar ──────────────────────────────────────────────────
+  const actionsContent = '> type anything...   [s] settings  [/] search  [q] quit';
   const actionsRow     = row(actionsContent);
 
-  // ── Print the full box ────────────────────────────────────────────────────
-  // Include action cards between status and sessions (with separators only when non-empty)
-  const poweredByRow = row('\x1b[2mPowered by dual-brain\x1b[0m');
+  // ── Print the full 5-box layout ───────────────────────────────────────────
+  // Box 1: header (title + provider dots + work style)
+  // Box 2: workspace (branch · uncommitted · ahead, last commit, open PRs)
+  // Box 3: awareness (observer, roadmap, risk)
+  // Box 4: sessions
+  // Box 5: input bar
   const lines = [
     top,
-    ...statusRows,
-    ...(actionRows.length > 0 ? [sep, ...actionRows] : []),
+    row(`🧠 dual-brain v${version}`),
+    row(providerLine),
+    sep,
+    ...workspaceRows,
+    sep,
+    ...awarenessRows,
     sep,
     ...sessionRows,
     sep,
     actionsRow,
-    sep,
-    poweredByRow,
     bot,
   ];
   // ── Stale session hint ──────────────────────────────────────────────────
