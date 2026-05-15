@@ -135,3 +135,13 @@ For most tasks, prefer `dual-brain go "..."` — it runs the same detect→decid
 | `node .claude/hooks/health-check.mjs` | System health |
 | `node .claude/hooks/test-orchestrator.mjs` | Self-tests (40 tests) |
 | `node .claude/hooks/vibe-memory.mjs` | Persistent preferences across sessions |
+| `dual-brain search "..."` | Search across all previous sessions |
+
+## Cross-Session Context
+
+When the user references past work ("we did this before", "yesterday we worked on", "remember when we", "didn't we already fix"), use the session search to find relevant context:
+
+1. Run `dual-brain search "keyword"` to search the session index
+2. Or use the MCP tool `dual_brain_search` if available
+
+This surfaces previous conversations so HEAD can provide continuity across sessions without the user having to re-explain.

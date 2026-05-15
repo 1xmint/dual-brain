@@ -99,6 +99,34 @@ const TOOLS = [
       required: ['preference'],
     },
   },
+  {
+    name: 'dual_brain_search',
+    description: 'Search across all previous sessions for context. Use this when the user references past work ("we did this before", "yesterday we worked on", "remember when we", "didn\'t we already"). Returns matching sessions with prompts, topics, and files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search keywords to find in previous sessions. Can be topic, file name, or description of past work.',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'dual_brain_session_context',
+    description: 'Get detailed context from a specific previous session. Use after dual_brain_search to retrieve details about what happened in a found session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: {
+          type: 'string',
+          description: 'The session UUID to get context for (from search results).',
+        },
+      },
+      required: ['sessionId'],
+    },
+  },
 ];
 
 // ─── Tool handlers ────────────────────────────────────────────────────────────
@@ -217,6 +245,34 @@ async function handleRemember({ preference }) {
   };
 }
 
+async function handleSearch({ query }) {
+  const { searchSessions, buildSessionIndex } = await import(`${SRC}/session.mjs`);
+  const cwd = process.cwd();
+  try { buildSessionIndex(cwd); } catch {}
+  const results = searchSessions(query, cwd);
+  return {
+    count: results.length,
+    sessions: results.slice(0, 5).map(s => ({
+      id: s.id,
+      tool: s.tool,
+      date: s.date,
+      firstPrompt: s.prompts.first,
+      lastPrompt: s.prompts.last,
+      topics: s.topics.slice(0, 5),
+      files: s.files.slice(0, 10),
+      messageCount: s.messageCount,
+    })),
+  };
+}
+
+async function handleSessionContext({ sessionId }) {
+  const { getSessionContext } = await import(`${SRC}/session.mjs`);
+  const cwd = process.cwd();
+  const ctx = getSessionContext(sessionId, cwd);
+  if (!ctx) return { error: 'Session not found' };
+  return ctx;
+}
+
 // ─── JSON-RPC dispatcher ──────────────────────────────────────────────────────
 
 async function dispatchTool(name, args) {
@@ -225,6 +281,8 @@ async function dispatchTool(name, args) {
     case 'dual_brain_decide':  return handleDecide(args);
     case 'dual_brain_status':  return handleStatus();
     case 'dual_brain_remember': return handleRemember(args);
+    case 'dual_brain_search':   return handleSearch(args);
+    case 'dual_brain_session_context': return handleSessionContext(args);
     default:
       throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32601 });
   }
