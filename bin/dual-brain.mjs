@@ -902,6 +902,27 @@ async function cmdStatus(args = []) {
     console.log('  unknown (could not read .claude/settings.json)');
   }
 
+  // Replit section
+  try {
+    const replit = await import('../src/replit.mjs');
+    const env = replit.detectReplitEnvironment(cwd);
+    if (env.isReplit) {
+      console.log('\nReplit:');
+      const tools = replit.inspectReplitTools(cwd);
+      const verStr = tools.version ? `v${tools.version}` : 'unknown';
+      const capsCount = Array.isArray(tools.capabilities) ? tools.capabilities.length : 0;
+      console.log(`  replit-tools  : ${tools.installed ? `${verStr} (${capsCount} capabilities)` : 'not installed'}`);
+      const authStatus = replit.getAuthStatus(cwd);
+      console.log(`  auth          : ${authStatus.authenticated ? 'authenticated' : 'not authenticated'}${authStatus.method ? ` (${authStatus.method})` : ''}`);
+      const archive = replit.getSessionArchive(cwd);
+      const archiveCount = Array.isArray(archive) ? archive.length : (archive?.count ?? 0);
+      console.log(`  session archive: ${archiveCount} session${archiveCount !== 1 ? 's' : ''}`);
+      const openaiPresent  = replit.hasSecret('OPENAI_API_KEY');
+      const anthropicPresent = replit.hasSecret('ANTHROPIC_API_KEY');
+      console.log(`  secrets       : OPENAI_API_KEY=${openaiPresent ? 'set' : 'unset'}  ANTHROPIC_API_KEY=${anthropicPresent ? 'set' : 'unset'}`);
+    }
+  } catch { /* replit.mjs not available or not in Replit — skip silently */ }
+
   // Update check
   try {
     const localVer  = readVersion();
@@ -1647,6 +1668,141 @@ function makeBoxRow(content, W) {
   return `│ ${content}${' '.repeat(padding)} │`;
 }
 
+// ─── Command palette: input classifier ───────────────────────────────────────
+
+/**
+ * Classify user input into one of three tiers:
+ *   { tier: 'free', command, args }   — deterministic, zero tokens
+ *   { tier: 'cheap' }                 — question → haiku
+ *   { tier: 'full' }                  — work task → confirm then dispatch
+ */
+function classifyInput(input) {
+  const trimmed = input.trim();
+  const lower   = trimmed.toLowerCase();
+  const parts   = trimmed.split(/\s+/);
+  const cmd     = parts[0].toLowerCase();
+  const args    = parts.slice(1);
+
+  // Tier 1: FREE — exact command matches
+  const FREE_COMMANDS = new Map([
+    ['resume', 'resume'],
+    ['r',      'resume'],
+    ['status', 'status'],
+    ['sessions', 'sessions'],
+    ['ss',     'sessions'],
+    ['settings', 'settings'],
+    ['s',      'settings'],
+    ['team',   'team'],
+    ['t',      'team'],
+    ['doctor', 'doctor'],
+    ['d',      'doctor'],
+    ['health', 'health'],
+    ['h',      'health'],
+    ['projects', 'projects'],
+    ['p',      'projects'],
+    ['help',   'help'],
+    ['?',      'help'],
+    ['quit',   'quit'],
+    ['q',      'quit'],
+    ['exit',   'quit'],
+    ['budget', 'budget'],
+    ['b',      'budget'],
+  ]);
+
+  if (FREE_COMMANDS.has(cmd)) {
+    return { tier: 'free', command: FREE_COMMANDS.get(cmd), args };
+  }
+
+  // Multi-word free commands
+  if (lower.startsWith('search ')) {
+    return { tier: 'free', command: 'search', args: parts.slice(1) };
+  }
+  if (lower === 'init --replit') {
+    return { tier: 'free', command: 'init --replit', args: [] };
+  }
+
+  // Tier 2: CHEAP — question / diagnostic patterns → haiku
+  const QUESTION_WORDS = /^(why|what|how|where|when|who|is my|check|show me|explain|tell me|list|am i|are there|does|did|can i|will|should i)/i;
+  const QUESTION_CONTAINS = /\b(why|what|how is|how are|where is|where are|explain|tell me|show me)\b/i;
+  if (QUESTION_WORDS.test(lower) || QUESTION_CONTAINS.test(lower)) {
+    return { tier: 'cheap' };
+  }
+
+  // Tier 3: FULL — everything else is a work task
+  return { tier: 'full' };
+}
+
+// ─── Dashboard: resume state detection ───────────────────────────────────────
+
+/**
+ * Detect resumable state for dashboard contextual hint.
+ * Returns an object with type ('resumable' | 'fresh' | 'none') and detail fields.
+ * All checks are best-effort and fail silent.
+ */
+async function detectResumeState(cwd) {
+  const result = { type: 'none', label: null, ageLabel: null, nextAction: null };
+
+  // Check for recent receipt (< 24h)
+  try {
+    const { getLatestReceipt } = await import('../src/receipt.mjs');
+    const receipt = getLatestReceipt(cwd);
+    if (receipt) {
+      const ageMs = Date.now() - Date.parse(receipt.timestamp);
+      if (ageMs < 24 * 60 * 60 * 1000) {
+        const mins  = Math.round(ageMs / 60000);
+        const age   = mins < 60
+          ? `${mins}m ago`
+          : mins < 1440
+            ? `${Math.round(mins / 60)}h ago`
+            : `${Math.round(mins / 1440)}d ago`;
+        const fileCount = (receipt.filesChanged || []).length;
+        const filePart  = fileCount > 0 ? ` · ${fileCount} file${fileCount !== 1 ? 's' : ''}` : '';
+        result.type       = 'resumable';
+        result.label      = (receipt.goal || 'last session').slice(0, 40);
+        result.ageLabel   = age;
+        result.filePart   = filePart;
+        result.nextAction = (receipt.nextAction || '').slice(0, 35);
+        return result;
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  // Check for open tasks in ledger
+  try {
+    const { getOpenTasks } = await import('../src/ledger.mjs');
+    const open = getOpenTasks(cwd);
+    if (open.length > 0) {
+      result.type       = 'resumable';
+      result.label      = (open[0].intent || 'open task').slice(0, 40);
+      result.ageLabel   = null;
+      result.filePart   = '';
+      result.nextAction = `${open.length} open task${open.length !== 1 ? 's' : ''}`;
+      return result;
+    }
+  } catch { /* non-fatal */ }
+
+  // Check if this is a fresh project (package.json but no dual-brain history)
+  try {
+    const { existsSync: exists } = await import('node:fs');
+    const { join: pjoin } = await import('node:path');
+    const hasPkg = exists(pjoin(cwd, 'package.json'));
+    const hasHistory = exists(pjoin(cwd, '.dual-brain', 'receipts'));
+    if (hasPkg && !hasHistory) {
+      let pkgName = 'this project';
+      try {
+        const { readFileSync: rfs } = await import('node:fs');
+        const pkg = JSON.parse(rfs(pjoin(cwd, 'package.json'), 'utf8'));
+        if (pkg.name) pkgName = pkg.name;
+      } catch {}
+      result.type  = 'fresh';
+      result.label = pkgName;
+      return result;
+    }
+  } catch { /* non-fatal */ }
+
+  return result;
+}
+
 // ─── Screen: mainScreen ───────────────────────────────────────────────────────
 
 async function mainScreen(rl, ask) {
@@ -1957,10 +2113,31 @@ async function mainScreen(rl, ask) {
     }
   } catch { /* non-fatal */ }
 
+  // Replit awareness rows (shown only when running in Replit, max 2-3 lines)
+  const replitAwarenessRows = [];
+  try {
+    const replitMod = await import('../src/replit.mjs');
+    const replitEnv = replitMod.detectReplitEnvironment(cwd);
+    if (replitEnv.isReplit) {
+      const rtInfo    = replitMod.inspectReplitTools(cwd);
+      const authInfo  = replitMod.getAuthStatus(cwd);
+      const archive   = replitMod.getSessionArchive(cwd);
+      const archCount = Array.isArray(archive) ? archive.length : (archive?.totalSessions ?? archive?.count ?? 0);
+      const secretNames = replitMod.listSecretNames();
+      const secretCount = Array.isArray(secretNames) ? secretNames.length : 0;
+      const verStr = rtInfo.version ? `v${rtInfo.version}` : (rtInfo.installed ? 'installed' : 'not installed');
+      const isAuthenticated = authInfo.authenticated ?? (authInfo.available && authInfo.tokenStatus === 'valid');
+      const authStr = isAuthenticated ? '\x1b[32m✓\x1b[0m auth' : '\x1b[2mno auth\x1b[0m';
+      replitAwarenessRows.push(row(`\x1b[2m🔧\x1b[0m Replit  replit-tools ${verStr}  ${authStr}`));
+      replitAwarenessRows.push(row(`\x1b[2m   \x1b[0m ${archCount} archived session${archCount !== 1 ? 's' : ''}  ${secretCount} secret${secretCount !== 1 ? 's' : ''}`));
+    }
+  } catch { /* replit.mjs not available — skip */ }
+
   const awarenessRows = [
     row(awarenessLine1),
     row(awarenessLine2),
     row(awarenessLine3),
+    ...replitAwarenessRows,
   ];
 
   // ── Sessions section ──────────────────────────────────────────────────────
@@ -2017,16 +2194,41 @@ async function mainScreen(rl, ask) {
     });
   }
 
+  // ── Resume state detection ────────────────────────────────────────────────
+  let resumeStateRows = [];
+  const resumeState = await detectResumeState(cwd);
+  if (resumeState.type === 'resumable') {
+    const DIM   = '\x1b[2m';
+    const RESET = '\x1b[0m';
+    const CYAN  = '\x1b[36m';
+    const labelTrunc = resumeState.label || 'last session';
+    const agePart    = resumeState.ageLabel ? ` (${resumeState.ageLabel})` : '';
+    const filePart   = resumeState.filePart || '';
+    const nextPart   = resumeState.nextAction ? ` · next: ${resumeState.nextAction}` : '';
+    resumeStateRows = [
+      row(`${CYAN}Last:${RESET} "${labelTrunc}"${agePart}${filePart}${nextPart}`),
+      row(`${DIM}[Enter] resume  [n] new  [?] help${RESET}`),
+    ];
+  } else if (resumeState.type === 'fresh' && recentSessions.length === 0) {
+    const DIM   = '\x1b[2m';
+    const RESET = '\x1b[0m';
+    resumeStateRows = [
+      row(`New project: ${resumeState.label}`),
+      row(`${DIM}Type what you want to do  [?] help${RESET}`),
+    ];
+  }
+
   // ── Box 5 — Input bar ──────────────────────────────────────────────────
-  const actionsContent = '> type anything...   [s] settings  [t] team  [q] quit';
+  const actionsContent = '> task or command...   [?] help  [q] quit';
   const actionsRow     = row(actionsContent);
 
   // ── Print the full 5-box layout ───────────────────────────────────────────
   // Box 1: header (title + provider dots + work style)
   // Box 2: workspace (branch · uncommitted · ahead, last commit, open PRs)
   // Box 3: awareness (observer, roadmap, risk)
-  // Box 4: sessions
+  // Box 4: sessions (+ resume state hint if applicable)
   // Box 5: input bar
+  const hasResumeHint = resumeStateRows.length > 0;
   const lines = [
     top,
     row(`🧠 dual-brain v${version}`),
@@ -2037,6 +2239,7 @@ async function mainScreen(rl, ask) {
     ...awarenessRows,
     sep,
     ...sessionRows,
+    ...(hasResumeHint ? [sep, ...resumeStateRows] : []),
     sep,
     actionsRow,
     bot,
@@ -2136,7 +2339,7 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        const singleKeySet = new Set(['n', 's', 't', 'q', '/', 'i']);
+        const singleKeySet = new Set(['n', 's', 't', 'q', '/', 'i', '?', 'h', 'd']);
         if (singleKeySet.has(lower)) {
           cleanup();
           process.stdout.write('\n');
@@ -2162,14 +2365,123 @@ async function mainScreen(rl, ask) {
 
   const choice = typeof raw === 'string' ? raw.toLowerCase() : '';
 
-  // Typed task → dispatch as "dual-brain go"
+  // ── Typed input — run through command palette ─────────────────────────────
   if (raw.startsWith('__task__:')) {
-    const prompt = raw.slice('__task__:'.length).trim();
-    if (prompt) {
-      return { next: 'go', prompt };
+    const input = raw.slice('__task__:'.length).trim();
+    if (!input) return { next: 'main' };
+
+    const classified = classifyInput(input);
+
+    // Tier 1: FREE — deterministic, zero tokens
+    if (classified.tier === 'free') {
+      const cmd  = classified.command;
+      const args = classified.args;
+
+      if (cmd === 'resume' || cmd === 'r') {
+        if (recentSessions.length === 0) return { next: 'new-session' };
+        return { next: 'sessions' };
+      }
+      if (cmd === 'status' || cmd === 's') {
+        await cmdStatus([]);
+        await ask('\n  Press Enter to continue...');
+        return { next: 'main' };
+      }
+      if (cmd === 'sessions' || cmd === 'ss') {
+        return { next: 'sessions' };
+      }
+      if (cmd === 'settings') {
+        return { next: 'settings' };
+      }
+      if (cmd === 'team' || cmd === 't') {
+        return { next: 'team' };
+      }
+      if (cmd === 'doctor' || cmd === 'd') {
+        return { next: 'diagnostics' };
+      }
+      if (cmd === 'health' || cmd === 'h') {
+        const hooksDir  = join(cwd, '.claude', 'hooks');
+        const healthScript = join(hooksDir, 'health-check.mjs');
+        const { spawnSync: sp } = await import('node:child_process');
+        if (existsSync(healthScript)) {
+          sp('node', [healthScript], { stdio: 'inherit', cwd });
+        } else {
+          process.stdout.write('\n  health-check.mjs not found — run: dual-brain install\n');
+        }
+        await ask('\n  Press Enter to continue...');
+        return { next: 'main' };
+      }
+      if (cmd === 'help' || cmd === '?') {
+        return { next: 'palette-help' };
+      }
+      if (cmd === 'quit' || cmd === 'q') {
+        return { next: 'exit' };
+      }
+      if (cmd === 'search') {
+        const query = args.join(' ');
+        if (!query) {
+          const q2 = (await ask('  Search: ')).trim();
+          if (!q2) return { next: 'main' };
+          args.push(q2);
+        }
+        const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
+        try { buildSessionIndex(cwd); } catch {}
+        const results = searchSessions(args.join(' '), cwd);
+        if (results.length === 0) {
+          process.stdout.write(`\n  No sessions matching "${args.join(' ')}"\n\n`);
+          await ask('  Press Enter to continue...');
+          return { next: 'main' };
+        }
+        process.stdout.write(`\n  Found ${results.length} session${results.length === 1 ? '' : 's'}:\n`);
+        results.slice(0, 9).forEach((sess, i) => {
+          const tool   = sess.tool === 'codex' ? 'cdx' : 'cld';
+          const date   = sess.date ? new Date(sess.date).toLocaleDateString() : '?';
+          process.stdout.write(`  [${i + 1}] ${tool}  ${date}  ${sess.prompts.first || sess.id.slice(0, 8)}\n`);
+        });
+        process.stdout.write('\n');
+        const pick = (await ask('  Enter number to resume (or Enter to cancel): ')).trim();
+        const num  = parseInt(pick, 10);
+        if (!isNaN(num) && num >= 1 && num <= Math.min(results.length, 9)) {
+          const sess = results[num - 1];
+          const { spawnSync: sp2 } = await import('node:child_process');
+          const tool = sess.tool === 'codex' ? 'codex' : 'claude';
+          process.stdout.write(`\n  Launching: ${tool} --resume ${sess.id}\n\n`);
+          sp2(tool, ['--resume', sess.id], { stdio: 'inherit' });
+        }
+        return { next: 'main' };
+      }
+      if (cmd === 'budget') {
+        await cmdStatus([]);
+        await ask('\n  Press Enter to continue...');
+        return { next: 'main' };
+      }
+      if (cmd === 'init --replit') {
+        await cmdInit(rl);
+        return { next: 'main' };
+      }
+      // fallthrough: unknown free command → treat as full task
     }
-    return { next: 'main' };
+
+    // Tier 2: CHEAP — question/diagnostic, route to haiku
+    if (classified.tier === 'cheap') {
+      process.stdout.write(`\n  Routing to haiku for quick answer...\n`);
+      return { next: 'go', prompt: input, model: 'haiku' };
+    }
+
+    // Tier 3: FULL — work task, confirm before dispatching
+    if (classified.tier === 'full') {
+      const summary = input.length > 60 ? input.slice(0, 57) + '...' : input;
+      process.stdout.write(`\n  Launch coding session: ${summary}\n`);
+      process.stdout.write(`  Model: sonnet  [Enter] to proceed, [n] to cancel\n\n`);
+      const confirm = (await ask('  > ')).trim().toLowerCase();
+      if (confirm === 'n' || confirm === 'no') return { next: 'main' };
+      return { next: 'go', prompt: input };
+    }
+
+    // Default fallback
+    return { next: 'go', prompt: input };
   }
+
+  // ── Single-key shortcuts ───────────────────────────────────────────────────
 
   // Enter (empty) → resume most recent session
   if (raw === '' || choice === '\r') {
@@ -2184,7 +2496,7 @@ async function mainScreen(rl, ask) {
     return { next: 'main' };
   }
 
-  // Number 1-3 → resume that session
+  // Number 1-9 → resume that session
   const numChoice = parseInt(raw, 10);
   if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= recentSessions.length) {
     const sess = recentSessions[numChoice - 1];
@@ -2204,6 +2516,8 @@ async function mainScreen(rl, ask) {
   }
 
   if (choice === 'n') { return { next: 'new-session' }; }
+  if (choice === '?' || choice === 'h') { return { next: 'palette-help' }; }
+  if (choice === 'd') { return { next: 'diagnostics' }; }
 
   if (choice === '/') {
     const query = (await ask('  Search: ')).trim();
@@ -2259,6 +2573,48 @@ async function newSessionScreen(rl, ask) {
   // All work routes through pipeline — detect → decide → dispatch with mandatory gates.
   await cmdGo([input], { cwd });
 
+  return { next: 'main' };
+}
+
+// ─── Screen: paletteHelpScreen ───────────────────────────────────────────────
+
+async function paletteHelpScreen(rl, ask) {
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 60);
+  const W     = boxW - 4;
+  const top   = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep   = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot   = `└${'─'.repeat(boxW - 2)}┘`;
+  const row   = (content) => makeBoxRow(content, W);
+  const DIM   = '\x1b[2m';
+  const RESET = '\x1b[0m';
+
+  const lines = [
+    top,
+    row('Command Palette'),
+    sep,
+    row(`${DIM}resume  r${RESET}        Resume last session`),
+    row(`${DIM}status${RESET}           Provider health + budget`),
+    row(`${DIM}sessions  ss${RESET}     List recent sessions`),
+    row(`${DIM}search <query>${RESET}   Search session history`),
+    row(`${DIM}budget  b${RESET}        Token usage + routing`),
+    row(`${DIM}health  h${RESET}        System health check`),
+    row(`${DIM}doctor  d${RESET}        Repo diagnostics`),
+    row(`${DIM}settings  s${RESET}      Settings screen`),
+    row(`${DIM}team  t${RESET}          Team screen`),
+    row(`${DIM}help  ?${RESET}          Show this help`),
+    row(`${DIM}quit  q${RESET}          Exit`),
+    sep,
+    row('Or type any task to launch a coding session'),
+    row(`${DIM}Questions (why/how/what) → haiku (cheap)${RESET}`),
+    row(`${DIM}Work tasks → confirm then dispatch${RESET}`),
+    sep,
+    row(`${DIM}[Enter] go back${RESET}`),
+    bot,
+  ];
+
+  process.stdout.write('\n' + lines.join('\n') + '\n\n');
+  await ask('');
   return { next: 'main' };
 }
 
@@ -4435,6 +4791,7 @@ const SCREENS = {
   welcome:          welcomeScreen,
   main:             mainScreen,
   'new-session':    newSessionScreen,
+  'palette-help':   paletteHelpScreen,
   settings:         settingsScreen,
   team:             teamScreen,
   'import-picker':  importPickerScreen,
@@ -4461,7 +4818,21 @@ async function runScreens(startScreen = 'dashboard') {
     if (current === 'go' && ctx.prompt) {
       const prompt = ctx.prompt;
       const dryRun = ctx.dryRun || false;
-      await cmdGo([prompt], { dryRun });
+      // Haiku tier: dispatch with model override for cheap question answers
+      if (ctx.model === 'haiku') {
+        process.stdout.write('\n');
+        try {
+          const { runPipeline: rp } = await import('../src/pipeline.mjs');
+          const { result } = await rp('go', prompt, { cwd: process.cwd(), dryRun, forceDepth: 'shallow' });
+          if (result?.output) process.stdout.write('\n' + String(result.output).trim() + '\n\n');
+          else process.stdout.write('  (no output)\n\n');
+        } catch (e) {
+          // Fall back to normal dispatch on error
+          await cmdGo([prompt], { dryRun });
+        }
+      } else {
+        await cmdGo([prompt], { dryRun });
+      }
       current = 'main';
       ctx = {};
       continue;
@@ -4474,7 +4845,7 @@ async function runScreens(startScreen = 'dashboard') {
       current = result?.next || 'exit';
       // Pass through context (e.g. selected session, typed prompt, openPRs) to next screen
       ctx = result?.session   ? { session: result.session }
-          : result?.prompt    ? { prompt: result.prompt }
+          : result?.prompt    ? { prompt: result.prompt, model: result.model }
           : result?.openPRs   ? { openPRs: result.openPRs }
           : {};
     } catch (e) {
@@ -5001,6 +5372,21 @@ async function main() {
   }
 
   if (cmd === 'init') {
+    // init --replit: run Replit-specific integration setup
+    if (args.includes('--replit')) {
+      const cwd = process.cwd();
+      const dryRun = args.includes('--dry-run');
+      try {
+        const replit = await import('../src/replit.mjs');
+        const report = await replit.initReplitIntegration({ dryRun, cwd });
+        console.log(replit.formatReplitReport(report));
+      } catch (e) {
+        console.error('replit.mjs not available yet — skipping Replit init');
+        if (process.env.DEBUG) console.error(e.message);
+      }
+      return;
+    }
+
     if (isInteractive) {
       // Run onboarding wizard then main screen
       const cwd = process.cwd();

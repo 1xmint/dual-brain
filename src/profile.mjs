@@ -818,6 +818,282 @@ function listSubscriptions(cwd) {
 // CLI
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Capability Manifest — single runtime view of all provider/subscription state
+// ---------------------------------------------------------------------------
+
+/** 60-second in-process cache for the manifest. */
+let _manifestCache = null;
+let _manifestCachedAt = 0;
+const MANIFEST_TTL_MS = 60_000;
+
+/**
+ * Build a normalized capability manifest that consolidates provider health,
+ * subscription config, user preferences, policy, and learning data.
+ *
+ * @param {string} [cwd]
+ * @returns {Promise<object>}
+ */
+export async function getCapabilityManifest(cwd = process.cwd()) {
+  const now = Date.now();
+  if (_manifestCache && now - _manifestCachedAt < MANIFEST_TTL_MS) {
+    return _manifestCache;
+  }
+
+  // ── Read orchestrator.json for subscription config ─────────────────────
+  let orchConfig = {};
+  try {
+    const orchPath = join(cwd, 'orchestrator.json');
+    orchConfig = JSON.parse(readFileSync(orchPath, 'utf8'));
+  } catch { /* missing or malformed — fall through */ }
+
+  const orchSubs   = orchConfig.subscriptions ?? {};
+  const orchProv   = orchConfig.providers     ?? {};
+
+  // ── Plan normalizer (orchestrator.json uses "$100", "max-5x", "pro" etc) ─
+  function normalizePlan(raw) {
+    if (!raw) return 'unknown';
+    const s = String(raw).toLowerCase();
+    if (s.includes('max') && s.includes('20')) return 'max20';
+    if (s.includes('max') && (s.includes('5') || s.includes('5x'))) return 'max5';
+    if (s.includes('pro')) return 'pro';
+    if (s.includes('plus')) return 'plus';
+    if (s === '$20' || s === '20') return 'pro';
+    if (s === '$100' || s === '100') return 'max5';
+    if (s === '$200' || s === '200') return 'max20';
+    return 'unknown';
+  }
+
+  // ── Health states ──────────────────────────────────────────────────────
+  let healthStates = {};
+  try {
+    const { getHealth } = await import('./health.mjs');
+    healthStates = getHealth(cwd).states ?? {};
+  } catch { /* health.mjs unavailable */ }
+
+  function deriveHealth(providerKey) {
+    // Aggregate across all model classes for the provider
+    const entries = Object.entries(healthStates)
+      .filter(([k]) => k.startsWith(providerKey + ':'))
+      .map(([, v]) => v?.status ?? 'healthy');
+    if (entries.length === 0) return 'healthy';
+    if (entries.some(s => s === 'hot'))      return 'rate-limited';
+    if (entries.some(s => s === 'degraded')) return 'degraded';
+    if (entries.some(s => s === 'probing'))  return 'degraded';
+    return 'healthy';
+  }
+
+  // ── Budget pressure from health file (simple proxy) ────────────────────
+  function deriveBudget(providerKey) {
+    const hotEntries = Object.entries(healthStates)
+      .filter(([k]) => k.startsWith(providerKey + ':'))
+      .filter(([, v]) => v?.status === 'hot');
+    if (hotEntries.length === 0) return { pressure5h: 0, pressure7d: 0 };
+    // Clamp to 0.9 when hot — we don't have real token data here
+    const pressure = Math.min(0.9, 0.5 + hotEntries.length * 0.15);
+    return { pressure5h: pressure, pressure7d: pressure * 0.6 };
+  }
+
+  // ── Claude provider ────────────────────────────────────────────────────
+  const claudeProvider = { available: false, authenticated: false, plan: 'unknown',
+    models: ['opus', 'sonnet', 'haiku'], health: 'healthy',
+    budget: { pressure5h: 0, pressure7d: 0 }, source: 'none' };
+
+  try {
+    // available: claude CLI or CLAUDE_CODE env or replit-tools claude dir
+    const claudeDir       = join(homedir(), '.claude');
+    const replitClaudeDir = join(cwd, '.replit-tools', '.claude-persistent');
+    if (process.env.CLAUDE_CODE || process.env.ANTHROPIC_API_KEY) {
+      claudeProvider.available = true;
+      claudeProvider.source    = process.env.ANTHROPIC_API_KEY ? 'env' : 'credentials';
+    } else if (existsSync(claudeDir) || existsSync(replitClaudeDir)) {
+      claudeProvider.available = true;
+      claudeProvider.source    = existsSync(replitClaudeDir) ? 'replit-tools' : 'credentials';
+    } else {
+      try { execSync('which claude', { stdio: 'pipe', timeout: 2000 }); claudeProvider.available = true; claudeProvider.source = 'credentials'; } catch { /* not found */ }
+    }
+
+    // authenticated: use getAuthHealthStatus
+    const { getAuthHealthStatus } = await import('./health.mjs');
+    const authStatus = await getAuthHealthStatus(cwd);
+    claudeProvider.authenticated = authStatus.ok;
+    if (authStatus.source === 'replit-tools') claudeProvider.source = 'replit-tools';
+  } catch { /* getAuthHealthStatus unavailable */ }
+
+  claudeProvider.plan   = normalizePlan(orchProv.claude?.subscription ?? orchSubs.claude?.plan);
+  claudeProvider.health = claudeProvider.authenticated ? deriveHealth('claude') : 'down';
+  claudeProvider.budget = deriveBudget('claude');
+
+  // ── OpenAI provider ────────────────────────────────────────────────────
+  const openaiProvider = { available: false, authenticated: false, plan: 'unknown',
+    models: ['gpt-5.5', 'o3', 'gpt-4o', 'gpt-4o-mini'], health: 'healthy',
+    budget: { pressure5h: 0, pressure7d: 0 }, source: 'none' };
+
+  try {
+    let hasSecret = false;
+    try { const { hasSecret: hs } = await import('./replit.mjs'); hasSecret = hs('OPENAI_API_KEY'); } catch { hasSecret = !!(process.env.OPENAI_API_KEY); }
+
+    let codexAvailable = false;
+    try { execSync('which codex', { stdio: 'pipe', timeout: 2000 }); codexAvailable = true; } catch { /* not in PATH */ }
+
+    openaiProvider.available      = hasSecret || codexAvailable;
+    openaiProvider.authenticated  = hasSecret;
+    openaiProvider.source         = hasSecret ? 'env' : codexAvailable ? 'codex-config' : 'none';
+  } catch { /* detection failed */ }
+
+  openaiProvider.plan   = normalizePlan(orchProv.openai?.subscription ?? orchSubs.openai?.plan);
+  openaiProvider.health = openaiProvider.authenticated ? deriveHealth('openai') : 'down';
+  openaiProvider.budget = deriveBudget('openai');
+
+  // ── Preferences ────────────────────────────────────────────────────────
+  let preferences = { bias: 'auto', forbiddenModels: [], preferredModels: [],
+    costBias: 0.5, confirmBeforeExpensive: false };
+  try {
+    const profile = loadProfile(cwd);
+    const bias = profile.bias ?? profile.workStyle ?? 'auto';
+    preferences.bias = ['auto','balanced','cost-saver','quality-first'].includes(bias) ? bias : 'auto';
+    preferences.forbiddenModels    = profile.forbiddenModels  ?? [];
+    preferences.preferredModels    = profile.preferredModels  ?? [];
+    preferences.costBias           = profile.costBias         ?? (bias === 'cost-saver' ? 0.8 : bias === 'quality-first' ? 0.1 : 0.5);
+    preferences.confirmBeforeExpensive = profile.apiGuardrail ?? false;
+  } catch { /* profile unavailable */ }
+
+  // ── Policy ─────────────────────────────────────────────────────────────
+  const policy = {
+    highRiskRequiresBestAvailable: true,
+    failoverMode: 'tell',
+    dualBrainThreshold: 'high',
+  };
+
+  // ── Learning ───────────────────────────────────────────────────────────
+  let learning = {};
+  try {
+    const { getModelSuccessRates } = await import('./doctor.mjs');
+    learning = getModelSuccessRates(cwd);
+  } catch { /* doctor.mjs unavailable */ }
+
+  // ── Setup summary ──────────────────────────────────────────────────────
+  const hasAnyProvider = (claudeProvider.available && claudeProvider.authenticated) ||
+                         (openaiProvider.available && openaiProvider.authenticated);
+
+  let recommendedAction = null;
+  if (!claudeProvider.available && !openaiProvider.available) {
+    recommendedAction = 'connect-claude';
+  } else if (!claudeProvider.authenticated && !openaiProvider.authenticated) {
+    recommendedAction = 'refresh-auth';
+  } else if (!openaiProvider.available) {
+    recommendedAction = 'connect-openai';
+  }
+
+  const manifest = {
+    providers: { claude: claudeProvider, openai: openaiProvider },
+    preferences,
+    policy,
+    learning,
+    setup: {
+      hasAnyProvider,
+      recommendedAction,
+      zeroProviderMode: !hasAnyProvider,
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  _manifestCache    = manifest;
+  _manifestCachedAt = now;
+  return manifest;
+}
+
+/**
+ * Compute the effective routing policy for a specific task, applying rules in order:
+ * 1. Safety constraints (high-risk → best available model)
+ * 2. Provider availability
+ * 3. Task tier fit (search→haiku, execute→sonnet, think→opus)
+ * 4. User preferences (cost bias, forbidden models)
+ * 5. Learning (prefer models with ≥90% success rate for this task type)
+ *
+ * @param {object} manifest — from getCapabilityManifest()
+ * @param {{ tier?: string, risk?: string, taskType?: string }} taskContext
+ * @returns {{ provider: string, model: string, tier: string, reason: string, overrides: string[] }}
+ */
+export function getEffectivePolicy(manifest, taskContext = {}) {
+  const { providers, preferences, policy, learning } = manifest;
+  const tier     = taskContext.tier     ?? 'execute';
+  const risk     = taskContext.risk     ?? 'medium';
+  const taskType = taskContext.taskType ?? 'general';
+  const overrides = [];
+
+  // Tier → default model mapping
+  const tierModelMap = { search: 'haiku', execute: 'sonnet', think: 'opus' };
+  let preferredModel    = tierModelMap[tier] ?? 'sonnet';
+  let preferredProvider = 'claude';
+
+  // 1. Safety: high/critical risk → best available model
+  if (policy.highRiskRequiresBestAvailable && (risk === 'high' || risk === 'critical')) {
+    preferredModel = 'opus';
+    overrides.push(`risk=${risk} → upgraded to opus`);
+  }
+
+  // 2. Provider availability — fall back to openai if claude is down
+  const claudeOk = providers.claude.available && providers.claude.authenticated &&
+                   providers.claude.health !== 'down';
+  const openaiOk = providers.openai.available && providers.openai.authenticated &&
+                   providers.openai.health !== 'down';
+
+  if (!claudeOk && openaiOk) {
+    preferredProvider = 'openai';
+    // Remap model names for openai
+    const openaiTierMap = { search: 'gpt-4o-mini', execute: 'gpt-4o', think: 'gpt-5.5' };
+    preferredModel = risk === 'high' || risk === 'critical' ? 'gpt-5.5' : (openaiTierMap[tier] ?? 'gpt-4o');
+    overrides.push('claude unavailable → routed to openai');
+  } else if (!claudeOk && !openaiOk) {
+    return { provider: 'none', model: 'none', tier, reason: 'no providers available', overrides };
+  }
+
+  // 3. Task fit already applied via tierModelMap above
+
+  // 4. User preferences: forbidden models, cost bias
+  const forbidden = preferences.forbiddenModels ?? [];
+  if (forbidden.includes(preferredModel)) {
+    // Downgrade one step
+    const fallback = preferredProvider === 'claude'
+      ? (preferredModel === 'opus' ? 'sonnet' : 'haiku')
+      : (preferredModel === 'gpt-5.5' ? 'gpt-4o' : 'gpt-4o-mini');
+    overrides.push(`${preferredModel} forbidden → downgraded to ${fallback}`);
+    preferredModel = fallback;
+  }
+
+  if (preferences.costBias > 0.7 && preferredModel === 'opus' && risk !== 'high' && risk !== 'critical') {
+    preferredModel = 'sonnet';
+    overrides.push('cost-bias > 0.7 → downgraded from opus to sonnet');
+  }
+
+  // 5. Learning: if another model has ≥90% success for this task type, prefer it
+  const successRates = learning ?? {};
+  let bestLearnedModel = null;
+  let bestRate = 0.9; // threshold
+  for (const [model, stats] of Object.entries(successRates)) {
+    if (stats.rate >= bestRate && stats.total >= 5 && !forbidden.includes(model)) {
+      // Only prefer if it's on the right provider
+      const isClaudeModel = ['opus', 'sonnet', 'haiku'].includes(model);
+      if ((preferredProvider === 'claude' && isClaudeModel) ||
+          (preferredProvider === 'openai' && !isClaudeModel)) {
+        bestLearnedModel = model;
+        bestRate = stats.rate;
+      }
+    }
+  }
+  if (bestLearnedModel && bestLearnedModel !== preferredModel) {
+    overrides.push(`learning: ${bestLearnedModel} has ${Math.round(bestRate * 100)}% success → preferred`);
+    preferredModel = bestLearnedModel;
+  }
+
+  const reason = overrides.length > 0
+    ? overrides[0]
+    : `tier=${tier} → ${preferredProvider}/${preferredModel}`;
+
+  return { provider: preferredProvider, model: preferredModel, tier, reason, overrides };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const cwd  = process.cwd();
