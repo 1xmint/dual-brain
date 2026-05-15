@@ -36,6 +36,24 @@ import { loadSession, saveSession, formatSessionCard, importReplitSessions, getS
 
 import { box, bar, badge, menu, separator } from '../src/tui.mjs';
 
+// ─── Dynamic imports for receipts + failure memory ───────────────────────────
+
+let _receipt = null;
+async function getReceipt() {
+  if (!_receipt) {
+    try { _receipt = await import('../src/receipt.mjs'); } catch { _receipt = {}; }
+  }
+  return _receipt;
+}
+
+let _failureMem = null;
+async function getFailureMem() {
+  if (!_failureMem) {
+    try { _failureMem = await import('../src/failure-memory.mjs'); } catch { _failureMem = {}; }
+  }
+  return _failureMem;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -158,20 +176,26 @@ function printHelp() {
 dual-brain <command> [options]
 
 Commands:
+  plan "task"               Scope and plan without executing (dry-run)
+  do "task"                 Implement — detect, route, execute, verify
+  review                    Challenge current changes with dual-brain
+  ship                      Test, commit, and prepare to ship
+
   init                      First-time setup → flows into interactive REPL
   auth                      Show provider login and plan status
   install                   Install Claude Code hooks into the current project
-  go "task description"     Detect → decide → dispatch a task
+  go "task description"     Detect → decide → dispatch (alias for do)
     --dry-run               Show routing decision without executing
     --files a.mjs,b.mjs     Provide file context for risk classification
     --verbose, -v           Print routing trace (intent, risk, health, model selection)
+  think "question"          Multi-round architecture decision with dual-brain
   status                    Provider health, session stats, available models
     --verbose, -v           Also print profile file path and raw profile object
   hot <provider>            Manually mark all model classes for provider as hot
   cool <provider>           Manually clear hot state for a provider
   remember "preference"     Save a project-scoped preference
   forget "preference"       Remove a preference by fuzzy match
-  search "keyword"           Search across all sessions
+  search "keyword"          Search across all sessions
   specialists               List available specialist agents with descriptions
   python "task"             Force Python specialist for the task
   typescript "task"         Force TypeScript specialist for the task
@@ -316,8 +340,8 @@ async function cmdAuth(subArgs = []) {
   }
 }
 
-async function cmdGo(args) {
-  const dryRun  = args.includes('--dry-run');
+async function cmdGo(args, opts = {}) {
+  const dryRun  = opts.dryRun || args.includes('--dry-run');
   const verbose = args.includes('--verbose') || args.includes('-v');
   const filesRaw = flag(args, '--files');
   const files   = filesRaw && typeof filesRaw === 'string'
@@ -332,6 +356,17 @@ async function cmdGo(args) {
   await ensureProfile(cwd);
 
   if (verbose) console.log('\nDispatching...');
+
+  // ── Failure memory: check history before dispatching ──────────────────────
+  const failureMem = await getFailureMem();
+  if (failureMem.checkFailureHistory && failureMem.formatEscalation) {
+    try {
+      const failureHistory = await failureMem.checkFailureHistory(prompt, files, cwd);
+      if (failureHistory?.escalation?.recommended) {
+        console.log(failureMem.formatEscalation(failureHistory.escalation));
+      }
+    } catch { /* non-fatal */ }
+  }
 
   const { plan, result } = await runPipeline('go', prompt, {
     files,
@@ -353,6 +388,16 @@ async function cmdGo(args) {
     console.log(`\nConsensus: ${result.consensus}`);
     if (result.claude?.summary) console.log(`Claude : ${result.claude.summary}`);
     if (result.openai?.summary) console.log(`OpenAI : ${result.openai.summary}`);
+
+    // Receipt
+    const receipt = await getReceipt();
+    if (receipt.buildReceipt && receipt.formatReceipt) {
+      try {
+        const r = receipt.buildReceipt(result, plan, null);
+        console.log(receipt.formatReceipt(r));
+      } catch { /* non-fatal */ }
+    }
+
     saveSession({
       objective:    prompt,
       branch:       null,
@@ -362,6 +407,12 @@ async function cmdGo(args) {
       provider:     plan?._decision?.provider ?? 'claude',
       nextAction:   null,
     }, cwd);
+
+    // Clear failure memory on success
+    if (failureMem.clearFailures) {
+      try { await failureMem.clearFailures(prompt, cwd); } catch { /* non-fatal */ }
+    }
+
     // ── Next steps suggestions (dual-brain consensus path) ──────────────────
     try {
       const { suggestNextSteps, formatNextSteps } = await import('../src/nextstep.mjs');
@@ -375,23 +426,52 @@ async function cmdGo(args) {
       }
     } catch { /* non-fatal */ }
   } else {
-    const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
+    const succeeded = result.status === 'completed';
+    const statusLine = succeeded ? 'Done' : `Failed (exit ${result.exitCode})`;
     console.log(`\n${statusLine}${result.durationMs != null ? ` in ${(result.durationMs / 1000).toFixed(1)}s` : ''}`);
     if (result.summary) console.log(result.summary);
     if (result.error)   process.stderr.write(`${result.error}\n`);
+
+    // Receipt
+    const receipt = await getReceipt();
+    if (succeeded && receipt.buildReceipt && receipt.formatReceipt) {
+      try {
+        const r = receipt.buildReceipt(result, plan, null);
+        console.log(receipt.formatReceipt(r));
+      } catch { /* non-fatal */ }
+    } else if (!succeeded && receipt.buildReceipt && receipt.formatFailureReceipt) {
+      try {
+        const r = receipt.buildReceipt(result, plan, null);
+        console.log(receipt.formatFailureReceipt(r, { error: result.error }));
+      } catch { /* non-fatal */ }
+    }
+
     saveSession({
       objective:    prompt,
       branch:       null,
       filesChanged: files,
       commandsRun:  [`dual-brain go "${prompt}"`],
       lastResult:   {
-        status:  result.status === 'completed' ? 'success' : 'failure',
-        summary: result.summary || (result.status === 'completed' ? 'completed' : `exit ${result.exitCode}`),
+        status:  succeeded ? 'success' : 'failure',
+        summary: result.summary || (succeeded ? 'completed' : `exit ${result.exitCode}`),
       },
       provider:     plan?._decision?.provider ?? 'claude',
       nextAction:   null,
     }, cwd);
-    if (result.status !== 'completed') process.exit(1);
+
+    if (!succeeded) {
+      // Record failure memory
+      if (failureMem.recordFailure) {
+        try { await failureMem.recordFailure(prompt, plan, result.error, cwd); } catch { /* non-fatal */ }
+      }
+      process.exit(1);
+    }
+
+    // Clear failure memory on success
+    if (failureMem.clearFailures) {
+      try { await failureMem.clearFailures(prompt, cwd); } catch { /* non-fatal */ }
+    }
+
     await offerAutoCommit(cwd);
     // ── Next steps suggestions ──────────────────────────────────────────────
     try {
@@ -473,6 +553,111 @@ async function cmdReview(_args) {
   }
 }
 
+async function cmdShip() {
+  const cwd = process.cwd();
+
+  console.log('\n── ship: finalizing ──────────────────────────────────────\n');
+
+  // 1. Check for test script
+  let hasTests = false;
+  let testScript = null;
+  try {
+    const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'));
+    testScript = pkg?.scripts?.test;
+    hasTests = Boolean(testScript && !testScript.includes('echo'));
+  } catch { /* no package.json */ }
+
+  // 2. Run tests if available
+  let testsPassed = null;
+  if (hasTests) {
+    console.log('Running tests...\n');
+    const testResult = _spawnSyncTop('npm', ['test'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60000,
+    });
+    const testOut = (testResult.stdout || '') + (testResult.stderr || '');
+    if (testOut) console.log(testOut.slice(0, 3000));
+    testsPassed = testResult.status === 0;
+    console.log(testsPassed ? 'Tests: PASS' : 'Tests: FAIL');
+  } else {
+    console.log('(no test script found in package.json — skipping tests)');
+    testsPassed = null;
+  }
+
+  // 3. Git status
+  let changedFiles = [];
+  let currentBranch = 'unknown';
+  try {
+    const statusResult = _spawnSyncTop('git', ['status', '--porcelain'], {
+      cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+    });
+    changedFiles = (statusResult.stdout || '').trim().split('\n').filter(Boolean);
+    const branchResult = _spawnSyncTop('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000,
+    });
+    currentBranch = (branchResult.stdout || '').trim() || 'unknown';
+  } catch { /* non-fatal */ }
+
+  if (changedFiles.length > 0) {
+    console.log('\nChanged files:');
+    changedFiles.slice(0, 20).forEach(f => console.log(`  ${f}`));
+    if (changedFiles.length > 20) console.log(`  ... and ${changedFiles.length - 20} more`);
+  } else {
+    console.log('\nNo uncommitted changes.');
+  }
+
+  // 4. Generate commit message suggestion
+  let commitMsg = null;
+  try {
+    const diffResult = _spawnSyncTop('git', ['diff', '--name-only', 'HEAD'], {
+      cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+    });
+    const diffFiles = (diffResult.stdout || '').trim().split('\n').filter(Boolean);
+    if (diffFiles.length > 0) {
+      const fileList = diffFiles.slice(0, 5).map(f => basename(f)).join(', ');
+      const suffix = diffFiles.length > 5 ? ` and ${diffFiles.length - 5} more` : '';
+      commitMsg = `update ${fileList}${suffix}`;
+    }
+  } catch { /* non-fatal */ }
+
+  // 5. Show suggested actions
+  console.log('\n── suggested actions ─────────────────────────────────────\n');
+
+  if (testsPassed === false) {
+    console.log('  ⚠  Tests failed — fix before committing.');
+  } else {
+    if (changedFiles.length > 0 && commitMsg) {
+      console.log(`  Commit: git add -p && git commit -m "${commitMsg}"`);
+    } else if (changedFiles.length === 0) {
+      console.log('  Nothing to commit — working tree clean.');
+    }
+
+    const isMain = currentBranch === 'main' || currentBranch === 'master';
+    if (!isMain && currentBranch !== 'unknown') {
+      console.log(`  PR:     gh pr create --title "${commitMsg || 'update'}" --body "..."`);}
+    else if (isMain) {
+      console.log('  (on main — consider branching before PR)');
+    }
+  }
+
+  // 6. Receipt
+  const receipt = await getReceipt();
+  if (receipt.buildReceiptFromOutcome && receipt.formatReceipt) {
+    try {
+      const r = receipt.buildReceiptFromOutcome({
+        command: 'ship',
+        branch: currentBranch,
+        filesChanged: changedFiles.length,
+        testsPassed,
+      });
+      console.log('\n' + receipt.formatReceipt(r));
+    } catch { /* non-fatal */ }
+  } else {
+    console.log(`\nReceipt: branch=${currentBranch}  files=${changedFiles.length}  tests=${testsPassed === null ? 'skipped' : testsPassed ? 'pass' : 'fail'}`);
+  }
+}
 
 async function cmdStatus(args = []) {
   const verbose = args.includes('--verbose') || args.includes('-v');
@@ -4443,9 +4628,12 @@ async function main() {
     await cmdAuth(args.slice(1));
     return;
   }
+  if (cmd === 'plan')     { await cmdGo(args.slice(1), { dryRun: true }); return; }
+  if (cmd === 'do')       { await cmdGo(args.slice(1)); return; }
   if (cmd === 'go')       { await cmdGo(args.slice(1)); return; }
   if (cmd === 'think')    { await cmdThink(args.slice(1)); return; }
   if (cmd === 'review')   { await cmdReview(args.slice(1)); return; }
+  if (cmd === 'ship')     { await cmdShip(); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
@@ -4510,7 +4698,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'init', 'install', 'auth', 'go', 'status', 'hot', 'cool',
+    'init', 'install', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'status', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),
