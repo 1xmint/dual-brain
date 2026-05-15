@@ -25,7 +25,7 @@
 import { createInterface } from 'readline';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
 // ---------------------------------------------------------------------------
 // Claude Code memory integration
@@ -174,6 +174,20 @@ async function detectAuth() {
     } catch { continue; }
   }
 
+  // --- Claude: check .dualbrain/auth.json (before env var) ---
+  if (!results.claude.found) {
+    const storedAuth = loadAuthKeys();
+    if (storedAuth.claude?.key) {
+      const expired = storedAuth.claude.expiresAt && new Date(storedAuth.claude.expiresAt) <= new Date();
+      if (!expired) {
+        results.claude.found   = true;
+        results.claude.source  = '.dualbrain/auth.json';
+        results.claude.masked  = _maskCredential(storedAuth.claude.key);
+        process.env.ANTHROPIC_API_KEY = storedAuth.claude.key;
+      }
+    }
+  }
+
   // --- Claude: fallback to ANTHROPIC_API_KEY env var ---
   if (!results.claude.found && process.env.ANTHROPIC_API_KEY) {
     results.claude.found  = true;
@@ -208,6 +222,20 @@ async function detectAuth() {
     } catch { continue; }
   }
 
+  // --- OpenAI: check .dualbrain/auth.json (before env var) ---
+  if (!results.openai.found) {
+    const storedAuth = loadAuthKeys();
+    if (storedAuth.openai?.key) {
+      const expired = storedAuth.openai.expiresAt && new Date(storedAuth.openai.expiresAt) <= new Date();
+      if (!expired) {
+        results.openai.found   = true;
+        results.openai.source  = '.dualbrain/auth.json';
+        results.openai.masked  = _maskCredential(storedAuth.openai.key);
+        process.env.OPENAI_API_KEY = storedAuth.openai.key;
+      }
+    }
+  }
+
   // --- OpenAI: fallback to OPENAI_API_KEY env var ---
   if (!results.openai.found && process.env.OPENAI_API_KEY) {
     results.openai.found  = true;
@@ -216,6 +244,105 @@ async function detectAuth() {
   }
 
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// API key storage (.dualbrain/auth.json)
+// ---------------------------------------------------------------------------
+
+const AUTH_FILE = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'auth.json');
+
+function loadAuthKeys(cwd) {
+  try {
+    return JSON.parse(readFileSync(AUTH_FILE(cwd), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveAuthKey(provider, key, opts = {}) {
+  const cwd = opts.cwd || process.cwd();
+  const authFile = AUTH_FILE(cwd);
+  const dir = dirname(authFile);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  const auth = loadAuthKeys(cwd);
+  auth[provider] = {
+    key,
+    savedAt: new Date().toISOString(),
+    expiresAt: opts.expiresAt || null,
+  };
+  writeFileSync(authFile, JSON.stringify(auth, null, 2));
+
+  // Inject into process.env for this session so dispatch can use it
+  if (provider === 'claude') process.env.ANTHROPIC_API_KEY = key;
+  if (provider === 'openai') process.env.OPENAI_API_KEY = key;
+}
+
+/**
+ * Interactive setup flow: walks user through entering API keys for missing providers.
+ * Accepts an existing readline Interface (rl) — does NOT close it.
+ * @param {import('readline').Interface} rl
+ */
+async function setupAuth(rl) {
+  const ask = (q) => new Promise(res => rl.question(q, res));
+  const auth = await detectAuth();
+
+  // Claude setup
+  if (!auth.claude.found) {
+    console.log('\n— Claude Setup —');
+    console.log('Options:');
+    console.log('  (1) Paste API key (recommended for Replit)');
+    console.log('  (2) Skip for now');
+    const choice = (await ask('> ')).trim();
+    if (choice === '1') {
+      const key = (await ask('Paste your Anthropic API key: ')).trim();
+      if (key && (key.startsWith('sk-ant-') || key.startsWith('sk-'))) {
+        const expiryStr = (await ask('Set key expiry? (enter days, or press Enter to skip)\n> ')).trim();
+        let expiresAt = null;
+        if (expiryStr && /^\d+$/.test(expiryStr)) {
+          const d = new Date();
+          d.setDate(d.getDate() + parseInt(expiryStr, 10));
+          expiresAt = d.toISOString();
+          console.log(`✓ Key expires in ${expiryStr} days (${d.toISOString().slice(0, 10)})`);
+        }
+        saveAuthKey('claude', key, { expiresAt });
+        console.log('✓ Claude API key saved');
+      } else {
+        console.log('Invalid key format. Expected sk-ant-... or sk-...');
+      }
+    }
+  } else {
+    console.log(`\n✓ Claude: already configured via ${auth.claude.source}`);
+  }
+
+  // OpenAI setup
+  if (!auth.openai.found) {
+    console.log('\n— OpenAI Setup —');
+    console.log('Options:');
+    console.log('  (1) Paste API key (recommended for Replit)');
+    console.log('  (2) Skip for now');
+    const choice = (await ask('> ')).trim();
+    if (choice === '1') {
+      const key = (await ask('Paste your OpenAI API key: ')).trim();
+      if (key && key.startsWith('sk-')) {
+        const expiryStr = (await ask('Set key expiry? (enter days, or press Enter to skip)\n> ')).trim();
+        let expiresAt = null;
+        if (expiryStr && /^\d+$/.test(expiryStr)) {
+          const d = new Date();
+          d.setDate(d.getDate() + parseInt(expiryStr, 10));
+          expiresAt = d.toISOString();
+          console.log(`✓ Key expires in ${expiryStr} days (${d.toISOString().slice(0, 10)})`);
+        }
+        saveAuthKey('openai', key, { expiresAt });
+        console.log('✓ OpenAI API key saved');
+      } else {
+        console.log('Invalid key format. Expected sk-...');
+      }
+    }
+  } else {
+    console.log(`\n✓ OpenAI: already configured via ${auth.openai.source}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +541,10 @@ function saveProfile(profile, opts = {}) {
 async function runOnboarding(opts = {}) {
   if (!opts.interactive) return defaultProfile();
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // Accept an externally-provided readline instance (shared with REPL/auth setup)
+  // or create one internally if not provided. Only close if we created it.
+  const rlProvided = !!opts.rl;
+  const rl = opts.rl || createInterface({ input: process.stdin, output: process.stdout });
   const ask = (q) => new Promise(res => rl.question(q, res));
   const profile = defaultProfile();
 
@@ -440,7 +570,8 @@ async function runOnboarding(opts = {}) {
     profile.mode = n >= 2 ? 'dual' : profile.providers.claude.enabled ? 'solo-claude' : 'solo-openai';
     process.stdout.write('\nProfile saved.\n');
   } finally {
-    rl.close();
+    // Only close if we created the rl instance (not if it was passed in)
+    if (!rlProvided) rl.close();
   }
   return profile;
 }
@@ -582,4 +713,5 @@ export {
   getAvailableProviders, isSoloBrain, getHeadModel,
   detectPlans, syncPreferencesToMemory,
   detectAuth, detectEnvironment,
+  setupAuth, saveAuthKey, loadAuthKeys,
 };

@@ -5,12 +5,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
+import { createInterface } from 'node:readline';
 
 import {
   ensureProfile, loadProfile, saveProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
-  detectAuth, detectEnvironment,
+  detectAuth, detectEnvironment, setupAuth,
 } from '../src/profile.mjs';
 
 import { detectTask } from '../src/detect.mjs';
@@ -45,8 +46,9 @@ function printHelp() {
 dual-brain <command> [options]
 
 Commands:
-  init                      First-time setup (providers, plans, optimization)
+  init                      First-time setup → flows into interactive REPL
   auth                      Show authentication status for all providers
+  auth setup                Paste API keys directly (recommended for Replit)
   install                   Install Claude Code hooks into the current project
   go "task description"     Detect → decide → dispatch a task
     --dry-run               Show routing decision without executing
@@ -58,6 +60,14 @@ Commands:
   cool <provider>           Manually clear hot state for a provider
   remember "preference"     Save a project-scoped preference
   forget "preference"       Remove a preference by fuzzy match
+
+Interactive REPL (entered after init or npx dual-brain with no args):
+  <task description>        Dispatch a task directly
+  go <task>                 Same as dual-brain go
+  status / auth / init      Run commands without exiting
+  auth setup                Re-run API key setup
+  help                      Show this help
+  exit / quit / q           Exit the REPL
 
 Options:
   --version                 Print version
@@ -85,14 +95,14 @@ function printAuthTable(auth) {
     : `  Claude:  ✗ not found`;
   const claudeLine2 = auth.claude.found
     ? `           ${auth.claude.masked}`
-    : `           run: claude auth login`;
+    : `           run: dual-brain auth setup`;
 
   const openaiLine1 = auth.openai.found
     ? `  OpenAI:  ✓ found via ${auth.openai.source}`
     : `  OpenAI:  ✗ not found`;
   const openaiLine2 = auth.openai.found
     ? `           ${auth.openai.masked}`
-    : `           run: codex auth  OR  export OPENAI_API_KEY=sk-...`;
+    : `           run: dual-brain auth setup`;
 
   console.log(`╔${bar}╗`);
   console.log(`║${pad('  Auth Status')}║`);
@@ -127,8 +137,8 @@ async function cmdCard() {
   // Auth status warnings (non-blocking)
   const auth = await detectAuth();
   const warnings = [];
-  if (!auth.claude.found) warnings.push('Claude auth not found — run: claude auth login');
-  if (!auth.openai.found) warnings.push('OpenAI auth not found — run: codex auth  OR  export OPENAI_API_KEY=sk-...');
+  if (!auth.claude.found) warnings.push('Claude auth not found — run: dual-brain auth setup');
+  if (!auth.openai.found) warnings.push('OpenAI auth not found — run: dual-brain auth setup');
   if (warnings.length > 0) {
     console.log('\nAuth warnings:');
     for (const w of warnings) console.log(`  ⚠  ${w}`);
@@ -144,7 +154,7 @@ async function cmdCard() {
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-async function cmdInit() {
+async function cmdInit(rl) {
   const cwd = process.cwd();
 
   // --- Step 1: Auth preflight ---
@@ -153,39 +163,61 @@ async function cmdInit() {
 
   const noneFound = !auth.claude.found && !auth.openai.found;
   if (noneFound) {
-    console.log('\nNo AI provider credentials found. Set up at least one before continuing:\n');
-    console.log('  Claude : claude auth login');
-    console.log('  OpenAI : codex auth   OR   export OPENAI_API_KEY=sk-...\n');
-    console.log('Re-run "dual-brain init" after authenticating.');
-    return;
+    console.log('\nNo AI provider credentials found. Let\'s set up at least one now.\n');
+    // Use the provided rl (REPL instance) or create a temporary one
+    const rlOwned = !rl;
+    if (!rl) rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      await setupAuth(rl);
+    } finally {
+      if (rlOwned) rl.close();
+    }
+    // Re-check after setup
+    const authAfter = await detectAuth();
+    if (!authAfter.claude.found && !authAfter.openai.found) {
+      console.log('\nNo credentials configured. You can run "auth setup" in the REPL anytime.');
+      // Still flow into REPL — don't exit
+      return;
+    }
   }
 
-  // --- Step 2: Run onboarding wizard, skipping tiers for auto-detected plans ---
-  const profile = await runOnboarding({ interactive: true, detectedAuth: auth });
+  // --- Step 2: Run onboarding wizard (pass shared rl so it isn't closed) ---
+  const profile = await runOnboarding({ interactive: true, detectedAuth: auth, rl });
   saveProfile(profile, { cwd });
 
-  // --- Step 3: Show dashboard + next step ---
+  // --- Step 3: Show dashboard ---
   console.log('');
   const repo    = loadRepoCache(cwd);
   const session = loadSession(cwd);
   const health  = getHealth(cwd);
   const card    = formatSessionCard(session, repo, health);
   console.log(card);
-  console.log('\nReady! Try: dual-brain go "your task here"\n');
+  console.log('\nReady! Type a task below, or "help" for commands.\n');
 }
 
-async function cmdAuth() {
+async function cmdAuth(subArgs = [], rl) {
+  const sub = subArgs[0];
+
+  if (sub === 'setup') {
+    return cmdAuthSetup(rl);
+  }
+
   const auth = await detectAuth();
   printAuthTable(auth);
 
-  // If anything is missing, print setup commands
-  if (!auth.claude.found) {
-    console.log('\nTo set up Claude:');
-    console.log('  claude auth login');
+  // If anything is missing, point to setup command
+  if (!auth.claude.found || !auth.openai.found) {
+    console.log('\nRun "dual-brain auth setup" (or "auth setup" in REPL) to paste API keys.');
   }
-  if (!auth.openai.found) {
-    console.log('\nTo set up OpenAI:');
-    console.log('  codex auth   OR   export OPENAI_API_KEY=sk-...');
+}
+
+async function cmdAuthSetup(rl) {
+  const rlOwned = !rl;
+  if (!rl) rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    await setupAuth(rl);
+  } finally {
+    if (rlOwned) rl.close();
   }
 }
 
@@ -489,6 +521,65 @@ function cmdForget(text) {
   console.log('Preference removed (if matched).');
 }
 
+// ─── Interactive REPL ────────────────────────────────────────────────────────
+
+async function startRepl(rl) {
+  // rl may have been created by cmdCard/cmdInit — reuse it.
+  // If not provided, create a fresh one.
+  const rlOwned = !rl;
+  if (!rl) rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  console.log('\nType a task or command. Type "help" for commands, "exit" to quit.\n');
+
+  const prompt = () => {
+    rl.question('dual-brain> ', async (input) => {
+      const line = input.trim();
+      if (!line) { prompt(); return; }
+
+      if (line === 'exit' || line === 'quit' || line === 'q') {
+        if (rlOwned) rl.close();
+        return;
+      }
+
+      try {
+        if (line === 'help') {
+          printHelp();
+        } else if (line === 'status') {
+          await cmdStatus([]);
+        } else if (line === 'auth setup' || line === 'auth-setup') {
+          await cmdAuthSetup(rl);
+        } else if (line === 'auth') {
+          await cmdAuth([], rl);
+        } else if (line.startsWith('go ')) {
+          await cmdGo(line.slice(3).trim().split(/\s+/));
+        } else if (line.startsWith('remember ')) {
+          cmdRemember(line.slice(9).trim());
+        } else if (line.startsWith('forget ')) {
+          cmdForget(line.slice(7).trim());
+        } else if (line.startsWith('hot ')) {
+          cmdHot(line.slice(4).trim());
+        } else if (line.startsWith('cool ')) {
+          cmdCool(line.slice(5).trim());
+        } else if (line === 'init') {
+          await cmdInit(rl);
+        } else {
+          // Treat as a task description → go
+          await cmdGo([line]);
+        }
+      } catch (e) {
+        process.stderr.write(`Error: ${e.message}\n`);
+      }
+
+      prompt(); // loop back
+    });
+  };
+
+  prompt();
+
+  // Return a promise that resolves when rl closes (exit/quit)
+  return new Promise(resolve => rl.on('close', resolve));
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 async function main() {
@@ -496,12 +587,37 @@ async function main() {
   const cmd  = args[0];
 
   if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
-  if (!cmd) { await cmdCard(); return; }
-  if (cmd === '--version' || cmd === '-v')      { console.log(readVersion()); return; }
+  if (cmd === '--version' || cmd === '-v') { console.log(readVersion()); return; }
 
-  if (cmd === 'init')     { await cmdInit(); return; }
+  // Interactive-only commands: enter REPL after completing (only when TTY)
+  const isInteractive = process.stdin.isTTY;
+
+  if (!cmd) {
+    await cmdCard();
+    if (isInteractive) await startRepl();
+    return;
+  }
+
+  if (cmd === 'init') {
+    if (isInteractive) {
+      // Create the shared rl upfront so init wizard and REPL share it
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      await cmdInit(rl);
+      await startRepl(rl);
+    } else {
+      await cmdInit();
+    }
+    return;
+  }
+
+  // One-shot commands — run and exit
   if (cmd === 'install')  { await cmdInstall(); return; }
-  if (cmd === 'auth')     { await cmdAuth(); return; }
+  if (cmd === 'auth') {
+    const sub = args[1];
+    if (sub === 'setup') { await cmdAuthSetup(); return; }
+    await cmdAuth(args.slice(1));
+    return;
+  }
   if (cmd === 'go')       { await cmdGo(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
