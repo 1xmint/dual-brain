@@ -744,7 +744,7 @@ function generateSettings(workspace) {
   let existing = {};
   try { existing = JSON.parse(readFileSync(settingsPath, 'utf8')); } catch {}
 
-  const HEAD_GUARD_CMD = 'bash .claude/hooks/head-guard.sh';
+  const HEAD_GUARD_CMD = 'node .claude/hooks/head-guard.mjs';
   const ENFORCE_TIER_CMD = 'node .claude/hooks/enforce-tier.mjs';
 
   // All dual-brain PreToolUse hooks we manage
@@ -883,11 +883,12 @@ function install(workspace, env, mode) {
     'wave-orchestrator.mjs',
     'task-classifier.mjs', 'model-registry.mjs',
     'auto-update-wrapper.mjs',
+    'head-guard.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
 
-  // Copy bash hooks (auto-update.sh and head-guard.sh live alongside .mjs hooks in the package)
-  const BASH_HOOKS = ['auto-update.sh', 'head-guard.sh'];
+  // Copy bash hooks (auto-update.sh lives alongside .mjs hooks in the package)
+  const BASH_HOOKS = ['auto-update.sh'];
   for (const h of BASH_HOOKS) {
     const src = join(__dirname, 'hooks', h);
     const dst = join(target, 'hooks', h);

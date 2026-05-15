@@ -379,7 +379,7 @@ async function cmdStatus(args = []) {
     } else {
       const settings = JSON.parse(rfs(settingsFile, 'utf8'));
       const preToolUse = settings?.hooks?.PreToolUse ?? [];
-      const guardCmd  = 'bash .claude/hooks/head-guard.sh';
+      const guardCmd  = 'node .claude/hooks/head-guard.mjs';
       const tierCmd   = 'node .claude/hooks/enforce-tier.mjs';
       const hasEdit   = preToolUse.some(e => e.matcher === 'Edit'   && e.hooks?.some(h => h.command === guardCmd));
       const hasWrite  = preToolUse.some(e => e.matcher === 'Write'  && e.hooks?.some(h => h.command === guardCmd));
@@ -639,7 +639,7 @@ async function dashboardScreen(rl, ask) {
     if (existsSync(settingsFile)) {
       const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
       const preToolUse = settings?.hooks?.PreToolUse ?? [];
-      const guardCmd  = 'bash .claude/hooks/head-guard.sh';
+      const guardCmd  = 'node .claude/hooks/head-guard.mjs';
       const tierCmd   = 'node .claude/hooks/enforce-tier.mjs';
       const hasEdit   = preToolUse.some(e => e.matcher === 'Edit'   && e.hooks?.some(h => h.command === guardCmd));
       const hasWrite  = preToolUse.some(e => e.matcher === 'Write'  && e.hooks?.some(h => h.command === guardCmd));
@@ -839,7 +839,7 @@ async function diagnosticsScreen(rl, ask) {
     if (existsSync(settingsFile)) {
       const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
       const preToolUse = settings?.hooks?.PreToolUse ?? [];
-      const guardCmd  = 'bash .claude/hooks/head-guard.sh';
+      const guardCmd  = 'node .claude/hooks/head-guard.mjs';
       const tierCmd   = 'node .claude/hooks/enforce-tier.mjs';
       const hasEdit   = preToolUse.some(e => e.matcher === 'Edit'   && e.hooks?.some(h => h.command === guardCmd));
       const hasWrite  = preToolUse.some(e => e.matcher === 'Write'  && e.hooks?.some(h => h.command === guardCmd));
@@ -855,7 +855,7 @@ async function diagnosticsScreen(rl, ask) {
   // Hook health: check if hook files exist
   const hooksDir = join(cwd, '.claude', 'hooks');
   const expectedHooks = [
-    'head-guard.sh', 'enforce-tier.mjs', 'budget-balancer.mjs',
+    'head-guard.mjs', 'enforce-tier.mjs', 'budget-balancer.mjs',
     'session-report.mjs', 'quality-gate.mjs', 'health-check.mjs',
   ];
   const hookStatus = expectedHooks.map(h => {

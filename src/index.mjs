@@ -6,7 +6,7 @@
  * orchestrate() convenience function for programmatic use.
  */
 
-export { loadProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel } from './profile.mjs';
+export { loadProfile, saveProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel, detectAuth, detectEnvironment, setupAuth, getActiveKey, removeAuthKey, disableKey, rotateToNextKey } from './profile.mjs';
 export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths } from './detect.mjs';
 export { decideRoute, getModelCapabilities, getAvailableModels, estimateBudgetPressure, shouldDualBrain, explainDecision } from './decide.mjs';
 export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain } from './dispatch.mjs';
@@ -16,6 +16,9 @@ export { detectRepo, loadRepoCache, getTestCommand, getLintCommand } from './rep
 export { loadSession, saveSession, updateSession, clearSession, formatSessionCard } from './session.mjs';
 export { decompose, isSimpleTask, taskGraphToWaves } from './decompose.mjs';
 export { generateBrief, compressPriorResults, listRoles } from './brief.mjs';
+export { redact, redactFiles, isSecretFile } from './redact.mjs';
+export { isInsideClaude, buildNativeDispatch, normalizeResult } from './dispatch.mjs';
+export { box, bar, badge, menu, separator } from './tui.mjs';
 
 // Top-level convenience function
 export async function orchestrate({ prompt, files, cwd, dryRun }) {
