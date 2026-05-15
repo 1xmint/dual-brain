@@ -10,6 +10,7 @@ import {
   ensureProfile, loadProfile, saveProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
+  detectAuth, detectEnvironment,
 } from '../src/profile.mjs';
 
 import { detectTask } from '../src/detect.mjs';
@@ -45,6 +46,7 @@ dual-brain <command> [options]
 
 Commands:
   init                      First-time setup (providers, plans, optimization)
+  auth                      Show authentication status for all providers
   install                   Install Claude Code hooks into the current project
   go "task description"     Detect → decide → dispatch a task
     --dry-run               Show routing decision without executing
@@ -62,6 +64,44 @@ Options:
   --help                    Show this help
   --verbose, -v             Enable verbose routing trace output (stderr)
 `.trim());
+}
+
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Print a compact auth status table to stdout.
+ * @param {{ claude: object, openai: object }} auth  Result from detectAuth()
+ */
+function printAuthTable(auth) {
+  const W = 55; // inner width (wide enough for source labels)
+  const bar = '═'.repeat(W);
+  const pad = (s) => {
+    const visible = s.replace(/[̀-ͯ]/g, ''); // strip combining chars for length
+    return s + ' '.repeat(Math.max(0, W - visible.length));
+  };
+
+  const claudeLine1 = auth.claude.found
+    ? `  Claude:  ✓ found via ${auth.claude.source}`
+    : `  Claude:  ✗ not found`;
+  const claudeLine2 = auth.claude.found
+    ? `           ${auth.claude.masked}`
+    : `           run: claude auth login`;
+
+  const openaiLine1 = auth.openai.found
+    ? `  OpenAI:  ✓ found via ${auth.openai.source}`
+    : `  OpenAI:  ✗ not found`;
+  const openaiLine2 = auth.openai.found
+    ? `           ${auth.openai.masked}`
+    : `           run: codex auth  OR  export OPENAI_API_KEY=sk-...`;
+
+  console.log(`╔${bar}╗`);
+  console.log(`║${pad('  Auth Status')}║`);
+  console.log(`╠${bar}╣`);
+  console.log(`║${pad(claudeLine1)}║`);
+  console.log(`║${pad(claudeLine2)}║`);
+  console.log(`║${pad(openaiLine1)}║`);
+  console.log(`║${pad(openaiLine2)}║`);
+  console.log(`╚${bar}╝`);
 }
 
 // ─── Card command (default) ──────────────────────────────────────────────────
@@ -83,19 +123,70 @@ async function cmdCard() {
   const health  = getHealth(cwd);
   const card    = formatSessionCard(session, repo, health);
   console.log(card);
+
+  // Auth status warnings (non-blocking)
+  const auth = await detectAuth();
+  const warnings = [];
+  if (!auth.claude.found) warnings.push('Claude auth not found — run: claude auth login');
+  if (!auth.openai.found) warnings.push('OpenAI auth not found — run: codex auth  OR  export OPENAI_API_KEY=sk-...');
+  if (warnings.length > 0) {
+    console.log('\nAuth warnings:');
+    for (const w of warnings) console.log(`  ⚠  ${w}`);
+  }
+
+  // Environment info
+  const env = detectEnvironment();
+  if (env.isReplit || env.hasReplitTools) {
+    const envLabel = env.hasReplitTools ? 'Replit + replit-tools' : 'Replit';
+    console.log(`\nRuntime: ${envLabel}`);
+  }
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 async function cmdInit() {
-  const profile = await runOnboarding({ interactive: true });
-  saveProfile(profile, { cwd: process.cwd() });
-  const rt = await detectRuntime();
-  const providers = getAvailableProviders(profile);
-  const providerSummary = providers.length
-    ? providers.map(p => `${p.name === 'claude' ? 'Claude' : 'OpenAI'} (${p.plan})`).join(', ')
-    : 'none';
-  console.log(`Profile saved. Providers: ${providerSummary}. Mode: ${profile.mode}. Runtime: ${rt.runtime}`);
+  const cwd = process.cwd();
+
+  // --- Step 1: Auth preflight ---
+  const auth = await detectAuth();
+  printAuthTable(auth);
+
+  const noneFound = !auth.claude.found && !auth.openai.found;
+  if (noneFound) {
+    console.log('\nNo AI provider credentials found. Set up at least one before continuing:\n');
+    console.log('  Claude : claude auth login');
+    console.log('  OpenAI : codex auth   OR   export OPENAI_API_KEY=sk-...\n');
+    console.log('Re-run "dual-brain init" after authenticating.');
+    return;
+  }
+
+  // --- Step 2: Run onboarding wizard, skipping tiers for auto-detected plans ---
+  const profile = await runOnboarding({ interactive: true, detectedAuth: auth });
+  saveProfile(profile, { cwd });
+
+  // --- Step 3: Show dashboard + next step ---
+  console.log('');
+  const repo    = loadRepoCache(cwd);
+  const session = loadSession(cwd);
+  const health  = getHealth(cwd);
+  const card    = formatSessionCard(session, repo, health);
+  console.log(card);
+  console.log('\nReady! Try: dual-brain go "your task here"\n');
+}
+
+async function cmdAuth() {
+  const auth = await detectAuth();
+  printAuthTable(auth);
+
+  // If anything is missing, print setup commands
+  if (!auth.claude.found) {
+    console.log('\nTo set up Claude:');
+    console.log('  claude auth login');
+  }
+  if (!auth.openai.found) {
+    console.log('\nTo set up OpenAI:');
+    console.log('  codex auth   OR   export OPENAI_API_KEY=sk-...');
+  }
 }
 
 async function cmdGo(args) {
@@ -410,6 +501,7 @@ async function main() {
 
   if (cmd === 'init')     { await cmdInit(); return; }
   if (cmd === 'install')  { await cmdInstall(); return; }
+  if (cmd === 'auth')     { await cmdAuth(); return; }
   if (cmd === 'go')       { await cmdGo(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }

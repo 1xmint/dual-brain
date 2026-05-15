@@ -107,6 +107,118 @@ function syncPreferencesToMemory(profile, cwd) {
 }
 
 // ---------------------------------------------------------------------------
+// Environment detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect the runtime environment.
+ * Returns { isReplit, hasReplitTools, isCI }.
+ */
+function detectEnvironment() {
+  const isReplit = !!(process.env.REPL_ID || process.env.REPLIT_DB_URL);
+  const hasReplitTools = existsSync(join(process.cwd(), '.replit-tools'));
+  const isCI = !!(process.env.CI || process.env.GITHUB_ACTIONS);
+  return { isReplit, hasReplitTools, isCI };
+}
+
+// ---------------------------------------------------------------------------
+// Auth detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Mask a credential string: show first 4 + "..." + last 4 chars.
+ * For short strings (< 8 chars), just returns "***".
+ * @param {string} str
+ * @returns {string}
+ */
+function _maskCredential(str) {
+  if (!str || str.length < 8) return '***';
+  return str.slice(0, 4) + '...' + str.slice(-4);
+}
+
+/**
+ * Detect authentication credentials from all known sources.
+ * Checks in priority order: config files first, then env vars.
+ * Never makes network calls — validation is always null in v1.
+ *
+ * @returns {{ claude: AuthEntry, openai: AuthEntry }}
+ * @typedef {{ found: boolean, source: string|null, masked: string|null, validated: null }} AuthEntry
+ */
+async function detectAuth() {
+  const results = {
+    claude: { found: false, source: null, masked: null, validated: null },
+    openai: { found: false, source: null, masked: null, validated: null },
+  };
+
+  // --- Claude: check .claude.json for oauthAccount or apiKey ---
+  const claudePaths = [
+    '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
+    join(homedir(), '.claude', '.claude.json'),
+  ];
+  for (const p of claudePaths) {
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf8'));
+      if (data?.oauthAccount) {
+        // OAuth session found
+        results.claude.found   = true;
+        results.claude.source  = p.includes('.replit-tools') ? '.claude.json (replit-tools)' : '.claude.json';
+        results.claude.masked  = 'oauth:configured';
+        break;
+      }
+      if (data?.apiKey && typeof data.apiKey === 'string') {
+        results.claude.found   = true;
+        results.claude.source  = p.includes('.replit-tools') ? '.claude.json (replit-tools)' : '.claude.json';
+        results.claude.masked  = _maskCredential(data.apiKey);
+        break;
+      }
+    } catch { continue; }
+  }
+
+  // --- Claude: fallback to ANTHROPIC_API_KEY env var ---
+  if (!results.claude.found && process.env.ANTHROPIC_API_KEY) {
+    results.claude.found  = true;
+    results.claude.source = 'env:ANTHROPIC_API_KEY';
+    results.claude.masked = _maskCredential(process.env.ANTHROPIC_API_KEY);
+  }
+
+  // --- OpenAI/Codex: check auth.json for access_token or id_token ---
+  const codexPaths = [
+    '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
+    join(homedir(), '.codex', 'auth.json'),
+  ];
+  for (const p of codexPaths) {
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf8'));
+      const accessToken = data?.tokens?.access_token || data?.access_token;
+      const idToken     = data?.tokens?.id_token     || data?.id_token;
+      const apiKey      = data?.apiKey ?? data?.api_key ?? null;
+
+      if (accessToken || idToken) {
+        results.openai.found   = true;
+        results.openai.source  = p.includes('.replit-tools') ? 'codex auth.json (replit-tools)' : 'codex auth.json';
+        results.openai.masked  = 'oauth:configured';
+        break;
+      }
+      if (apiKey && typeof apiKey === 'string') {
+        results.openai.found   = true;
+        results.openai.source  = p.includes('.replit-tools') ? 'codex auth.json (replit-tools)' : 'codex auth.json';
+        results.openai.masked  = _maskCredential(apiKey);
+        break;
+      }
+    } catch { continue; }
+  }
+
+  // --- OpenAI: fallback to OPENAI_API_KEY env var ---
+  if (!results.openai.found && process.env.OPENAI_API_KEY) {
+    results.openai.found  = true;
+    results.openai.source = 'env:OPENAI_API_KEY';
+    results.openai.masked = _maskCredential(process.env.OPENAI_API_KEY);
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // Auto-detect subscription plans from provider config files
 // ---------------------------------------------------------------------------
 
@@ -469,4 +581,5 @@ export {
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
   detectPlans, syncPreferencesToMemory,
+  detectAuth, detectEnvironment,
 };
