@@ -598,13 +598,13 @@ async function welcomeScreen(rl, ask) {
     detectedLines.push(`  ${existingSessions.length} session${existingSessions.length !== 1 ? 's' : ''} found from data-tools`);
   }
 
-  // Re-print with full detection results
-  console.log('\r\x1b[K'); // clear the partial output
-  console.log('Detected:');
-  for (const line of detectedLines) {
+  // Show detection results in a box
+  const detectedFormatted = detectedLines.map(line => {
     const ok = !line.includes('not logged');
-    console.log(`  ${ok ? '✓' : '✗'} ${line.trim()}`);
-  }
+    return `${ok ? '✅' : '⚠️ '} ${line.trim()}`;
+  });
+  console.log('');
+  console.log(box(`🧠 Dual-Brain v${version} — Setup`, detectedFormatted));
   console.log('');
 
   if (!claudeReady && !openaiReady) {
@@ -775,20 +775,21 @@ async function mainScreen(rl, ask) {
   const claudeDays = daysUntil(claudeSub?.expiresAt);
   const openaiDays = daysUntil(openaiSub?.expiresAt);
 
-  function subStatus(name, plan, found, expired, days, sub) {
-    if (!found) return `${name}: not logged in`;
-    let s = `${name}: ${plan} ✓`;
-    if (sub?.label) s += ` [${sub.label}]`;
-    if (expired) return `${name}: ${plan} ⚠ expired${sub?.label ? ` [${sub.label}]` : ''}`;
-    if (days !== null && days <= 7) s += ` (${days}d left)`;
-    return s;
+  function subLine(name, plan, found, expired, days, sub) {
+    const label = sub?.label ? ` [${sub.label}]` : '';
+    if (!found) return `⚠️  ${name}: not logged in — run: ${name === 'Claude' ? 'claude login' : 'codex login'}`;
+    if (expired) return `🔴 ${name}: ${plan} expired${label} — will re-auth`;
+    const daysNote = (days !== null && days <= 7) ? ` (${days}d left)` : '';
+    return `✅ ${name}: ${plan}${label}${daysNote}`;
   }
 
-  let claudeStatus = subStatus('Claude', claudePlan, auth.claude.found, claudeExpired, claudeDays, claudeSub);
-  let openaiStatus = subStatus('OpenAI', openaiPlan, auth.openai.found, openaiExpired, openaiDays, openaiSub);
+  const headerLines = [
+    subLine('Claude', claudePlan, auth.claude.found, claudeExpired, claudeDays, claudeSub),
+    subLine('OpenAI', openaiPlan, auth.openai.found, openaiExpired, openaiDays, openaiSub),
+  ];
 
-  console.log(`\ndual-brain v${version}`);
-  console.log(`${claudeStatus}  ·  ${openaiStatus}`);
+  console.log('');
+  console.log(box(`🧠 dual-brain v${version}`, headerLines));
 
   // Auto-refresh expired subscriptions
   if (claudeExpired || openaiExpired) {
@@ -819,7 +820,7 @@ async function mainScreen(rl, ask) {
   const recentSessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 7);
 
   if (recentSessions.length > 0) {
-    console.log('Recent:');
+    console.log(separator('Recent Sessions'));
     recentSessions.forEach((sess, i) => {
       const pin    = sess.pinned ? '📌 ' : '   ';
       const active = sess.isActive ? ' ●' : '';
@@ -829,16 +830,19 @@ async function mainScreen(rl, ask) {
     console.log('');
   }
 
-  console.log('  [c] Continue last session');
-  console.log('  [n] New session');
+  const menuOpts = [];
+  menuOpts.push({ key: 'c', label: 'Continue last session', section: 'Sessions' });
+  menuOpts.push({ key: 'n', label: 'New session',           section: 'Sessions' });
   if (recentSessions.length > 0) {
-    console.log('  [1-9] Resume numbered above');
+    menuOpts.push({ key: '1-9', label: 'Resume numbered above', section: 'Sessions' });
   }
-  console.log('  [e] Manage sessions');
-  console.log('  [d] Switch to data-tools');
-  if (!auth.claude.found) console.log('  [j] Login to Claude');
-  if (!auth.openai.found) console.log('  [k] Login to Codex');
-  console.log('  [s] Settings  [q] Exit');
+  menuOpts.push({ key: 'e', label: 'Manage sessions',       section: 'Sessions' });
+  menuOpts.push({ key: 'd', label: 'Switch to data-tools',  section: 'Tools' });
+  menuOpts.push({ key: 'j', label: 'Login to Claude',       section: 'Auth' });
+  menuOpts.push({ key: 'k', label: 'Login to Codex',        section: 'Auth' });
+  menuOpts.push({ key: 's', label: 'Settings',              section: '' });
+  menuOpts.push({ key: 'q', label: 'Exit',                  section: '' });
+  console.log(menu(menuOpts));
   console.log('');
 
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
