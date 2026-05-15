@@ -29,3 +29,6 @@ dual-brain.update-check.json
 hooks/.burst-state
 hooks/decision-ledger.jsonl
 hooks/usage-summary-*.json
+
+# Dual-Brain Orchestrator
+.claude/dual-brain.permissions.json

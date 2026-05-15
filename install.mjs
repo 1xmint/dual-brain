@@ -749,12 +749,17 @@ function generateSettings(workspace) {
         matcher: '',
         hooks: [{ type: 'command', command: 'node .claude/hooks/cost-logger.mjs' }],
       },
+      {
+        matcher: '',
+        hooks: [{ type: 'command', command: 'node .claude/hooks/auto-update-wrapper.mjs' }],
+      },
     ],
   };
 
   const DUAL_BRAIN_CMDS = [
     'node .claude/hooks/enforce-tier.mjs',
     'node .claude/hooks/cost-logger.mjs',
+    'node .claude/hooks/auto-update-wrapper.mjs',
   ];
 
   const merged = { ...(existing.hooks || {}) };
@@ -859,8 +864,20 @@ function install(workspace, env, mode) {
     'vibe-router.mjs', 'plan-generator.mjs', 'vibe-memory.mjs',
     'wave-orchestrator.mjs',
     'task-classifier.mjs', 'model-registry.mjs',
+    'auto-update-wrapper.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
+
+  // Copy bash hooks (auto-update.sh lives alongside .mjs hooks in the package)
+  const BASH_HOOKS = ['auto-update.sh'];
+  for (const h of BASH_HOOKS) {
+    const src = join(__dirname, 'hooks', h);
+    const dst = join(target, 'hooks', h);
+    if (existsSync(src)) {
+      cpSync(src, dst);
+      try { chmodSync(dst, 0o755); } catch {}
+    }
+  }
   actions.push(`✓ ${HOOKS.length} hook scripts`);
 
   const RULES = [

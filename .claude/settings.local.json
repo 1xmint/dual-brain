@@ -5,6 +5,12 @@
         "matcher": "",
         "command": "bash /home/runner/workspace/hooks/head-guard.sh"
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "command": "node /home/runner/workspace/hooks/auto-update-wrapper.mjs"
+      }
     ]
   }
 }
