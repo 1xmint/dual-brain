@@ -3,9 +3,12 @@
 import { classifyRisk, extractPaths } from './risk-classifier.mjs';
 import { resolveDependencies } from './plan-generator.mjs';
 import { dispatchGptTask } from './gpt-work-dispatcher.mjs';
-import { getProviderStatus, chooseProvider } from './budget-balancer.mjs';
+import { getProviderStatus, chooseProvider, estimateWaveCost, estimateTokensForTask } from './budget-balancer.mjs';
 import { recordDecision, recordOutcome } from './decision-ledger.mjs';
-import { spawnSync } from 'child_process';
+import { classifyTask, selectModelEffort } from './task-classifier.mjs';
+import { getCapabilities, getDispatchConfig, recommendEffort } from './model-registry.mjs';
+import { dualThink } from './dual-brain-think.mjs';
+import { spawnSync, spawn } from 'child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -497,11 +500,24 @@ function routeTasks(tasks) {
   const status = getProviderStatus();
   return tasks.map(task => {
     const tier = ['search', 'execute', 'think'].includes(task.tier) ? task.tier : 'execute';
-    const effort = inferEffort(task);
+    const files = combinedTaskFiles(task);
     const agentType = inferAgentType(task);
     const sandbox = inferSandbox(task);
-    const files = combinedTaskFiles(task);
-    const contextCoupling = task.tier === 'think' || files.length > 3 ? 'high' : files.length > 1 ? 'medium' : 'low';
+
+    // Use task-classifier for capability-aware model+effort selection
+    const profile = classifyTask(task.description, { files });
+    const estimatedTokens = estimateTokensForTask({ tier, effort: profile.effort, fileCount: files.length });
+    const selection = selectModelEffort(profile, {
+      budgetPressure: Math.max(
+        status.claude?.[tier]?.effectivePressure ?? 0,
+        status.openai?.[tier]?.effectivePressure ?? 0,
+      ) / 100,
+      estimatedTokens,
+      isIterating: (task.retryCount || 0) > 0,
+    });
+
+    // Choose provider via budget balancer
+    const contextCoupling = tier === 'think' || files.length > 3 ? 'high' : files.length > 1 ? 'medium' : 'low';
     const isolation = (task.owns?.length || 0) <= 1 ? 'high' : (task.owns?.length || 0) <= 3 ? 'medium' : 'low';
     const selected = chooseProvider({
       tier,
@@ -511,19 +527,25 @@ function routeTasks(tasks) {
     });
 
     let provider = selected.provider;
-    let model = selected.model;
-    let reason = selected.reason;
+    let model, effort, modes;
 
-    if (provider !== 'openai') {
-      provider = 'openai';
-      model = tier === 'think' ? 'gpt-5.5' : tier === 'search' ? 'gpt-4.1-mini' : 'gpt-5.4';
-      reason = `${selected.provider}:${selected.model} preferred; forced to openai:${model} because dispatchGptTask is GPT-only`;
+    if (provider === 'claude') {
+      model = selection.claude.model;
+      effort = selection.claude.effort;
+      modes = selection.claude.modes;
+    } else {
+      model = selection.openai.model;
+      effort = selection.openai.effort;
+      modes = selection.openai.modes;
     }
+
+    let reason = selected.reason;
 
     const decisionId = recordDecision({
       tier,
       provider,
       model,
+      effort,
       recommended_model: selected.model,
       followed: provider === selected.provider,
       task_type: agentType,
@@ -533,7 +555,13 @@ function routeTasks(tasks) {
       isolation,
       claude_pressure: status.claude?.[tier]?.pressure ?? null,
       openai_pressure: status.openai?.[tier]?.pressure ?? null,
+      dualBrain: selection.dualBrain,
     });
+
+    // Enforce: think/search tiers are read-only — they must not own files
+    if (tier !== 'execute') {
+      task.owns = [];
+    }
 
     return {
       ...task,
@@ -543,29 +571,44 @@ function routeTasks(tasks) {
       effort,
       agentType,
       sandbox,
+      modes: modes || {},
+      dualBrain: selection.dualBrain,
       reason,
       _decisionId: decisionId,
+      _profile: profile,
     };
   });
 }
 
 function printDispatchTable(manifest) {
-  const rows = manifest.waves.flatMap(wave => wave.tasks.map(task => [
-    `${wave.waveId}:${task.taskId}`,
-    task.provider || '-',
-    task.model || '-',
-    task.effort || '-',
-    task.agentType || '-',
-    trimText(combinedTaskFiles(task).join(', ') || '-', 42),
-  ]));
+  const rows = manifest.waves.flatMap(wave => wave.tasks.map(task => {
+    const flags = [];
+    if (task.dualBrain) flags.push('DB');
+    if (task.modes?.extendedThinking) flags.push('ET');
+    if (task.modes?.ultrathink) flags.push('UT');
+    if (task.modes?.fastMode) flags.push('FM');
+    if (task.modes?.extendedContext) flags.push('1M');
+    const modeStr = flags.length ? flags.join(',') : '-';
+
+    return [
+      `${wave.waveId}:${task.taskId}`,
+      task.provider || '-',
+      task.model || '-',
+      task.effort || '-',
+      modeStr,
+      task.agentType || '-',
+      trimText(combinedTaskFiles(task).join(', ') || '-', 36),
+    ];
+  }));
 
   console.log(`Manifest: ${manifest.manifestId}`);
   console.log(`State: ${manifest.status}  Risk: ${manifest.riskLevel}`);
   console.log(`Balance: ${manifest.balanceSnapshot.recommendation}`);
   console.log(renderTable(
-    ['Task', 'Provider', 'Model', 'Effort', 'Agent', 'Files'],
+    ['Task', 'Provider', 'Model', 'Effort', 'Modes', 'Agent', 'Files'],
     rows,
   ));
+  console.log('Modes: DB=dual-brain ET=extended-thinking UT=ultrathink FM=fast-mode 1M=extended-context');
 }
 
 function printFinalTable(manifest) {
@@ -603,7 +646,18 @@ function gitCheckpoint(manifest, waveId) {
     return checkpoint;
   }
 
-  runCommand('git', ['add', '-A']);
+  const wave = manifest.waves.find(w => w.waveId === waveId);
+  const completedFiles = wave
+    ? wave.tasks
+        .filter(t => t.status === 'completed')
+        .flatMap(t => t.owns || [])
+        .filter(Boolean)
+    : [];
+  if (completedFiles.length > 0) {
+    runCommand('git', ['add', ...completedFiles]);
+  } else {
+    runCommand('git', ['add', '-A']);
+  }
   const commit = runCommand('git', ['commit', '-m', `wave-orchestrator checkpoint ${manifest.manifestId} ${waveId}`]);
   if (commit.status === 0) {
     checkpoint.commitStatus = 'created';
@@ -687,12 +741,14 @@ function buildDispatchPayload(manifest, wave, task) {
     ].join('\n'),
     model: task.model,
     tier: task.tier,
+    effort: task.effort,
     files,
     timeoutMs: Math.max(120_000, estimateDurationMs(task)),
     constraints: [
       `Owns: ${task.owns.join(', ') || 'none'}`,
       `Reads: ${task.reads.join(', ') || 'none'}`,
       `Status persistence is handled by the orchestrator; summarize changes clearly.`,
+      `CRITICAL: You may ONLY edit files listed in "Owns". Do NOT modify any other files. If you need to edit a file not in "Owns", report it as a blocker instead of editing it.`,
     ],
     cwd: ROOT_DIR,
   };
@@ -709,14 +765,314 @@ function compressResult(result) {
   return trimText(core, 500);
 }
 
+async function executeClaudeAgent(task) {
+  const model = task.model || 'sonnet';
+  const files = combinedTaskFiles(task);
+  let prompt = [
+    task.description,
+    files.length ? `\nRelevant files:\n${files.map(f => `- ${f}`).join('\n')}` : '',
+    `\nOwns: ${(task.owns || []).join(', ') || 'none'}`,
+    `Reads: ${(task.reads || []).join(', ') || 'none'}`,
+    '\nCRITICAL: You may ONLY edit files listed in "Owns". Do NOT modify any other files. If you need to edit a file not in "Owns", report it as a blocker instead of editing it.',
+    '\nWhen done, summarize: files changed, tests run, edge cases, assumptions.',
+  ].filter(Boolean).join('\n');
+
+  if (task.tier !== 'execute') {
+    // Think/search agents: analysis only, no edits
+    prompt = `YOU ARE A READ-ONLY ANALYST. Do NOT use Edit, Write, or any file-modification tools. Only use Read, Bash (for grep/find/git commands), and analysis.\n\n${prompt}`;
+  }
+
+  const timeoutMs = Math.max(120_000, estimateDurationMs(task));
+  const started = Date.now();
+
+  const args = ['--model', model, '--print', '--output-format', 'json'];
+  if (task.effort && task.effort !== 'null') {
+    args.push('--effort', task.effort);
+  }
+  args.push('-p', prompt);
+
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn('claude', args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: ROOT_DIR,
+      });
+    } catch (spawnErr) {
+      const durationMs = Date.now() - started;
+      resolve({
+        success: false,
+        summary: '',
+        durationMs,
+        model,
+        usage: null,
+        errors: ['Claude CLI not found. Install claude or set PATH.'],
+        exitCode: null,
+        failureType: 'not_found',
+        retryCount: 0,
+      });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill('SIGTERM');
+      setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch (_) {}
+      }, 5000);
+    }, timeoutMs);
+
+    proc.stdout.on('data', chunk => { stdout += chunk; });
+    proc.stderr.on('data', chunk => { stderr += chunk; });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      const durationMs = Date.now() - started;
+      if (err.code === 'ENOENT') {
+        resolve({
+          success: false,
+          summary: '',
+          durationMs,
+          model,
+          usage: null,
+          errors: ['Claude CLI not found. Install claude or set PATH.'],
+          exitCode: null,
+          failureType: 'not_found',
+          retryCount: 0,
+        });
+      } else {
+        resolve({
+          success: false,
+          summary: '',
+          durationMs,
+          model,
+          usage: null,
+          errors: [err.message || 'spawn error'],
+          exitCode: null,
+          failureType: 'spawn_error',
+          retryCount: 0,
+        });
+      }
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      const durationMs = Date.now() - started;
+      const success = !timedOut && code === 0;
+      let summary = '';
+      let usage = null;
+
+      if (stdout) {
+        const parsed = safeJsonParse(stdout, null);
+        if (parsed) {
+          summary = parsed.result || parsed.text || stdout.slice(0, 2000);
+          usage = parsed.usage || null;
+        } else {
+          summary = stdout.slice(0, 2000);
+        }
+      }
+
+      resolve({
+        success,
+        summary,
+        durationMs,
+        model,
+        usage,
+        errors: success ? [] : [stderr?.slice(0, 500) || (timedOut ? 'timeout' : 'claude agent failed')],
+        exitCode: code,
+        failureType: timedOut ? 'timeout' : code !== 0 ? 'agent_error' : null,
+        retryCount: 0,
+      });
+    });
+  });
+}
+
+async function runClaudeAnalysis(question, files, riskLevel) {
+  const prompt = [
+    `Analyze this independently — give your own recommendation, rationale, alternatives, risks, and confidence level.`,
+    '',
+    `Question: ${question}`,
+    files?.length ? `\nRelevant files: ${files.join(', ')}` : '',
+    riskLevel ? `Risk level: ${riskLevel}` : '',
+    '',
+    'Structure your response as:',
+    '1. Recommendation (what to do)',
+    '2. Rationale (why)',
+    '3. Alternatives considered',
+    '4. Risks and edge cases',
+    '5. Confidence level (low/medium/high)',
+  ].filter(Boolean).join('\n');
+
+  const timeoutMs = 180_000;
+
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn('claude', ['--model', 'opus', '--print', '-p', prompt], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: ROOT_DIR,
+      });
+    } catch (_) {
+      resolve(null);
+      return;
+    }
+
+    let stdout = '';
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill('SIGTERM');
+      setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch (_) {}
+      }, 5000);
+    }, timeoutMs);
+
+    proc.stdout.on('data', chunk => { stdout += chunk; });
+    proc.on('error', () => { clearTimeout(timer); resolve(null); });
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (timedOut || code !== 0) {
+        resolve(null);
+        return;
+      }
+      resolve(stdout?.slice(0, 3000) || null);
+    });
+  });
+}
+
+async function executeDualBrainThink(task) {
+  const files = combinedTaskFiles(task);
+  const started = Date.now();
+
+  // Round 1: GPT independent analysis
+  printProgress(`${statusIcon('running')} dual-brain R1: GPT analyzing "${trimText(task.description, 60)}"`);
+  const r1 = await dualThink({
+    question: task.description,
+    files,
+    round: 1,
+  });
+
+  if (r1.error || !r1.gpt) {
+    return {
+      success: false,
+      summary: `Dual-brain R1 failed: ${r1.error || 'no GPT response'}. Fallback: ${r1.fallback || 'single-brain'}`,
+      durationMs: Date.now() - started,
+      model: 'dual-brain',
+      usage: null,
+      errors: [r1.error || 'dual-brain-think R1 failed'],
+      exitCode: 1,
+      failureType: 'dual_brain_r1_failed',
+      retryCount: 0,
+      dualBrainResult: { round1: r1, round2: null },
+    };
+  }
+
+  const gptAnalysis = r1.gpt.recommendation || r1.gpt.rebuttal || '';
+
+  // Round 1b: Claude's REAL independent analysis (not fabricated)
+  printProgress(`${statusIcon('running')} dual-brain R1b: Claude (Opus) analyzing independently`);
+  const claudeAnalysis = runClaudeAnalysis(task.description, files, task.riskLevel);
+
+  if (!claudeAnalysis) {
+    printProgress(`${statusIcon('failed')} Claude analysis unavailable — falling back to GPT-only`);
+    return {
+      success: true,
+      summary: `[single-brain fallback] GPT analysis:\n${trimText(gptAnalysis, 1200)}`,
+      durationMs: Date.now() - started,
+      model: 'gpt-5.5',
+      usage: r1.gpt?.tokens || null,
+      errors: ['Claude analysis unavailable — single-brain result'],
+      exitCode: 0,
+      failureType: null,
+      retryCount: 0,
+      dualBrainResult: { round1: r1, round2: null },
+    };
+  }
+
+  // Round 2: GPT responds to Claude's REAL perspective
+  printProgress(`${statusIcon('running')} dual-brain R2: GPT rebutting Claude's analysis`);
+  const r2 = await dualThink({
+    question: task.description,
+    files,
+    round: 2,
+    claudePerspective: claudeAnalysis,
+  });
+
+  const durationMs = Date.now() - started;
+
+  const gptR1Text = (gptAnalysis || '').toLowerCase();
+  const claudeText = (claudeAnalysis || '').toLowerCase();
+  const gptR2Text = (r2.gpt?.rebuttal || '').toLowerCase();
+
+  const disagreementSignals = [
+    /disagree/i, /however/i, /on the other hand/i, /I would push back/i,
+    /alternative approach/i, /concern/i, /risk/i, /not recommended/i,
+  ];
+  const hasDisagreement = disagreementSignals.some(re => re.test(gptR2Text));
+
+  const combinedSummary = [
+    '=== DUAL-BRAIN THINK RESULT ===',
+    `Question: ${task.description}`,
+    '',
+    '--- GPT Round 1 (independent) ---',
+    trimText(gptAnalysis, 800),
+    '',
+    '--- Claude Round 1 (independent) ---',
+    trimText(claudeAnalysis, 800),
+    '',
+    '--- GPT Round 2 (rebuttal to Claude) ---',
+    r2.gpt ? trimText(r2.gpt.rebuttal || '', 800) : '(R2 unavailable)',
+    '',
+    '--- Synthesis ---',
+    'Both models analyzed independently. Agreements are high-confidence.',
+    hasDisagreement
+      ? 'DISAGREEMENT DETECTED — models diverged on approach. Review both perspectives before proceeding.'
+      : 'Models aligned — high confidence in shared recommendation.',
+  ].join('\n');
+
+  return {
+    success: true,
+    summary: combinedSummary,
+    durationMs,
+    model: 'dual-brain',
+    usage: {
+      input_tokens: (r1.gpt?.tokens?.input_tokens || 0) + (r2.gpt?.tokens?.input_tokens || 0),
+      output_tokens: (r1.gpt?.tokens?.output_tokens || 0) + (r2.gpt?.tokens?.output_tokens || 0),
+    },
+    errors: [],
+    exitCode: 0,
+    failureType: null,
+    retryCount: 0,
+    dualBrainResult: { round1: r1, claudeAnalysis: trimText(claudeAnalysis, 2000), round2: r2 },
+  };
+}
+
 async function executeTask(manifest, wave, task) {
   task.status = 'running';
   task.startedAt = isoNow();
   saveManifest(refreshCounts(manifest));
-  printProgress(`${statusIcon('running')} ${wave.waveId} ${task.taskId} -> ${task.provider}:${task.model}`);
+
+  const dualBrainLabel = task.dualBrain ? ' [dual-brain]' : '';
+  const providerLabel = `${task.provider}:${task.model}`;
+  printProgress(`${statusIcon('running')} ${wave.waveId} ${task.taskId} -> ${providerLabel}${dualBrainLabel}`);
 
   const started = Date.now();
-  const result = await dispatchGptTask(buildDispatchPayload(manifest, wave, task));
+
+  let result;
+  if (task.dualBrain && task.tier === 'think') {
+    result = await executeDualBrainThink(task);
+  } else if (task.provider === 'claude') {
+    result = await executeClaudeAgent(task);
+  } else {
+    result = await dispatchGptTask(buildDispatchPayload(manifest, wave, task));
+  }
+
   const durationMs = Date.now() - started;
 
   task.durationMs = durationMs;
@@ -732,6 +1088,11 @@ async function executeTask(manifest, wave, task) {
     failureType: result.failureType || null,
   };
   task.status = result.success ? 'completed' : 'failed';
+
+  if (task.tier !== 'execute' && task.owns?.length > 0) {
+    printProgress(`WARNING: think/search task ${task.taskId} had owned files — this should not happen. Clearing owns.`);
+    task.owns = [];
+  }
 
   if (task._decisionId) {
     recordOutcome(task._decisionId, {
@@ -865,14 +1226,43 @@ async function orchestrate(utterance, opts = {}) {
     manifest = buildManifest(plan);
     saveManifest(manifest);
     printDispatchTable(manifest);
+
+    // Pre-dispatch spend estimate
+    const allTasks = manifest.waves.flatMap(w => w.tasks);
+    const costEstimate = estimateWaveCost(allTasks);
+    if (costEstimate.impact.claude || costEstimate.impact.openai) {
+      console.log('\n--- Pre-dispatch cost estimate ---');
+      for (const [prov, est] of Object.entries(costEstimate.impact)) {
+        const label = prov === 'claude' ? 'Claude' : 'OpenAI';
+        console.log(`  ${label}: ~${(est.estimatedTokens / 1000).toFixed(1)}K tokens (${est.pctOfBudget}% of 5hr budget, ${(est.remaining / 1000).toFixed(1)}K remaining)`);
+        if (est.wouldExceed) {
+          console.log(`  WARNING: Estimated usage EXCEEDS remaining ${label} budget!`);
+        }
+      }
+      console.log('');
+    }
+
     if (opts.dryRun) {
       manifest.status = 'dry-run';
       saveManifest(refreshCounts(manifest));
       return manifest;
     }
+
+    // Auto-confirm in non-interactive mode (--yes flag or piped input)
+    if (!opts.confirmed && !opts.yes) {
+      manifest.status = 'awaiting-confirmation';
+      manifest.costEstimate = costEstimate;
+      saveManifest(refreshCounts(manifest));
+      console.log(`Dispatch plan ready. Execute with: node hooks/wave-orchestrator.mjs --resume ${manifest.manifestId}`);
+      console.log('Or pass --yes to skip confirmation.');
+      return manifest;
+    }
   }
 
   try {
+    manifest.status = 'running';
+    saveManifest(refreshCounts(manifest));
+
     const startWaveIdx = Math.max(0, getResumeWaveIndex(manifest));
     if (startWaveIdx >= manifest.waves.length) {
       manifest.status = 'completed';
@@ -884,6 +1274,19 @@ async function orchestrate(utterance, opts = {}) {
     for (let i = startWaveIdx; i < manifest.waves.length; i++) {
       const wave = manifest.waves[i];
       if (wave.status === 'completed') continue;
+
+      // Per-wave spend check
+      const waveCost = estimateWaveCost(wave.tasks);
+      for (const [prov, est] of Object.entries(waveCost.impact)) {
+        if (est.wouldExceed) {
+          console.error(`[SPEND CAP] Wave ${wave.waveId} would exceed ${prov} budget (${(est.estimatedTokens / 1000).toFixed(1)}K estimated, ${(est.remaining / 1000).toFixed(1)}K remaining). Pausing.`);
+          manifest.status = 'paused';
+          manifest.pauseReason = `spend_cap:${prov}`;
+          saveManifest(refreshCounts(manifest));
+          console.error(`Resume with: node hooks/wave-orchestrator.mjs --resume ${manifest.manifestId}`);
+          return manifest;
+        }
+      }
 
       wave.checkpoint = gitCheckpoint(manifest, wave.waveId);
       saveManifest(refreshCounts(manifest));
@@ -900,6 +1303,27 @@ async function orchestrate(utterance, opts = {}) {
 
     manifest.status = 'completed';
     saveManifest(refreshCounts(manifest));
+
+    const totalDuration = manifest.waves.reduce((sum, w) =>
+      sum + w.tasks.reduce((ts, t) => ts + (t.durationMs || 0), 0), 0);
+    const totalTokens = manifest.waves.reduce((sum, w) =>
+      sum + w.tasks.reduce((ts, t) => ts + (t.result?.usage?.input_tokens || 0) + (t.result?.usage?.output_tokens || 0), 0), 0);
+    const providerBreakdown = {};
+    for (const w of manifest.waves) {
+      for (const t of w.tasks) {
+        const p = t.provider || 'unknown';
+        if (!providerBreakdown[p]) providerBreakdown[p] = { tasks: 0, tokens: 0, durationMs: 0 };
+        providerBreakdown[p].tasks++;
+        providerBreakdown[p].tokens += (t.result?.usage?.input_tokens || 0) + (t.result?.usage?.output_tokens || 0);
+        providerBreakdown[p].durationMs += t.durationMs || 0;
+      }
+    }
+    console.log('\n--- Session Cost Summary ---');
+    console.log(`Total: ${(totalDuration / 1000).toFixed(1)}s wall time, ${(totalTokens / 1000).toFixed(1)}K tokens`);
+    for (const [prov, stats] of Object.entries(providerBreakdown)) {
+      console.log(`  ${prov}: ${stats.tasks} tasks, ${(stats.tokens / 1000).toFixed(1)}K tokens, ${(stats.durationMs / 1000).toFixed(1)}s`);
+    }
+
     printFinalTable(manifest);
     return manifest;
   } catch (error) {
@@ -914,16 +1338,19 @@ async function orchestrate(utterance, opts = {}) {
 
 function parseCli(argv) {
   const args = [...argv];
-  if (args[0] === '--resume') {
-    return { resume: args[1] };
+  const hasYes = args.includes('--yes') || args.includes('-y');
+  const filtered = args.filter(a => a !== '--yes' && a !== '-y');
+
+  if (filtered[0] === '--resume') {
+    return { resume: filtered[1], confirmed: true };
   }
-  if (args[0] === '--dry-run') {
-    return { dryRun: true, utterance: args.slice(1).join(' ') };
+  if (filtered[0] === '--dry-run') {
+    return { dryRun: true, utterance: filtered.slice(1).join(' ') };
   }
-  if (args[0] === '--show') {
-    return { show: args[1] };
+  if (filtered[0] === '--show') {
+    return { show: filtered[1] };
   }
-  return { utterance: args.join(' ') };
+  return { utterance: filtered.join(' '), yes: hasYes };
 }
 
 async function main() {

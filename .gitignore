@@ -23,3 +23,9 @@ reviews/
 # Dual-Brain Orchestrator
 .claude/dual-brain.version.json
 .claude/dual-brain.update-check.json
+dual-brain.profile.json
+dual-brain.update-check.json
+.dualbrain/
+hooks/.burst-state
+hooks/decision-ledger.jsonl
+hooks/usage-summary-*.json

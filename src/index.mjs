@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+/**
+ * index.mjs — Main entry point for the dual-brain package.
+ *
+ * Re-exports all public APIs from the four core modules, plus a top-level
+ * orchestrate() convenience function for programmatic use.
+ */
+
+export { loadProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel } from './profile.mjs';
+export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths } from './detect.mjs';
+export { decideRoute, getModelCapabilities, getAvailableModels, estimateBudgetPressure, shouldDualBrain, explainDecision } from './decide.mjs';
+export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain } from './dispatch.mjs';
+
+// Top-level convenience function
+export async function orchestrate({ prompt, files, cwd, dryRun }) {
+  // Import dynamically to avoid circular issues
+  const { ensureProfile } = await import('./profile.mjs');
+  const { detectTask } = await import('./detect.mjs');
+  const { decideRoute } = await import('./decide.mjs');
+  const { dispatch: run, dispatchDualBrain } = await import('./dispatch.mjs');
+
+  const profile = await ensureProfile(cwd || process.cwd(), { interactive: false });
+  const detection = detectTask({ prompt, files });
+  const decision = decideRoute({ profile, detection, cwd: cwd || process.cwd() });
+
+  if (dryRun) {
+    return { profile, detection, decision, result: null };
+  }
+
+  const result = decision.dualBrain
+    ? await dispatchDualBrain({ decision, prompt, files, cwd: cwd || process.cwd() })
+    : await run({ decision, prompt, files, cwd: cwd || process.cwd() });
+
+  return { profile, detection, decision, result };
+}

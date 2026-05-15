@@ -858,6 +858,7 @@ function install(workspace, env, mode) {
     'risk-classifier.mjs', 'failure-detector.mjs',
     'vibe-router.mjs', 'plan-generator.mjs', 'vibe-memory.mjs',
     'wave-orchestrator.mjs',
+    'task-classifier.mjs', 'model-registry.mjs',
   ];
   for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
   actions.push(`✓ ${HOOKS.length} hook scripts`);

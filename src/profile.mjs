@@ -1,0 +1,267 @@
+#!/usr/bin/env node
+/**
+ * profile.mjs — User profile module for the Dual-Brain Orchestrator.
+ *
+ * Exported API:
+ *   loadProfile(cwd)               → profile (or defaults)
+ *   saveProfile(profile, opts)     → write project or global file
+ *   ensureProfile(cwd, opts)       → load or onboard
+ *   runOnboarding(opts)            → interactive 3-question setup
+ *   rememberPreference(text, opts) → add/update preference
+ *   forgetPreference(text, cwd)    → remove preference by fuzzy match
+ *   getActivePreferences(cwd)      → enabled global + project preferences
+ *   getAvailableProviders(profile) → enabled providers with plan info
+ *   isSoloBrain(profile)           → true if only one provider enabled
+ *   getHeadModel(profile)          → suggested head model string
+ *
+ * CLI:
+ *   node src/profile.mjs                  # show current profile
+ *   node src/profile.mjs --init           # run onboarding
+ *   node src/profile.mjs --remember "…"   # add preference
+ *   node src/profile.mjs --forget "…"     # remove preference
+ *   node src/profile.mjs --providers      # show available providers
+ */
+
+import { createInterface } from 'readline';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
+
+// ---------------------------------------------------------------------------
+// Paths & defaults
+// ---------------------------------------------------------------------------
+
+const GLOBAL_DIR  = join(homedir(), '.config', 'dual-brain');
+const GLOBAL_PATH = join(GLOBAL_DIR, 'profile.json');
+const projectPath = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'profile.json');
+
+function defaultProfile() {
+  const now = new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    createdAt: now,
+    updatedAt: now,
+    providers: {
+      claude: { plan: '$20', enabled: true  },
+      openai: { plan: '$20', enabled: false },
+    },
+    mode: 'auto',
+    bias: 'balanced',
+    preferences: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Schema migration
+// ---------------------------------------------------------------------------
+
+function migrateProfile(profile) {
+  if (!profile.schemaVersion || profile.schemaVersion < 1) {
+    // v0 → v1: add missing fields with defaults
+    profile.schemaVersion = 1;
+    profile.mode = profile.mode || 'auto';
+    profile.bias = profile.bias || 'balanced';
+    profile.preferences = profile.preferences || [];
+    profile.providers = profile.providers || {};
+  }
+  // Future migrations go here:
+  // if (profile.schemaVersion < 2) { ... profile.schemaVersion = 2; }
+  return profile;
+}
+
+// ---------------------------------------------------------------------------
+// Load / save
+// ---------------------------------------------------------------------------
+
+function loadProfile(cwd) {
+  for (const p of [projectPath(cwd), GLOBAL_PATH]) {
+    if (existsSync(p)) {
+      try { return migrateProfile(JSON.parse(readFileSync(p, 'utf8'))); } catch { /* skip */ }
+    }
+  }
+  return defaultProfile();
+}
+
+function saveProfile(profile, opts = {}) {
+  const target = opts.global ? GLOBAL_PATH : projectPath(opts.cwd);
+  const dir = target.slice(0, target.lastIndexOf('/'));
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  profile.updatedAt = new Date().toISOString();
+  const tmp = target + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(profile, null, 2) + '\n');
+  renameSync(tmp, target);
+  return target;
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding
+// ---------------------------------------------------------------------------
+
+async function runOnboarding(opts = {}) {
+  if (!opts.interactive) return defaultProfile();
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise(res => rl.question(q, res));
+  const profile = defaultProfile();
+
+  try {
+    process.stdout.write('\nDual-Brain Orchestrator — First-time setup\n\n');
+
+    const q1 = (await ask('Which AI subscriptions do you have?\n  (1) Claude only  (2) OpenAI only  (3) Both\n> ')).trim();
+    if (q1 === '2') { profile.providers.claude.enabled = false; profile.providers.openai.enabled = true; }
+    else if (q1 === '3') { profile.providers.openai.enabled = true; }
+
+    const PLANS = { '1': '$20', '2': '$100', '3': '$200' };
+    for (const [key, prov] of Object.entries(profile.providers)) {
+      if (!prov.enabled) continue;
+      const label = key === 'claude' ? 'Claude' : 'OpenAI/ChatGPT';
+      const q2 = (await ask(`\n${label} tier?\n  (1) $20/mo  (2) $100/mo  (3) $200/mo\n> `)).trim();
+      prov.plan = PLANS[q2] || '$20';
+    }
+
+    const q3 = (await ask('\nDefault optimization?\n  (1) Save usage  (2) Balanced  (3) Best quality\n> ')).trim();
+    profile.bias = ({ '1': 'cost-saver', '3': 'quality-first' })[q3] || 'balanced';
+
+    const n = Object.values(profile.providers).filter(p => p.enabled).length;
+    profile.mode = n >= 2 ? 'dual' : profile.providers.claude.enabled ? 'solo-claude' : 'solo-openai';
+    process.stdout.write('\nProfile saved.\n');
+  } finally {
+    rl.close();
+  }
+  return profile;
+}
+
+async function ensureProfile(cwd, opts = {}) {
+  for (const p of [projectPath(cwd), GLOBAL_PATH]) {
+    if (existsSync(p)) {
+      try { return migrateProfile(JSON.parse(readFileSync(p, 'utf8'))); } catch { /* skip */ }
+    }
+  }
+  const profile = await runOnboarding(opts);
+  saveProfile(profile, { cwd, global: opts.global });
+  return profile;
+}
+
+// ---------------------------------------------------------------------------
+// Preferences
+// ---------------------------------------------------------------------------
+
+const VALID_SCOPES = ['one-off', 'project', 'global'];
+
+function rememberPreference(text, opts = {}) {
+  const scope   = VALID_SCOPES.includes(opts.scope) ? opts.scope : 'project';
+  const cwd     = opts.cwd || process.cwd();
+  const profile = loadProfile(cwd);
+  const needle  = text.toLowerCase();
+  const idx     = profile.preferences.findIndex(p =>
+    p.text.toLowerCase().includes(needle) || needle.includes(p.text.toLowerCase()));
+  if (idx >= 0) profile.preferences[idx] = { text, enabled: true, scope };
+  else profile.preferences.push({ text, enabled: true, scope });
+  saveProfile(profile, { cwd, global: opts.global || scope === 'global' });
+  return profile;
+}
+
+function forgetPreference(text, cwd) {
+  const profile = loadProfile(cwd);
+  const needle  = text.toLowerCase();
+  profile.preferences = profile.preferences.filter(p => !p.text.toLowerCase().includes(needle));
+  saveProfile(profile, { cwd });
+  return profile;
+}
+
+function getActivePreferences(cwd) {
+  const seen = new Set();
+  const result = [];
+  for (const p of [GLOBAL_PATH, projectPath(cwd)]) {
+    if (!existsSync(p)) continue;
+    try {
+      for (const pref of JSON.parse(readFileSync(p, 'utf8')).preferences || []) {
+        if (pref.enabled && !seen.has(pref.text)) { seen.add(pref.text); result.push(pref); }
+      }
+    } catch { /* skip */ }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Provider helpers
+// ---------------------------------------------------------------------------
+
+const PLAN_RANK = { '$20': 1, '$100': 2, '$200': 3 };
+
+function getAvailableProviders(profile) {
+  return Object.entries(profile.providers || {})
+    .filter(([, p]) => p.enabled)
+    .map(([name, p]) => ({ name, plan: p.plan, rank: PLAN_RANK[p.plan] || 1 }));
+}
+
+function isSoloBrain(profile) {
+  return getAvailableProviders(profile).length === 1;
+}
+
+function getHeadModel(profile) {
+  const providers = getAvailableProviders(profile);
+  if (providers.length === 0) return 'sonnet';
+  if (providers.length === 1) return providers[0].name === 'openai' ? 'gpt-5.4' : 'sonnet';
+  const top = providers.reduce((a, b) => (b.rank > a.rank ? b : a));
+  return top.name === 'openai' ? 'gpt-5.4' : 'sonnet';
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cwd  = process.cwd();
+  const flag = args[0];
+  const val  = args[1];
+
+  if (flag === '--init') {
+    const profile = await runOnboarding({ interactive: true });
+    saveProfile(profile, { cwd });
+    return;
+  }
+  if (flag === '--remember') {
+    if (!val) { process.stderr.write('Usage: --remember "text"\n'); process.exit(1); }
+    const p = rememberPreference(val, { cwd });
+    process.stdout.write(`Preference saved. Total: ${p.preferences.length}\n`);
+    return;
+  }
+  if (flag === '--forget') {
+    if (!val) { process.stderr.write('Usage: --forget "text"\n'); process.exit(1); }
+    forgetPreference(val, cwd);
+    process.stdout.write('Preference removed (if matched).\n');
+    return;
+  }
+  if (flag === '--providers') {
+    const providers = getAvailableProviders(loadProfile(cwd));
+    if (!providers.length) { process.stdout.write('No providers enabled.\n'); return; }
+    providers.forEach(p => process.stdout.write(`${p.name}  plan=${p.plan}\n`));
+    return;
+  }
+
+  // default: show profile
+  const profile   = loadProfile(cwd);
+  const providers = getAvailableProviders(profile);
+  [
+    `mode       : ${profile.mode}`,
+    `bias       : ${profile.bias}`,
+    `head model : ${getHeadModel(profile)}`,
+    `providers  : ${providers.map(p => `${p.name} (${p.plan})`).join(', ') || 'none'}`,
+    `prefs      : ${profile.preferences?.filter(p => p.enabled).length || 0} active`,
+  ].forEach(l => process.stdout.write(l + '\n'));
+}
+
+const isMain = process.argv[1]?.endsWith('profile.mjs');
+if (isMain) main().catch(e => { process.stderr.write(e.message + '\n'); process.exit(1); });
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+export {
+  loadProfile, saveProfile, ensureProfile, runOnboarding,
+  rememberPreference, forgetPreference, getActivePreferences,
+  getAvailableProviders, isSoloBrain, getHeadModel,
+};

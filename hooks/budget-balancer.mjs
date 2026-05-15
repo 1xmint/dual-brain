@@ -115,11 +115,52 @@ function classifyModel(model) {
   if (m.includes("opus"))         return { provider: "claude", tier: "think" };
   if (m.includes("sonnet"))       return { provider: "claude", tier: "execute" };
   if (m.includes("haiku"))        return { provider: "claude", tier: "search" };
-  if (m.includes("gpt-5.5") || m.includes("gpt4.5")) return { provider: "openai", tier: "think" };
-  if (m.includes("gpt-5.4") || (m.includes("gpt-4.1") && !m.includes("mini"))) return { provider: "openai", tier: "execute" };
+  if (m.includes("gpt-5.5"))     return { provider: "openai", tier: "think" };
+  if (m === "gpt-4.1-mini")      return { provider: "openai", tier: "search" };
+  if (m === "gpt-4.1")           return { provider: "openai", tier: "execute" };
+  if (m.includes("gpt-5.") || m.includes("gpt-4.")) return { provider: "openai", tier: "execute" };
   if (m.includes("mini"))         return { provider: "openai", tier: "search" };
 
   return null;
+}
+
+/**
+ * Return models available for a subscription tier.
+ * Pro ($20) → no opus, limited models. Max ($100/$200) → full access.
+ */
+function getAvailableModels(provider, plan) {
+  if (provider === 'claude') {
+    if (plan === '$20') return ['haiku', 'sonnet'];
+    return ['haiku', 'sonnet', 'opus'];
+  }
+  if (provider === 'openai') {
+    if (plan === '$20') return ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini'];
+    return ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.4', 'gpt-5.5'];
+  }
+  return [];
+}
+
+function isModelAvailable(model, provider, config) {
+  const plan = config?.subscriptions?.[provider]?.plan || (provider === 'claude' ? '$100' : '$20');
+  const available = getAvailableModels(provider, plan);
+  return available.includes(model);
+}
+
+function downgradeModel(model, provider, config) {
+  const plan = config?.subscriptions?.[provider]?.plan || (provider === 'claude' ? '$100' : '$20');
+  const available = getAvailableModels(provider, plan);
+  if (available.includes(model)) return model;
+
+  if (provider === 'claude') {
+    if (model === 'opus') return available.includes('sonnet') ? 'sonnet' : 'haiku';
+    return 'haiku';
+  }
+  const rank = ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.4', 'gpt-5.5'];
+  const idx = rank.indexOf(model);
+  for (let i = idx - 1; i >= 0; i--) {
+    if (available.includes(rank[i])) return rank[i];
+  }
+  return available[0] || 'gpt-4.1-mini';
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +356,17 @@ function chooseProvider(taskProfile = {}) {
   const config = loadConfig();
   const status = getProviderStatus();
 
+  let profileBias = 0;
+  try {
+    const profilePath = join(__dirname, '..', 'dual-brain.profile.json');
+    if (existsSync(profilePath)) {
+      const profile = JSON.parse(readFileSync(profilePath, 'utf8'));
+      const active = profile.active || 'balanced';
+      if (active === 'cost-saver') profileBias = -20;
+      else if (active === 'quality-first') profileBias = 10;
+    }
+  } catch {}
+
   const PRESSURE_PENALTY = {
     healthy:   0,
     warm:     15,
@@ -340,6 +392,8 @@ function chooseProvider(taskProfile = {}) {
     }
 
     score -= PRESSURE_PENALTY[tierStatus.state] ?? 0;
+
+    if (provider === 'openai') score += profileBias;
 
     if (provider === "openai") {
       let minTaskMs = 180_000;
@@ -372,11 +426,34 @@ function chooseProvider(taskProfile = {}) {
     scores[provider] = Math.round(score);
   }
 
+  // Both-providers-throttled hard stop
+  const claudeState = status.claude?.[tier]?.state;
+  const openaiState = status.openai?.[tier]?.state;
+  if (claudeState === 'throttled' && openaiState === 'throttled') {
+    const claudeP = status.claude[tier].effectivePressure;
+    const openaiP = status.openai[tier].effectivePressure;
+    const lessThrottled = claudeP <= openaiP ? 'claude' : 'openai';
+    const m = getProviderModels(config, lessThrottled);
+    return {
+      provider: lessThrottled,
+      model: m?.[tier] || DEFAULT_MODELS[lessThrottled][tier],
+      reason: `BOTH PROVIDERS THROTTLED (claude ${Math.round(claudeP * 100)}%, openai ${Math.round(openaiP * 100)}%). Using ${lessThrottled} as least-throttled. Consider waiting or downgrading tier.`,
+      scores,
+      bothThrottled: true,
+    };
+  }
+
   const winner = scores.claude >= scores.openai ? "claude" : "openai";
   const loser  = winner === "claude" ? "openai" : "claude";
 
   const models = getProviderModels(config, winner);
-  const model = models?.[tier] || DEFAULT_MODELS[winner][tier];
+  let model = models?.[tier] || DEFAULT_MODELS[winner][tier];
+
+  // Gate model by subscription tier
+  if (!isModelAvailable(model, winner, config)) {
+    const downgraded = downgradeModel(model, winner, config);
+    model = downgraded;
+  }
 
   const ws = status[winner]?.[tier] || {};
   const ls = status[loser]?.[tier] || {};
@@ -406,6 +483,53 @@ function chooseProvider(taskProfile = {}) {
     reason: reasonParts.join(", "),
     scores,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Exported: estimateWaveCost(tasks)
+// ---------------------------------------------------------------------------
+
+function estimateWaveCost(tasks) {
+  const config = loadConfig();
+  const budgets = getSubscriptionBudgets(config);
+  const status = getProviderStatus();
+
+  let totalTokens = { claude: 0, openai: 0 };
+  for (const task of tasks) {
+    const provider = task.provider || 'claude';
+    const tier = task.tier || 'execute';
+    const estimate = TOKENS_PER_CALL_FALLBACK[tier] || 8_000;
+    totalTokens[provider] += estimate;
+  }
+
+  const impact = {};
+  for (const provider of ['claude', 'openai']) {
+    if (totalTokens[provider] === 0) continue;
+    const tierStatus = status[provider]?.execute || {};
+    const remaining = Math.max(0, (tierStatus.budget || 0) - (tierStatus.tokens || 0));
+    const pctOfBudget = tierStatus.budget > 0 ? (totalTokens[provider] / tierStatus.budget) * 100 : 0;
+    impact[provider] = {
+      estimatedTokens: totalTokens[provider],
+      remaining,
+      pctOfBudget: Math.round(pctOfBudget * 10) / 10,
+      wouldExceed: totalTokens[provider] > remaining,
+    };
+  }
+
+  return { totalTokens, impact, taskCount: tasks.length };
+}
+
+// ---------------------------------------------------------------------------
+// Exported: estimateTokensForTask(task)
+// ---------------------------------------------------------------------------
+
+function estimateTokensForTask(task) {
+  const tier = task?.tier || 'execute';
+  const fileCount = Math.max(1, (task?.files?.length || 0));
+  const base = TOKENS_PER_CALL_FALLBACK[tier] || 8_000;
+  const effortMultiplier = { low: 0.5, medium: 1, high: 1.5, xhigh: 2.5 };
+  const mult = effortMultiplier[task?.effort] || 1;
+  return Math.round(base * mult * Math.sqrt(fileCount));
 }
 
 // ---------------------------------------------------------------------------
@@ -552,4 +676,4 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
-export { getProviderStatus, chooseProvider, recordUsageEvent, getSubscriptionBudgets, SUBSCRIPTION_TIERS };
+export { getProviderStatus, chooseProvider, recordUsageEvent, getSubscriptionBudgets, estimateWaveCost, estimateTokensForTask, isModelAvailable, downgradeModel, SUBSCRIPTION_TIERS };

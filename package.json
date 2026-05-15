@@ -1,10 +1,18 @@
 {
   "name": "dual-brain",
-  "version": "5.1.0",
-  "description": "Dual-provider orchestration for Claude Code — tiered routing, budget balancing, and GPT dual-brain review across Claude + OpenAI subscriptions",
+  "version": "6.0.0",
+  "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
-    "dual-brain": "./install.mjs"
+    "dual-brain": "./bin/dual-brain.mjs"
+  },
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./profile": "./src/profile.mjs",
+    "./detect": "./src/detect.mjs",
+    "./decide": "./src/decide.mjs",
+    "./dispatch": "./src/dispatch.mjs"
   },
   "keywords": [
     "claude-code",
@@ -23,14 +31,18 @@
     "url": "https://github.com/1xmint/dual-brain.git"
   },
   "scripts": {
-    "test": "node hooks/test-orchestrator.mjs"
+    "test": "node hooks/test-orchestrator.mjs",
+    "postinstall": "node install.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "files": [
-    "install.mjs",
+    "src/*.mjs",
+    "bin/*.mjs",
     "hooks/*.mjs",
+    "hooks/*.sh",
+    "install.mjs",
     "orchestrator.json",
     "hookify.*.local.md",
     "review-rules.md",
