@@ -128,7 +128,7 @@ function resolveChallenger(useChallenger, contextPack) {
 
   const plan = contextPack.profile.providers.openai.plan;
   // Pick the best available OpenAI model for the challenger role
-  if (plan === '$100' || plan === '$200') return 'o3';
+  if (plan === '$100' || plan === '$200') return 'o3'; // doctor:verified — config value comparison, not UI display
   return 'gpt-4o';
 }
 

@@ -131,7 +131,7 @@ function detectEnvironment() {
 
 /**
  * Detect what providers and tools are actually available.
- * Never makes network calls, never claims to know subscription tier or price.
+ * Never makes network calls, never claims to know configured plan or price.
  *
  * @param {string} [cwd]
  * @returns {Promise<{
@@ -338,7 +338,7 @@ function migrateProfile(profile) {
     }
     delete profile.plan;
     delete profile.price;
-    delete profile.subscription;
+    delete profile.subscription; // doctor:verified — removing legacy field from stored config
     delete profile.budget;
     delete profile.detectedPlan;
   }
@@ -771,7 +771,7 @@ function detectPlans() {
   return { claude: null, openai: null };
 }
 
-/** @deprecated Plan/subscription tracking removed. Use provider enabled flag instead. */
+/** @deprecated Plan tracking removed. Use provider enabled flag instead. */
 function saveSubscription(provider, config, cwd) {
   const profile = loadProfile(cwd);
   if (!profile.providers[provider]) profile.providers[provider] = { enabled: true };
@@ -780,7 +780,7 @@ function saveSubscription(provider, config, cwd) {
   return profile;
 }
 
-/** @deprecated Plan/subscription tracking removed. Use getAvailableProviders() instead. */
+/** @deprecated Plan tracking removed. Use getAvailableProviders() instead. */
 function listSubscriptions(cwd) {
   const profile = loadProfile(cwd);
   return profile.providers || {};

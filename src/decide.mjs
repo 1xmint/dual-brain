@@ -26,8 +26,7 @@ const WORKSPACE  = join(__dirname, '..');
 /**
  * Work styles control how aggressively the router uses stronger models,
  * challenger (dual-brain) reviews, and checkpoints.
- * These replace subscription-tier-based routing — the user picks a style
- * regardless of what plan they are on.
+ * The user picks a style regardless of provider or plan — no price gating.
  */
 export const WORK_STYLES = {
   fast: {
@@ -193,7 +192,7 @@ export function getModelCapabilities(model) {
  * Return which models the user can access.
  * All known models are available by default; providers can explicitly restrict
  * via profile.providers.<provider>.models (array of allowed model short names).
- * This does NOT gate on subscription price — that was fake knowledge.
+ * This does NOT gate on price or configured plan — we cannot verify those from here.
  * @param {{ providers?: { claude?: { enabled?: boolean, models?: string[] }, openai?: { enabled?: boolean, models?: string[] } } }} profile
  * @returns {{ claude: string[], openai: string[] }}
  */
