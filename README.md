@@ -24,7 +24,7 @@ dual-brain detects the intent and risk of your task, picks the best model based 
 
 ### `dual-brain init`
 
-First-time setup. Three questions: which providers you have, subscription tiers, and optimization preference.
+First-time setup. Three questions: which providers you have, subscription tiers, and optimization preference. The actual flow auto-detects existing auth and adapts — you may see fewer prompts if credentials are already configured.
 
 ```
 Dual-Brain Orchestrator — First-time setup
@@ -121,7 +121,7 @@ Preferences are stored in `.dualbrain/profile.json` and applied on every `go` in
 import { orchestrate } from 'dual-brain';
 
 const result = await orchestrate({ prompt: "fix the bug", cwd: "." });
-console.log(result.summary);
+console.log(result.result?.summary);
 ```
 
 Individual modules are also exported:
@@ -174,7 +174,7 @@ For Claude Code users, a hooks layer provides deeper integration. Hooks fire on 
 
 ```bash
 # Install hooks into .claude/settings.json
-npx -y dual-brain
+npx dual-brain install
 ```
 
 The installer auto-detects your environment (Claude CLI, Codex CLI, Replit), registers `enforce-tier.mjs` and `cost-logger.mjs` hooks, and writes `orchestrator.json` with your subscription config. Re-run anytime — it's idempotent.

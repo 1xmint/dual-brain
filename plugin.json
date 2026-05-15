@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "7.1.0",
+  "version": "7.1.4",
   "description": "Dual-provider AI orchestration — smart routing between Claude and OpenAI",
   "skills": [
     { "name": "go", "description": "Route and dispatch a task", "file": "skills/go.md" },

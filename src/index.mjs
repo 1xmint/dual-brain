@@ -6,7 +6,7 @@
  * orchestrate() convenience function for programmatic use.
  */
 
-export { loadProfile, saveProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel, detectAuth, detectEnvironment, setupAuth, getActiveKey, removeAuthKey, disableKey, rotateToNextKey } from './profile.mjs';
+export { loadProfile, saveProfile, ensureProfile, runOnboarding, rememberPreference, forgetPreference, getActivePreferences, getAvailableProviders, isSoloBrain, getHeadModel, detectAuth, detectEnvironment, setupAuth, getActiveKey } from './profile.mjs';
 export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths } from './detect.mjs';
 export { decideRoute, getModelCapabilities, getAvailableModels, shouldDualBrain, explainDecision } from './decide.mjs';
 export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain } from './dispatch.mjs';

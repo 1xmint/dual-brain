@@ -647,13 +647,14 @@ async function dispatch(input = {}) {
     }
     _recordDispatchBudget(prompt);
     return {
-      status:        'native-agent',
+      status:        'completed',
+      type:          'native-agent',
       provider:      effectiveProvider,
       model:         effectiveModel,
       command:       null,
       nativeDispatch: nativeDescriptor,
-      exitCode:      null,
-      summary:       `[native] ${nativeDescriptor.description}`,
+      exitCode:      0,
+      summary:       `Routed to ${effectiveProvider}/${effectiveModel} (${effectiveDecision.tier})`,
       durationMs:    0,
       usage:         null,
       error:         null,

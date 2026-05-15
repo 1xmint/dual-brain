@@ -445,7 +445,7 @@ test('enforce-tier: cost-saver demotes think', () => {
     // cost-saver's demote_think=true demotes think→execute when text lacks think words
     const payload = JSON.stringify({
       tool_name: 'Agent',
-      tool_input: { prompt: 'edit the README file', model: 'opus' },
+      tool_input: { prompt: '<!-- dual-brain-dispatch: test23 -->edit the README file', model: 'opus' },
     });
     const { parsed, status } = run(ENFORCE_TIER, payload);
     if (status !== 0) return `non-zero exit: ${status}`;
@@ -494,7 +494,7 @@ test('enforce-tier: auto profile with high-risk file', () => {
     // Description with auth/credentials path → risk classifier detects critical risk → promote to think
     const payload = JSON.stringify({
       tool_name: 'Agent',
-      tool_input: { description: 'update src/auth/credentials.mjs', prompt: 'change the token logic', model: 'sonnet' },
+      tool_input: { description: 'update src/auth/credentials.mjs', prompt: '<!-- dual-brain-dispatch: test25 -->change the token logic', model: 'sonnet' },
     });
     const { parsed, status } = run(ENFORCE_TIER, payload);
     if (status !== 0) return `non-zero exit: ${status}`;
@@ -740,9 +740,9 @@ test('install: preserves existing hooks', () => {
   if (!installSrc.includes('.filter'))
     return 'install.mjs missing .filter() call — may clobber non-dual-brain hooks';
 
-  // The merge logic should spread existingEntries first, then add dual-brain hooks
-  if (!installSrc.includes('existingEntries'))
-    return 'install.mjs missing existingEntries variable — may not preserve other hooks';
+  // The merge logic should filter existing hooks before merging dual-brain hooks
+  if (!installSrc.includes('existingPre') && !installSrc.includes('existingEntries'))
+    return 'install.mjs missing existing hook preservation — may not preserve other hooks';
 
   // Verify it reads existing settings before overwriting
   if (!installSrc.includes('existing') || !installSrc.includes('settings.json'))
@@ -1017,7 +1017,7 @@ test('adaptive loop: end-to-end hash match', () => {
     writeFileSync(LEDGER, '', 'utf8');
 
     // Step 1: Define a specific Agent payload used consistently across all steps
-    const toolInput = { prompt: 'fix the auth bug', description: 'patch auth module' };
+    const toolInput = { prompt: '<!-- dual-brain-dispatch: test40 -->fix the auth bug', description: 'patch auth module' };
     const agentPayload = JSON.stringify({ tool_name: 'Agent', tool_input: toolInput });
 
     // Step 2: Run enforce-tier with this payload (computes and may log a promptHash)

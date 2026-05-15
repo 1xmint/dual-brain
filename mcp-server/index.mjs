@@ -253,7 +253,7 @@ async function handleRequest(msg) {
         return respond(id, {
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'dual-brain', version: '7.1.0' },
+          serverInfo: { name: 'dual-brain', version: '7.1.4' },
         });
 
       case 'initialized':

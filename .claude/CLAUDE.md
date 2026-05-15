@@ -2,7 +2,7 @@
 
 This project uses dual-provider orchestration. Config: `.claude/orchestrator.json`.
 
-## Core Architecture (v6)
+## Core Architecture (v7)
 
 Four modules in `src/` form the decision pipeline:
 
@@ -71,21 +71,21 @@ Dual-brain is a multi-round conversation between Claude and GPT — not a single
 ## Quality Gate
 
 Before ending a session with code changes:
-1. Run `node .claude/hooks/session-report.mjs`
-2. Run `node .claude/hooks/quality-gate.mjs`
+1. `node .claude/hooks/session-report.mjs` (allowed by head-guard for hook scripts)
+2. `node .claude/hooks/quality-gate.mjs`
 
 Gate statuses: `pass` (safe to end), `issues_found` (fix first), `needs_human_review` (GPT unavailable).
 
 ## Profiles
 
-Profile persists to `.claude/dual-brain.profile.json` (gitignored).
+Profile persists to `.dualbrain/profile.json` (project-scoped, gitignored).
 
 - **auto** (default): Adapts routing based on task risk, provider health, and outcomes
 - **balanced**: Best model per tier, normal budgets, reviews at medium+ risk
 - **cost-saver**: Prefer cheaper models, lower budgets, skip GPT for non-critical
 - **quality-first**: Dual-brain for medium+ risk, higher budgets, stricter reviews
 
-Switch: `dual-brain mode cost-saver` · Natural language aliases work: "be careful", "cheap mode", "thorough"
+Switch via the interactive Profile screen in `dual-brain`, or set `bias` in `.dualbrain/profile.json`.
 
 ## Adaptive Routing (Auto Mode)
 

@@ -71,10 +71,37 @@ const MODEL_CAPABILITIES = {
     effortLevels: ['low', 'medium', 'high'],
     costTier: 'medium',
   },
+  'gpt-5.2': {
+    provider: 'openai',
+    tierFit: ['search', 'execute'],
+    contextWindow: 200_000,
+    costTier: 'medium',
+    strengths: ['code-generation', 'analysis'],
+    weaknesses: [],
+    effortLevels: null,
+  },
+  'gpt-5.4-mini': {
+    provider: 'openai',
+    tierFit: ['search'],
+    contextWindow: 200_000,
+    costTier: 'low',
+    strengths: ['quick-tasks', 'search'],
+    weaknesses: ['complex-edits', 'architecture'],
+    effortLevels: null,
+  },
+  'gpt-5.3-codex': {
+    provider: 'openai',
+    tierFit: ['execute'],
+    contextWindow: 200_000,
+    costTier: 'medium',
+    strengths: ['code-generation', 'refactoring'],
+    weaknesses: ['architecture', 'security'],
+    effortLevels: null,
+  },
   'gpt-5.4': {
     provider: 'openai',
     tierFit: ['execute', 'think'],
-    contextWindow: 200_000,
+    contextWindow: 1_050_000,
     strengths: ['refactor', 'debug', 'code-generation', 'test'],
     weaknesses: ['cost'],
     effortLevels: ['low', 'medium', 'high', 'xhigh'],
@@ -83,7 +110,7 @@ const MODEL_CAPABILITIES = {
   'gpt-5.5': {
     provider: 'openai',
     tierFit: ['think'],
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     strengths: ['architecture', 'security', 'review', 'planning', 'complex-debug'],
     weaknesses: ['cost', 'latency'],
     effortLevels: ['low', 'medium', 'high', 'xhigh'],
@@ -264,16 +291,19 @@ function applyHealthDowngrade(model, score, provider, available, isHighStakes) {
   }
 }
 
-function applyProfileBias(model, profile, provider, available) {
+function applyProfileBias(model, profile, provider, available, tier) {
   const mode = profile?.mode || profile?.profile || 'auto';
   if (mode === 'cost-saver') {
-    // Prefer cheapest available
+    // Prefer cheapest available that also fits the required tier
     const ranks = {
       claude: ['haiku', 'sonnet', 'opus'],
       openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'],
     };
     for (const m of ranks[provider]) {
-      if (available.includes(m)) return m;
+      if (!available.includes(m)) continue;
+      const caps = MODEL_CAPABILITIES[m];
+      if (tier && caps && !caps.tierFit.includes(tier)) continue;
+      return m;
     }
   }
   if (mode === 'quality-first') {
@@ -535,7 +565,7 @@ export function decideRoute({ profile = {}, detection = {}, cwd } = {}) {
   model = applyHealthDowngrade(model, healthScores[provider], provider, available[provider], isHighStakes);
 
   // Apply profile mode bias (cost-saver / quality-first / preferences) using patched profile
-  model = applyProfileBias(model, profileWithEffectiveBias, provider, available[provider]);
+  model = applyProfileBias(model, profileWithEffectiveBias, provider, available[provider], detection.tier);
 
   // Safety floor: critical-risk tasks must never use haiku/gpt-4.1-mini even in cost-saver mode
   model = applyCriticalRiskFloor(model, provider, available[provider], detection.risk);

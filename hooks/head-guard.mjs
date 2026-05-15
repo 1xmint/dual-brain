@@ -15,7 +15,15 @@
 
 import { readFileSync } from 'fs';
 
-const BLOCKED_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash']);
+const BLOCKED_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
+
+// Patterns that indicate a Bash command is writing/mutating the filesystem.
+// Anchored to avoid false positives on grep/find output containing these words.
+const WRITE_BASH_RE = /\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|\bdd\b|\binstall\b|\btruncate\b|\btee\b|\bsed\s+-i\b|\bawk\s+-i\b|>>|(?<![><])>(?![>=])/;
+
+function isBashWriteIntent(command) {
+  return WRITE_BASH_RE.test(command);
+}
 
 // Read stdin JSON payload
 let input;
@@ -23,9 +31,16 @@ try {
   const raw = readFileSync('/dev/stdin', 'utf8');
   input = JSON.parse(raw);
 } catch {
-  // If we can't read / parse input, fail open — don't break sessions
-  // that aren't using dual-brain at all.
-  process.exit(0);
+  // Can't parse input — fail closed to avoid guard bypass.
+  const output = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: '[dual-brain] head-guard could not parse hook input — blocking as a safety measure.',
+    },
+  };
+  process.stdout.write(JSON.stringify(output));
+  process.exit(2);
 }
 
 const toolName = input.tool_name || '';
@@ -50,9 +65,30 @@ if (BLOCKED_TOOLS.has(toolName)) {
   process.exit(2);
 }
 
-// Also block MCP filesystem write tools (any mcp__ tool with write/create/
-// delete/remove/move/rename in the name).
-if (toolName.startsWith('mcp__') && /write|create|delete|remove|move|rename/i.test(toolName)) {
+// Bash: allow read-only commands; block write-intent ones.
+// Always allow node .claude/hooks/ and node hooks/ — CLAUDE.md instructs HEAD to run these.
+if (toolName === 'Bash') {
+  const command = (input.tool_input && input.tool_input.command) || '';
+  if (/^node\s+\.?(?:\.claude\/)?hooks\//.test(command.trimStart())) {
+    process.exit(0);
+  }
+  if (isBashWriteIntent(command)) {
+    const output = {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          '[dual-brain] HEAD cannot run write-intent Bash commands. Dispatch via: dual-brain go "task description"',
+      },
+    };
+    process.stdout.write(JSON.stringify(output));
+    process.exit(2);
+  }
+  process.exit(0);
+}
+
+// Block MCP filesystem write tools by name.
+if (toolName.startsWith('mcp__') && /write|create|delete|remove|move|rename|append|patch|truncate|copy|commit|push|stage|merge|update|overwrite/i.test(toolName)) {
   const output = {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',

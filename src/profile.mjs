@@ -269,46 +269,13 @@ async function detectAuth() {
 const AUTH_FILE = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'auth.json');
 
 /**
- * Migrate old single-key format to array format transparently.
- * Old: { claude: { key, savedAt, expiresAt }, openai: { ... } }
- * New: { claude: [{ key, label, savedAt, expiresAt, priority, enabled }], openai: [...] }
- * @param {object} auth
- * @returns {object} migrated auth object
- */
-function _migrateAuthFormat(auth) {
-  const migrated = {};
-  for (const [provider, value] of Object.entries(auth)) {
-    if (Array.isArray(value)) {
-      // Already new format
-      migrated[provider] = value;
-    } else if (value && typeof value === 'object' && value.key) {
-      // Old single-key format — wrap in array
-      migrated[provider] = [
-        {
-          key: value.key,
-          label: 'primary',
-          savedAt: value.savedAt || new Date().toISOString(),
-          expiresAt: value.expiresAt || null,
-          priority: 1,
-          enabled: true,
-        },
-      ];
-    } else {
-      migrated[provider] = value;
-    }
-  }
-  return migrated;
-}
-
-/**
- * Load .dualbrain/auth.json, migrating old single-key format to array format.
+ * Load .dualbrain/auth.json.
  * @param {string} [cwd]
  * @returns {object} auth object with arrays per provider
  */
 function loadAuthKeys(cwd) {
   try {
-    const raw = JSON.parse(readFileSync(AUTH_FILE(cwd), 'utf8'));
-    return _migrateAuthFormat(raw);
+    return JSON.parse(readFileSync(AUTH_FILE(cwd), 'utf8'));
   } catch {
     return {};
   }
@@ -378,73 +345,6 @@ function saveAuthKey(provider, key, opts = {}) {
     if (provider === 'claude') process.env.ANTHROPIC_API_KEY = active.key;
     if (provider === 'openai') process.env.OPENAI_API_KEY = active.key;
   }
-}
-
-/**
- * Remove a key by index from the provider's array.
- * @param {string} provider
- * @param {number} index
- * @param {string} [cwd]
- */
-function removeAuthKey(provider, index, cwd) {
-  const authFile = AUTH_FILE(cwd);
-  const dir = dirname(authFile);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-
-  const auth = loadAuthKeys(cwd);
-  if (!Array.isArray(auth[provider])) return;
-
-  auth[provider].splice(index, 1);
-  writeFileSync(authFile, JSON.stringify(auth, null, 2));
-  chmodSync(authFile, 0o600);
-}
-
-/**
- * Mark a key as enabled:false (used during failover when a key hits rate limits).
- * @param {string} provider
- * @param {number} index
- * @param {string} [cwd]
- */
-function disableKey(provider, index, cwd) {
-  const authFile = AUTH_FILE(cwd);
-  const dir = dirname(authFile);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-
-  const auth = loadAuthKeys(cwd);
-  if (!Array.isArray(auth[provider]) || !auth[provider][index]) return;
-
-  auth[provider][index].enabled = false;
-  writeFileSync(authFile, JSON.stringify(auth, null, 2));
-  chmodSync(authFile, 0o600);
-}
-
-/**
- * Called when the active key hits a rate limit. Disables the current active key
- * temporarily and returns the next valid key, or null if none available.
- * @param {string} provider
- * @param {string} [cwd]
- * @returns {{ key: string, label: string, priority: number, enabled: boolean, expiresAt: string|null }|null}
- */
-function rotateToNextKey(provider, cwd) {
-  const auth = loadAuthKeys(cwd);
-  const keys = auth[provider] || [];
-  const now = new Date();
-
-  // Find current active key index
-  const sortedValid = keys
-    .map((k, i) => ({ ...k, _idx: i }))
-    .filter(k => k.enabled)
-    .filter(k => !k.expiresAt || new Date(k.expiresAt) > now)
-    .sort((a, b) => (a.priority || 99) - (b.priority || 99));
-
-  if (sortedValid.length === 0) return null;
-
-  // Disable the current active key
-  const currentIdx = sortedValid[0]._idx;
-  disableKey(provider, currentIdx, cwd);
-
-  // Reload and get the next valid key
-  return getActiveKey(provider, cwd);
 }
 
 /**
@@ -974,6 +874,6 @@ export {
   detectPlans, syncPreferencesToMemory,
   detectAuth, detectEnvironment,
   setupAuth, saveAuthKey, loadAuthKeys,
-  getActiveKey, removeAuthKey, disableKey, rotateToNextKey,
+  getActiveKey,
   defaultProfile, autoSetup,
 };

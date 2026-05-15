@@ -66,9 +66,7 @@ Commands:
 
 Interactive mode (entered with no args on a TTY):
   Shows dashboard screen with menu-driven navigation.
-  [g] Go — dispatch a task
-  [s] Status, [p] Profile, [a] Auth, [d] Diagnostics
-  [c] Command mode (REPL), [q] Exit
+  [s] Status, [p] Profile, [a] Auth, [d] Diagnostics, [q] Exit
 
 Options:
   --version                 Print version
@@ -154,6 +152,9 @@ async function cmdInit(rl) {
   // --- Step 2: Run onboarding wizard (pass shared rl so it isn't closed) ---
   const profile = await runOnboarding({ interactive: true, detectedAuth: auth, rl });
   saveProfile(profile, { cwd });
+
+  // --- Step 2b: Install hooks so enforcement is active from first run ---
+  await cmdInstall(cwd);
 
   // --- Step 3: Show dashboard ---
   console.log('');
@@ -280,6 +281,27 @@ async function cmdGo(args) {
     }, cwd);
   } else {
     result = await dispatch({ decision, prompt, files, cwd });
+    if (result.status === 'completed' && result.type === 'native-agent') {
+      const nd = result.nativeDispatch || {};
+      const promptPreview = (nd.prompt || prompt).slice(0, 100);
+      const promptSuffix  = (nd.prompt || prompt).length > 100 ? '...' : '';
+      console.log(`\nRouted: ${decision.provider}/${nd.model || decision.model} (${decision.tier})`);
+      console.log('To dispatch, use the Agent tool with:');
+      console.log(`  model: ${nd.model || decision.model}`);
+      console.log(`  prompt: ${promptPreview}${promptSuffix}`);
+      if (nd.isolation)  console.log(`  isolation: ${nd.isolation}`);
+      if (nd.maxTurns)   console.log(`  maxTurns: ${nd.maxTurns}`);
+      saveSession({
+        objective:    prompt,
+        branch:       null,
+        filesChanged: files,
+        commandsRun:  [`dual-brain go "${prompt}"`],
+        lastResult:   { status: 'success', summary: `native-agent routed to ${nd.model || decision.model}` },
+        provider:     decision.provider,
+        nextAction:   null,
+      }, cwd);
+      return;
+    }
     const statusLine = result.status === 'completed' ? 'Done' : `Failed (exit ${result.exitCode})`;
     console.log(`\n${statusLine} in ${(result.durationMs / 1000).toFixed(1)}s`);
     if (result.summary) console.log(result.summary);
@@ -443,7 +465,7 @@ async function cmdStatus(args = []) {
 
 const PROVIDER_MODEL_CLASSES = {
   claude: ['haiku', 'sonnet', 'opus'],
-  openai: ['o4-mini', 'o3', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-5.4', 'gpt-5.5'],
+  openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'],
 };
 
 function cmdHot(providerArg) {
@@ -466,8 +488,8 @@ function cmdCool(providerArg) {
   console.log(`Cleared hot state for all ${provider} model classes.`);
 }
 
-async function cmdInstall() {
-  const cwd = process.cwd();
+async function cmdInstall(cwd) {
+  if (!cwd) cwd = process.cwd();
 
   // Run the main install.mjs (orchestrator config, all hooks, CLAUDE.md, etc.)
   const { spawnSync } = await import('child_process');
@@ -486,8 +508,6 @@ async function cmdInstall() {
     console.log(`Enforcement hooks already present (${skipped.length}):`);
     for (const item of skipped) console.log(`  = ${item}`);
   }
-
-  process.exit(0);
 }
 
 function cmdRemember(text) {
@@ -559,6 +579,7 @@ async function welcomeScreen(rl, ask) {
     } else {
       // Enter or anything else → save and go to dashboard
       saveProfile(setup.profile, { cwd });
+      await cmdInstall(cwd);
       return { next: 'dashboard' };
     }
   } else {
@@ -684,6 +705,8 @@ async function welcomeScreen(rl, ask) {
   console.log('');
   console.log(box('Setup Complete', summaryLines));
   console.log('');
+
+  await cmdInstall(cwd);
 
   return { next: 'dashboard' };
 }
