@@ -775,8 +775,26 @@ async function dispatch(input = {}) {
   }
 
   const effectiveProvider = validated.provider;
-  const effectiveModel    = validated.model ?? decision.model ?? 'sonnet';
-  const effectiveDecision = { ...validated };
+  let effectiveModel    = validated.model ?? decision.model ?? 'sonnet';
+  let effectiveDecision = { ...validated };
+
+  // modelSuggestion influence: if the pipeline provided a model suggestion from models.mjs,
+  // apply it when the current model is a tier default/fallback (not an explicit override).
+  // The suggestion is advisory — it only applies when the decision didn't pin a specific model.
+  if (input.modelSuggestion?.model && effectiveProvider === 'claude') {
+    const TIER_DEFAULTS = new Set(['haiku', 'sonnet', 'opus']);
+    const decisionModelExplicit = decision._explicit?.model ?? false;
+    const isDefault = !decisionModelExplicit && TIER_DEFAULTS.has(effectiveModel);
+    if (isDefault) {
+      const suggestedAlias = mapToAgentModel(input.modelSuggestion.model, effectiveDecision.tier ?? 'execute');
+      const validList = VALID_MODELS[effectiveProvider] ?? [];
+      if (validList.includes(suggestedAlias)) {
+        effectiveModel = suggestedAlias;
+        effectiveDecision = { ...effectiveDecision, model: suggestedAlias };
+        if (verbose) process.stderr.write(`\x1b[2m[dual-brain] modelSuggestion applied: ${suggestedAlias} (${input.modelSuggestion.reason})\x1b[0m\n`);
+      }
+    }
+  }
 
   // ── Feature 2: Dirty-worktree guard for execute-tier dispatches ──────────
   if (tier === 'execute' && decision.owns && !decision._force) {

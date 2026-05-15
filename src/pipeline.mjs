@@ -666,6 +666,16 @@ export async function runPipeline(trigger, prompt, options = {}) {
       // intelligence module not available — continue without it (degraded)
     }
 
+    // Doctor: discover capabilities (cached per process via discovery log)
+    try {
+      const { discover, verifyAll } = await import('./doctor.mjs');
+      const doctorCwd = options.cwd || process.cwd();
+      discover(doctorCwd);    // writes to .dual-brain/discoveries.jsonl (idempotent)
+      verifyAll(doctorCwd);   // writes to .dual-brain/verifications.jsonl
+    } catch (e) {
+      // doctor not available — non-blocking
+    }
+
     // Ledger: check open tasks + create task for this run
     try {
       const { getOpenTasks, createTask, reconcile } = await import('./ledger.mjs');
@@ -895,8 +905,21 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     if (dryRun) {
       run.completedAt = Date.now();
-      // Return legacy-compatible shape for dry-run callers
-      return { plan: run.plan, result: null, verification: null, run };
+      // Return legacy-compatible shape plus intelligence fields for dry-run callers
+      return {
+        plan: run.plan,
+        result: null,
+        verification: null,
+        run,
+        // Intelligence fields (mirrors full execution return)
+        projectBrief:     run.projectBrief,
+        contradictions:   run.contradictions,
+        promptAnalysis:   run.promptAnalysis,
+        environment:      run.environment,
+        modelSuggestion:  run.modelSuggestion,
+        thinkResult:      run.thinkResult,
+        decisionPreflight: run.decisionPreflight,
+      };
     }
 
     // Gate 4: Execution gate (cleared to work?)
@@ -924,26 +947,29 @@ export async function runPipeline(trigger, prompt, options = {}) {
       profile: run.context.profile,
       situationBrief: run.situationBrief,
       adaptation: run.adaptation,
+      modelSuggestion: run.modelSuggestion,
     });
 
     // Update ledger task with result
     if (run.taskId) {
-      try {
-        const { updateTask, failTask } = await import('./ledger.mjs');
-        const cwd = options.cwd || process.cwd();
+      const { updateTask, failTask } = await import('./ledger.mjs');
+      const ledgerCwd = options.cwd || process.cwd();
 
-        if (run.result && !run.result.error) {
-          updateTask(run.taskId, {
-            status: 'done',
-            result: typeof run.result === 'string' ? run.result : JSON.stringify(run.result).slice(0, 500),
-            proof: run.verification ? 'Pipeline verification passed' : 'Execution completed',
-            files: run.result.filesChanged || run.plan?.targetFiles || []
-          }, cwd);
-        } else {
-          failTask(run.taskId, run.result?.error || 'Pipeline execution failed', cwd);
+      if (run.result && !run.result.error) {
+        // updateTask throws if proof/result is missing — let that propagate so
+        // the outcome gate catches it rather than silently succeeding.
+        updateTask(run.taskId, {
+          status: 'done',
+          result: typeof run.result === 'string' ? run.result : JSON.stringify(run.result).slice(0, 500),
+          proof: run.verification ? 'Pipeline verification passed' : 'Execution completed',
+          files: run.result.filesChanged || run.plan?.targetFiles || []
+        }, ledgerCwd);
+      } else {
+        try {
+          failTask(run.taskId, run.result?.error || 'Pipeline execution failed', ledgerCwd);
+        } catch (e) {
+          // failTask failure is non-blocking
         }
-      } catch (e) {
-        // ledger update failed — non-blocking
       }
     }
 
@@ -976,6 +1002,62 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     if (!run.verification.ok) {
       _incrementFailureCache(prompt);
+    }
+
+    // Track cost after verification (fail-silent — advisory only)
+    try {
+      const { trackCost } = await import('./cost-tracker.mjs');
+      const tokensEstimated =
+        (run.result?.usage?.inputTokens ?? run.result?.tokensUsed?.input ?? 0) +
+        (run.result?.usage?.outputTokens ?? run.result?.tokensUsed?.output ?? 0);
+      trackCost({
+        action: trigger || 'execute',
+        model:  run.result?.model ?? run.plan?._decision?.model ?? 'default',
+        tier:   run.plan?.tier ?? 'standard',
+        tokensEstimated,
+        wasCacheHit: false,
+        tokensSaved: 0,
+      }, cwd);
+    } catch (e) {
+      // cost-tracker not available — non-blocking
+    }
+
+    // Living docs: update state after significant execution (fail-silent — advisory only)
+    try {
+      const { updateState } = await import('./living-docs.mjs');
+      const docsCwd = options.cwd || process.cwd();
+      const successFlag = run.result && !run.result.error && run.verification.ok;
+      const stateEntry =
+        `# Current State\n\nLast run: ${new Date().toISOString()}\n` +
+        `Task: ${prompt.slice(0, 120)}\n` +
+        `Status: ${successFlag ? 'completed' : 'failed'}\n` +
+        `Tier: ${run.plan?.tier ?? 'unknown'}\n` +
+        `Model: ${run.plan?.primaryModel ?? 'unknown'}\n`;
+      updateState(stateEntry, docsCwd);
+    } catch (e) {
+      // living-docs not available — non-blocking
+    }
+
+    // Doctor: record learning from this execution outcome (fail-silent)
+    try {
+      const { recordLearning } = await import('./doctor.mjs');
+      const doctorCwd = options.cwd || process.cwd();
+      const successFlag = run.result && !run.result.error && run.verification.ok;
+      recordLearning({
+        taskType:      run.context?.detection?.intent ?? 'unknown',
+        prompt,
+        model:         run.result?.model ?? run.plan?._decision?.model ?? '',
+        provider:      run.result?.provider ?? run.plan?.primaryProvider ?? '',
+        tier:          run.plan?.tier ?? '',
+        reasoningDepth: run.plan?.reasoningDepth ?? 'low',
+        wasEnriched:   !!run.enrichedPrompt,
+        wasDualBrain:  !!(run.plan?.useChallenger && run.plan?.challengerModel),
+        success:       successFlag,
+        duration:      run.completedAt ? (Date.now() - run.startedAt) : 0,
+        filesChanged:  (run.result?.filesChanged ?? []).length,
+      }, doctorCwd);
+    } catch (e) {
+      // doctor not available — non-blocking
     }
 
     // ── Phase 5: Outcome ──────────────────────────────────────────────────────

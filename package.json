@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "7.1.30",
+  "version": "0.2.0",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -43,6 +43,7 @@
   "scripts": {
     "test": "node .claude/hooks/test-orchestrator.mjs",
     "test:core": "node --test src/test.mjs",
+    "prepublishOnly": "node .claude/hooks/repo-doctor.mjs",
     "postinstall": "echo 'dual-brain installed. Run: dual-brain install (in your project) to set up hooks.'",
     "postpublish": "node scripts/verify-publish.mjs"
   },
