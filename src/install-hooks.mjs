@@ -14,7 +14,7 @@ const __dirname  = dirname(__filename);
 const PKG_ROOT   = join(__dirname, '..');
 
 // The hook commands we want present in .claude/settings.json PreToolUse
-const HEAD_GUARD_CMD   = 'bash .claude/hooks/head-guard.sh';
+const HEAD_GUARD_CMD   = 'node .claude/hooks/head-guard.mjs';
 const ENFORCE_TIER_CMD = 'node .claude/hooks/enforce-tier.mjs';
 
 const DESIRED_HOOKS = [
@@ -44,7 +44,7 @@ export function installHooks(cwd) {
 
   // Copy hook files from package into project's .claude/hooks/
   const filesToCopy = [
-    { name: 'head-guard.sh',    exec: true },
+    { name: 'head-guard.mjs',   exec: true },
     { name: 'enforce-tier.mjs', exec: false },
   ];
 

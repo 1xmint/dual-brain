@@ -195,6 +195,20 @@ function quickPressureCheck(tier) {
 const SEARCH_WORDS = /\b(explore|search|find|grep|locate|where\s+is|list\s+files|read[-\s]?only|lookup|scan)\b/i;
 const THINK_WORDS = /\b(plan|design|architect|review|audit|security|code[-\s]?review|threat[-\s]?model|complex[-\s]?debug)\b/i;
 
+// ─── Write-intent enforcement ─────────────────────────────────────────────────
+// Keywords that indicate an agent will mutate files or system state.
+const WRITE_INTENT_WORDS = /\b(edit|fix|change|update|create|write|modify|implement|refactor|add|remove|delete|build|install|configure|patch|apply|move|rename|migrate|replace|rewrite|generate|scaffold|init(?:ialize)?|setup|deploy|run\s+tests?|commit|push|install|uninstall)\b/i;
+
+// Dispatch marker prefix stamped by src/dispatch.mjs for all legitimate dispatches.
+const DISPATCH_MARKER_RE = /<!--\s*dual-brain-dispatch:\s*[a-z0-9]+\s*-->/i;
+
+/**
+ * Determine whether a prompt is purely read-only (no write keywords at all).
+ */
+function isReadOnly(prompt) {
+  return !WRITE_INTENT_WORDS.test(prompt);
+}
+
 function preferredModel(config, tier) {
   const models = config?.subscriptions?.claude?.models ?? {};
   for (const [name, meta] of Object.entries(models)) {
@@ -212,9 +226,36 @@ try {
   }
 
   const ti = input.tool_input || {};
-  const text = `${ti.description || ''} ${ti.prompt || ''}`.toLowerCase();
+  // Use the raw prompt for dispatch-marker and write-intent checks (before lowercasing).
+  const rawPrompt = `${ti.description || ''} ${ti.prompt || ''}`;
+  const text = rawPrompt.toLowerCase();
   const subType = (ti.subagent_type || '').toLowerCase();
   const currentModel = (ti.model || '').toLowerCase();
+
+  // ── Dispatch pipeline gate ─────────────────────────────────────────────────
+  // Block write-capable agents that did NOT come through src/dispatch.mjs.
+  // Legitimate dispatches have a <!-- dual-brain-dispatch: <runId> --> marker
+  // prepended to the prompt by dispatch() / dispatchDualBrain().
+  //
+  // Skip enforcement when already inside a subagent (agent_id present) —
+  // nested agent spawns from within a work agent are fine.
+  const hasMarker = DISPATCH_MARKER_RE.test(rawPrompt);
+  const inSubagent = Boolean(input.agent_id);
+
+  if (!inSubagent && !hasMarker && !isReadOnly(rawPrompt)) {
+    // Write-intent detected in HEAD session without the dispatch marker → block.
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          '[dual-brain] Write-capable agents must go through dispatch. Use: dual-brain go "task"',
+      },
+    }));
+    process.exit(2);
+  }
+  // (If hasMarker is true OR the prompt is read-only we fall through to normal
+  //  tier-routing logic below.)
 
   // Compute prompt hash early for duplicate detection and logging
   const promptHash = computePromptHash(ti);

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/head-guard.sh"
+            "command": "node .claude/hooks/head-guard.mjs"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/head-guard.sh"
+            "command": "node .claude/hooks/head-guard.mjs"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/head-guard.sh"
+            "command": "node .claude/hooks/head-guard.mjs"
           }
         ]
       },
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/head-guard.sh"
+            "command": "node .claude/hooks/head-guard.mjs"
           }
         ]
       },

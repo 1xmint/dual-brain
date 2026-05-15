@@ -345,6 +345,28 @@ function runProcess(cmd, cwd, timeoutMs) {
   });
 }
 
+// ─── Dispatch marker ─────────────────────────────────────────────────────────
+// Prepend a marker to every prompt that goes through the official dispatch pipeline.
+// The enforce-tier hook checks for this marker to distinguish legitimate dispatches
+// from raw Agent calls made by the HEAD that bypass the dual-brain pipeline.
+// Format: <!-- dual-brain-dispatch: <runId> -->
+// runId is a short timestamp-based ID that ties back to this dispatch session.
+
+let _dispatchRunId = null;
+
+function _getDispatchRunId() {
+  if (!_dispatchRunId) {
+    // Generate once per process: timestamp + random suffix
+    _dispatchRunId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+  return _dispatchRunId;
+}
+
+function _prependDispatchMarker(prompt) {
+  const runId = _getDispatchRunId();
+  return `<!-- dual-brain-dispatch: ${runId} -->\n${prompt}`;
+}
+
 // ─── Main dispatch ────────────────────────────────────────────────────────────
 async function dispatch(input = {}) {
   const { decision = {}, files = [], cwd = process.cwd(), dryRun = false } = input;
@@ -354,6 +376,10 @@ async function dispatch(input = {}) {
 
   // Safety gate: redact secrets before anything reaches a subprocess or log
   prompt = redact(prompt);
+
+  // Stamp the prompt with the dispatch marker so enforce-tier.mjs can recognise
+  // that this agent call came through the official pipeline.
+  prompt = _prependDispatchMarker(prompt);
 
   const tier     = decision.tier ?? 'execute';
   const timeoutMs = TIER_TIMEOUT_MS[tier] ?? 120_000;
@@ -488,6 +514,9 @@ async function dispatchDualBrain(input = {}) {
 
   // Safety gate: redact secrets before sending to either provider
   prompt = redact(prompt);
+
+  // Stamp with dispatch marker so enforce-tier.mjs allows this Agent call
+  prompt = _prependDispatchMarker(prompt);
 
   // Feature 1: Validate both sub-decisions before spawning anything
   const rt = await detectRuntime();

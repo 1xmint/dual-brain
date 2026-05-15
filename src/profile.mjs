@@ -28,6 +28,172 @@ import { homedir } from 'os';
 import { join } from 'path';
 
 // ---------------------------------------------------------------------------
+// Claude Code memory integration
+// ---------------------------------------------------------------------------
+
+const MEMORY_FILE_NAME = 'dual_brain_preferences.md';
+const MEMORY_INDEX_ENTRY =
+  '- [Dual-brain preferences](dual_brain_preferences.md) — Active routing preferences for model/provider selection';
+
+/**
+ * Derive the Claude Code memory directory for the given project root.
+ * Returns null when the directory doesn't exist (i.e. not running on Replit).
+ */
+function _memoryDir(cwd) {
+  const root = cwd || process.cwd();
+  // Replit persistent memory lives at a fixed path derived from the workspace root.
+  // Convert e.g. /home/runner/workspace → -home-runner-workspace
+  const encoded = root.replace(/\//g, '-');
+  const candidate = join(
+    root,
+    '.replit-tools',
+    '.claude-persistent',
+    'projects',
+    encoded,
+    'memory',
+  );
+  return existsSync(candidate) ? candidate : null;
+}
+
+/**
+ * Write (or update) the dual_brain_preferences.md file in the Claude Code
+ * memory directory, and ensure MEMORY.md has an index entry for it.
+ * Fails silently if the memory directory is absent or unwritable.
+ */
+function syncPreferencesToMemory(profile, cwd) {
+  try {
+    const memDir = _memoryDir(cwd);
+    if (!memDir) return; // not on Replit / memory dir missing — skip silently
+
+    const prefs = (profile.preferences || []).filter(p => p.enabled);
+
+    // Build markdown body
+    const prefLines = prefs.length
+      ? prefs.map(p => `- ${p.text} (scope: ${p.scope || 'project'})`).join('\n')
+      : '_(no active preferences)_';
+
+    const content = [
+      '---',
+      'name: dual-brain-preferences',
+      'description: Active dual-brain routing preferences — affects model selection, provider choice, and dual-brain consensus',
+      'metadata:',
+      '  type: project',
+      '---',
+      '',
+      'Active dual-brain preferences:',
+      '',
+      prefLines,
+      '',
+      'These preferences are enforced by the dual-brain orchestrator routing engine.',
+      'Provider routing, model selection, and dual-brain consensus decisions',
+      'respect these preferences automatically via src/decide.mjs.',
+      '',
+    ].join('\n');
+
+    const prefFile = join(memDir, MEMORY_FILE_NAME);
+    writeFileSync(prefFile, content, 'utf8');
+
+    // Update MEMORY.md index — add entry only if not already present
+    const indexFile = join(memDir, 'MEMORY.md');
+    if (existsSync(indexFile)) {
+      const existing = readFileSync(indexFile, 'utf8');
+      if (!existing.includes(MEMORY_FILE_NAME)) {
+        writeFileSync(indexFile, existing.trimEnd() + '\n' + MEMORY_INDEX_ENTRY + '\n', 'utf8');
+      }
+    }
+  } catch {
+    // Non-fatal — the profile JSON remains the source of truth
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-detect subscription plans from provider config files
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode a JWT payload without verifying the signature.
+ * Returns the payload object, or null on failure.
+ * @param {string} token
+ */
+function decodeJwtPayload(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    // Base64url → base64 → Buffer
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detect actual subscription plans from Claude Code and Codex config files.
+ * Returns { claude: '$20'|'$100'|'$200'|null, openai: '$20'|'$100'|'$200'|null }.
+ * Returns nulls for any provider whose config cannot be read — never throws.
+ */
+function detectPlans() {
+  const plans = { claude: null, openai: null };
+
+  // --- Claude: read organizationRateLimitTier from .claude.json ---
+  const claudePaths = [
+    // Replit-tools persistent path (takes precedence)
+    '/home/runner/workspace/.replit-tools/.claude-persistent/.claude.json',
+    join(homedir(), '.claude', '.claude.json'),
+  ];
+  for (const p of claudePaths) {
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf8'));
+      const tier = data?.oauthAccount?.organizationRateLimitTier;
+      if (tier) {
+        if (tier.includes('max_20x')) plans.claude = '$200';
+        else if (tier.includes('max_5x')) plans.claude = '$100';
+        else plans.claude = '$20';
+      }
+      break;
+    } catch { continue; }
+  }
+
+  // --- OpenAI/Codex: read plan from auth.json (direct field or JWT payload) ---
+  const codexPaths = [
+    // Replit-tools persistent path (takes precedence)
+    '/home/runner/workspace/.replit-tools/.codex-persistent/auth.json',
+    join(homedir(), '.codex', 'auth.json'),
+  ];
+  for (const p of codexPaths) {
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf8'));
+
+      // Try a top-level `plan` field first
+      let planType = data.plan ?? null;
+
+      // Fall back to decoding the JWT id_token or access_token
+      if (!planType) {
+        for (const key of ['id_token', 'access_token']) {
+          const token = data?.tokens?.[key];
+          if (!token) continue;
+          const payload = decodeJwtPayload(token);
+          planType =
+            payload?.['https://api.openai.com/auth']?.chatgpt_plan_type ?? null;
+          if (planType) break;
+        }
+      }
+
+      if (planType) {
+        // pro / prolite → $100 | plus → $20 | pro200 / team → $200
+        if (planType === 'pro200' || planType === 'team') plans.openai = '$200';
+        else if (planType === 'pro' || planType === 'prolite') plans.openai = '$100';
+        else plans.openai = '$20';
+      }
+      break;
+    } catch { continue; }
+  }
+
+  return plans;
+}
+
+// ---------------------------------------------------------------------------
 // Paths & defaults
 // ---------------------------------------------------------------------------
 
@@ -86,12 +252,36 @@ function migrateProfile(profile) {
 // ---------------------------------------------------------------------------
 
 function loadProfile(cwd) {
+  let profile;
   for (const p of [projectPath(cwd), GLOBAL_PATH]) {
     if (existsSync(p)) {
-      try { return migrateProfile(JSON.parse(readFileSync(p, 'utf8'))); } catch { /* skip */ }
+      try { profile = migrateProfile(JSON.parse(readFileSync(p, 'utf8'))); break; } catch { /* skip */ }
     }
   }
-  return defaultProfile();
+  if (!profile) profile = defaultProfile();
+
+  // Auto-detect plans from provider config files and apply if detected.
+  const detected = detectPlans();
+  for (const [provider, detectedPlan] of Object.entries(detected)) {
+    if (!detectedPlan) continue;
+    if (!profile.providers[provider]) continue;
+    const stored = profile.providers[provider].plan;
+    if (stored !== detectedPlan) {
+      const labels = {
+        claude: {
+          '$20': 'Claude Pro ($20)', '$100': 'Claude Max x5 ($100)', '$200': 'Claude Max x20 ($200)',
+        },
+        openai: {
+          '$20': 'ChatGPT Plus ($20)', '$100': 'ChatGPT Pro ($100)', '$200': 'ChatGPT Pro ($200)',
+        },
+      };
+      const label = labels[provider]?.[detectedPlan] ?? `${provider} ${detectedPlan}`;
+      process.stderr.write(`[dual-brain] Detected ${label} plan\n`);
+      profile.providers[provider].plan = detectedPlan;
+    }
+  }
+
+  return profile;
 }
 
 function saveProfile(profile, opts = {}) {
@@ -170,6 +360,7 @@ function rememberPreference(text, opts = {}) {
   if (idx >= 0) profile.preferences[idx] = { text, enabled: true, scope };
   else profile.preferences.push({ text, enabled: true, scope });
   saveProfile(profile, { cwd, global: opts.global || scope === 'global' });
+  syncPreferencesToMemory(profile, cwd);
   return profile;
 }
 
@@ -178,6 +369,7 @@ function forgetPreference(text, cwd) {
   const needle  = text.toLowerCase();
   profile.preferences = profile.preferences.filter(p => !p.text.toLowerCase().includes(needle));
   saveProfile(profile, { cwd });
+  syncPreferencesToMemory(profile, cwd);
   return profile;
 }
 
@@ -276,4 +468,5 @@ export {
   loadProfile, saveProfile, ensureProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
+  detectPlans, syncPreferencesToMemory,
 };

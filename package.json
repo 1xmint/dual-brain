@@ -54,6 +54,7 @@
     "orchestrator.json",
     "hookify.*.local.md",
     "review-rules.md",
+    "AGENTS.md",
     "CLAUDE.md",
     "README.md",
     "LICENSE",

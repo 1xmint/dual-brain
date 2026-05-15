@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# head-guard.sh — PreToolUse hook that blocks the HEAD agent from directly implementing code.
+# head-guard.sh — DEPRECATED. Replaced by head-guard.mjs.
 #
-# Claude Code calls this before every tool invocation:
-#   - CLAUDE_TOOL_NAME  = name of the tool being called (e.g. "Edit", "Bash")
-#   - stdin             = tool input as JSON
+# This file is kept for reference only. It never worked correctly because it
+# reads CLAUDE_TOOL_NAME from the environment, but Claude Code delivers tool
+# info via stdin JSON, not environment variables.
 #
-# Exit 0  → allow
-# Exit 2  → block  (stderr message is shown to Claude)
+# The replacement (head-guard.mjs) reads stdin JSON, detects HEAD vs subagent
+# via `agent_id`, and returns the correct permissionDecision block format.
+#
+# Do not use this file. See hooks/head-guard.mjs instead.
 
 BLOCK_MSG='[dual-brain] HEAD cannot use this tool directly. Dispatch via: dual-brain go "task description"'
 
