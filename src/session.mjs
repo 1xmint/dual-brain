@@ -461,23 +461,38 @@ export function importReplitSessions(cwd = process.cwd()) {
   const windowMs = windowHours * 60 * 60 * 1000;
   const cutoff = Date.now() - windowMs;
 
+  // Load existing session index for smartName lookup (best-effort, non-fatal)
+  let sessionIndex = {};
+  try {
+    const indexPath = join(cwd, '.dualbrain', 'session-index.json');
+    if (existsSync(indexPath)) {
+      sessionIndex = JSON.parse(readFileSync(indexPath, 'utf8'));
+    }
+  } catch { /* non-fatal */ }
+
   // Build session list
   for (const [id, sess] of bySession) {
     // Skip sessions outside the recency window (timestamps are in ms)
     if (sess.lastTimestamp < cutoff) continue;
-    // Derive display name
-    let name = sess.firstPrompt;
+
+    // Use smartName from index if available, otherwise fall back to first prompt
+    let name = sessionIndex[id]?.smartName || null;
+
     if (!name) {
-      // Fallback: use first non-login display
-      const firstReal = sess.entries.find(e => e.display && e.display !== 'login');
-      name = firstReal?.display || `Session ${id.slice(0, 8)}`;
+      // Classic fallback: first meaningful prompt
+      name = sess.firstPrompt;
+      if (!name) {
+        const firstReal = sess.entries.find(e => e.display && e.display !== 'login');
+        name = firstReal?.display || `Session ${id.slice(0, 8)}`;
+      }
+      // Truncate long names that came from raw prompts
+      if (name.length > 60) name = name.slice(0, 57) + '...';
     }
-    // Truncate long names
-    if (name.length > 60) name = name.slice(0, 57) + '...';
 
     sessions.push({
       id: sess.sessionId,
       name,
+      smartName: sessionIndex[id]?.smartName || null,
       project: sess.project,
       promptCount: sess.entries.length,
       lastActive: new Date(sess.lastTimestamp).toISOString(),
@@ -741,6 +756,159 @@ export function syncSessionMirror(cwd = process.cwd()) {
   return { copied: totalCopied, grew: totalGrew };
 }
 
+// ─── Smart session naming ─────────────────────────────────────────────────────
+
+/**
+ * File pattern → human label mapping (checked in order, first match wins).
+ * Each entry: { pattern: RegExp, label: string, action?: string }
+ */
+const FILE_PATTERN_RULES = [
+  { pattern: /auth/i,      label: 'Auth',      action: 'Refactor' },
+  { pattern: /test|spec/i, label: 'Tests',     action: 'Fix' },
+  { pattern: /dispatch/i,  label: 'Dispatch',  action: 'Update' },
+  { pattern: /session/i,   label: 'Session',   action: 'Update' },
+  { pattern: /profile/i,   label: 'Profile',   action: 'Update' },
+  { pattern: /detect/i,    label: 'Detection', action: 'Update' },
+  { pattern: /decide/i,    label: 'Routing',   action: 'Update' },
+  { pattern: /budget/i,    label: 'Budget',    action: 'Update' },
+  { pattern: /hook/i,      label: 'Hooks',     action: 'Update' },
+  { pattern: /install/i,   label: 'Install',   action: 'Update' },
+  { pattern: /config/i,    label: 'Config',    action: 'Update' },
+  { pattern: /migrate/i,   label: 'Migration', action: 'Add' },
+];
+
+/**
+ * Topic words that suggest a dominant action verb.
+ */
+const TOPIC_ACTION_MAP = [
+  { words: ['fix', 'bug', 'error', 'crash', 'broken', 'fail'],  action: 'Fix' },
+  { words: ['refactor', 'cleanup', 'clean', 'reorganize'],       action: 'Refactor' },
+  { words: ['add', 'implement', 'create', 'build', 'write'],     action: 'Add' },
+  { words: ['update', 'upgrade', 'bump', 'patch'],               action: 'Update' },
+  { words: ['test', 'spec', 'coverage'],                         action: 'Fix' },
+  { words: ['deploy', 'release', 'publish'],                     action: 'Deploy' },
+  { words: ['audit', 'review', 'check'],                         action: 'Review' },
+];
+
+/**
+ * Convert a string to Title Case.
+ * @param {string} str
+ * @returns {string}
+ */
+function toTitleCase(str) {
+  return str.replace(/\b\w/g, c => c.toUpperCase());
+}
+
+/**
+ * Strip file extensions from a name candidate.
+ * @param {string} name
+ * @returns {string}
+ */
+function stripExtensions(name) {
+  return name.replace(/\.(mjs|js|ts|tsx|jsx|json|md|css|html|py|sh|sql|toml|yaml|yml)\b/gi, '');
+}
+
+/**
+ * Truncate a string to maxLen characters, preserving whole words where possible.
+ * @param {string} str
+ * @param {number} maxLen
+ * @returns {string}
+ */
+function truncate(str, maxLen = 40) {
+  if (str.length <= maxLen) return str;
+  const cut = str.slice(0, maxLen).replace(/\s+\S*$/, '');
+  return cut || str.slice(0, maxLen);
+}
+
+/**
+ * Generate a smart human-readable session name from session index data.
+ *
+ * Priority:
+ *   1. Dominant file pattern (e.g. auth*.mjs → "Refactor Auth Module")
+ *   2. Top topics (e.g. ['auth','token','refresh'] → "Auth Token Refresh")
+ *   3. Fallback: first prompt truncated to 40 chars
+ *
+ * Rules: ≤40 chars, Title Case, no file extensions, action-prefixed when detectable.
+ *
+ * @param {{ topics?: string[], files?: string[], prompts?: { first?: string } }} sessionData
+ * @returns {string}
+ */
+export function generateSmartName(sessionData) {
+  const topics = sessionData.topics || [];
+  const files  = sessionData.files  || [];
+  const firstPrompt = sessionData.prompts?.first || '';
+
+  // ── Step 1: Detect dominant action from topics ─────────────────────────────
+  let detectedAction = null;
+  for (const { words, action } of TOPIC_ACTION_MAP) {
+    if (topics.some(t => words.includes(t))) {
+      detectedAction = action;
+      break;
+    }
+  }
+
+  // ── Step 2: Try file pattern match ─────────────────────────────────────────
+  if (files.length > 0) {
+    // Flatten all filenames for pattern matching
+    const fileNames = files.map(f => f.split('/').pop()).join(' ');
+
+    for (const { pattern, label, action } of FILE_PATTERN_RULES) {
+      if (pattern.test(fileNames)) {
+        const actionWord = detectedAction || action || 'Update';
+        const candidate = `${actionWord} ${label}`;
+        return truncate(toTitleCase(candidate));
+      }
+    }
+
+    // No named pattern — derive a label from the most common directory or base name
+    const basenames = files.map(f => {
+      const base = f.split('/').pop() || f;
+      // Strip extension and convert camelCase/kebab to words
+      return stripExtensions(base)
+        .replace(/[-_]/g, ' ')
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .trim();
+    }).filter(Boolean);
+
+    if (basenames.length > 0) {
+      // Use the most common prefix or first significant basename
+      const label = basenames[0];
+      const actionWord = detectedAction || 'Update';
+      const candidate = `${actionWord} ${label}`;
+      return truncate(toTitleCase(stripExtensions(candidate)));
+    }
+  }
+
+  // ── Step 3: Try top topics ─────────────────────────────────────────────────
+  if (topics.length >= 2) {
+    // Take top 3 topics and compose a name
+    const topTopics = topics.slice(0, 3);
+    const actionWord = detectedAction || null;
+
+    let candidate;
+    if (actionWord) {
+      // Use action + remaining topics
+      candidate = [actionWord, ...topTopics.filter(t => t !== actionWord.toLowerCase())].slice(0, 3).join(' ');
+    } else {
+      candidate = topTopics.join(' ');
+    }
+
+    return truncate(toTitleCase(candidate));
+  }
+
+  if (topics.length === 1) {
+    const actionWord = detectedAction || 'Work on';
+    return truncate(toTitleCase(`${actionWord} ${topics[0]}`));
+  }
+
+  // ── Step 4: Fallback — first prompt truncated ──────────────────────────────
+  if (firstPrompt) {
+    return truncate(firstPrompt);
+  }
+
+  return 'Session';
+}
+
 // ─── Session index ────────────────────────────────────────────────────────────
 
 /**
@@ -841,7 +1009,7 @@ export function buildSessionIndex(cwd = process.cwd()) {
           .slice(0, 10)
           .map(([w]) => w);
 
-        index[sessionId] = {
+        const sessionEntry = {
           id: sessionId,
           topics,
           files: [...fileSet].slice(0, 20),
@@ -851,6 +1019,8 @@ export function buildSessionIndex(cwd = process.cwd()) {
           tool: 'claude',
           _fileSize: fileSize,
         };
+        sessionEntry.smartName = generateSmartName(sessionEntry);
+        index[sessionId] = sessionEntry;
       } catch { continue; }
     }
   }
@@ -904,12 +1074,14 @@ export function buildSessionIndex(cwd = process.cwd()) {
           } catch { continue; }
         }
 
-        index[id] = {
+        const codexEntry = {
           id, topics: [], files: [],
           prompts: { first: firstPrompt || '', last: lastPrompt || '' },
           date: lastTimestamp ? new Date(lastTimestamp * 1000).toISOString() : null,
           messageCount, tool: 'codex', _fileSize: fileSize,
         };
+        codexEntry.smartName = generateSmartName(codexEntry);
+        index[id] = codexEntry;
       } catch { continue; }
     }
   }

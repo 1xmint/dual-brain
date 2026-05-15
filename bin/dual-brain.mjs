@@ -1113,6 +1113,22 @@ async function mainScreen(rl, ask) {
 
   // ── Header: one line above the box ────────────────────────────────────────
   process.stdout.write(`\n🧠 dual-brain v${version}\n`);
+  {
+    let gitName = '';
+    try {
+      const { execSync } = await import('node:child_process');
+      gitName = execSync('git config user.name', { encoding: 'utf8', stdio: ['pipe','pipe','pipe'] }).trim();
+    } catch { /* ignore */ }
+    if (gitName) {
+      const hour = new Date().getHours();
+      let greet;
+      if (hour >= 5 && hour <= 11)  greet = 'Good morning';
+      else if (hour >= 12 && hour <= 16) greet = 'Good afternoon';
+      else if (hour >= 17 && hour <= 21) greet = 'Good evening';
+      else                               greet = 'Late night';
+      process.stdout.write(`\x1b[2m${greet}, ${gitName}\x1b[0m\n`);
+    }
+  }
 
   // ── Status section ────────────────────────────────────────────────────────
   const providerLine = buildProviderStatusLine(profile, auth);
@@ -1164,11 +1180,126 @@ async function mainScreen(rl, ask) {
     bot,
   ];
   process.stdout.write(lines.join('\n') + '\n');
-  process.stdout.write(`\x1b[2mBuilt on data-tools by Steve Moraco\x1b[0m\n\n`);
+  process.stdout.write(`\x1b[2mPowered by data-tools · Steve Moraco\x1b[0m\n\n`);
 
   // ── Key handling ──────────────────────────────────────────────────────────
-  const raw = (await ask('')).trim();
-  const choice = raw.toLowerCase();
+  // Use raw keypress mode so we can show a live type-to-start buffer.
+  // Single-key commands (n, s, q, /, 1-9, Enter) only fire when buffer is empty.
+  let taskBuffer = '';
+
+  const readline = await import('node:readline');
+
+  // Render the type-ahead line below the box (overwrites the current cursor line)
+  const renderBuffer = (buf) => {
+    // Move to the prompt line (we're already at it after printing the box + footer)
+    // Use carriage return + clear-to-end-of-line to overwrite
+    if (buf.length === 0) {
+      process.stdout.write('\r\x1b[K');
+    } else {
+      const display = buf.length > W - 4 ? buf.slice(-(W - 4)) : buf;
+      process.stdout.write(`\r\x1b[K> ${display}\x1b[7m \x1b[0m`);
+    }
+  };
+
+  // Enable keypress events on stdin (safe to call multiple times)
+  readline.emitKeypressEvents(process.stdin, rl);
+
+  const raw = await new Promise((resolve) => {
+    // Switch to raw mode if possible (TTY only)
+    const wasRaw = process.stdin.isRaw;
+    const canRaw = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+    if (canRaw) process.stdin.setRawMode(true);
+
+    const cleanup = () => {
+      process.stdin.removeListener('keypress', onKey);
+      if (canRaw) {
+        try { process.stdin.setRawMode(wasRaw || false); } catch {}
+      }
+    };
+
+    const onKey = (str, key) => {
+      if (!key) return;
+
+      const name = key.name || '';
+      const seq  = key.sequence || str || '';
+
+      // Ctrl-C / Ctrl-D → exit
+      if (key.ctrl && (name === 'c' || name === 'd')) {
+        cleanup();
+        process.stdout.write('\n');
+        resolve('q');
+        return;
+      }
+
+      // Enter key
+      if (name === 'return' || name === 'enter' || seq === '\r' || seq === '\n') {
+        cleanup();
+        if (taskBuffer.length > 0) {
+          process.stdout.write('\n');
+          resolve(`__task__:${taskBuffer}`);
+        } else {
+          resolve('');
+        }
+        return;
+      }
+
+      // Escape → clear buffer
+      if (name === 'escape') {
+        taskBuffer = '';
+        renderBuffer('');
+        return;
+      }
+
+      // Backspace / delete
+      if (name === 'backspace' || name === 'delete') {
+        if (taskBuffer.length > 0) {
+          taskBuffer = taskBuffer.slice(0, -1);
+          renderBuffer(taskBuffer);
+        }
+        return;
+      }
+
+      // Ignore non-printable / control keys
+      if (key.ctrl || key.meta || !str || str.length === 0) return;
+      const code = str.codePointAt(0);
+      if (code < 32 || code === 127) return;
+
+      // Single-key commands only fire when buffer is empty
+      if (taskBuffer.length === 0) {
+        const lower = str.toLowerCase();
+        if (lower === 'n' || lower === 's' || lower === 'q' || lower === '/') {
+          cleanup();
+          process.stdout.write('\n');
+          resolve(lower);
+          return;
+        }
+        const digit = parseInt(str, 10);
+        if (!isNaN(digit) && digit >= 1 && digit <= 9) {
+          cleanup();
+          process.stdout.write('\n');
+          resolve(str);
+          return;
+        }
+      }
+
+      // Accumulate into buffer
+      taskBuffer += str;
+      renderBuffer(taskBuffer);
+    };
+
+    process.stdin.on('keypress', onKey);
+  });
+
+  const choice = typeof raw === 'string' ? raw.toLowerCase() : '';
+
+  // Typed task → dispatch as "dual-brain go"
+  if (raw.startsWith('__task__:')) {
+    const prompt = raw.slice('__task__:'.length).trim();
+    if (prompt) {
+      return { next: 'go', prompt };
+    }
+    return { next: 'main' };
+  }
 
   // Enter (empty) → resume most recent session
   if (raw === '' || choice === '\r') {
@@ -2455,13 +2586,40 @@ async function runScreens(startScreen = 'dashboard') {
   let current = startScreen;
   let ctx = {};
   while (current && current !== 'exit') {
+    // Handle type-to-start dispatch from mainScreen
+    if (current === 'go' && ctx.prompt) {
+      const prompt = ctx.prompt;
+      const cwd    = process.cwd();
+      const profile   = loadProfile(cwd);
+      const detection = detectTask({ prompt });
+      const decision  = decideRoute({ profile, detection, cwd });
+      process.stdout.write(`\n  Routing: ${decision.provider}/${decision.model} (${decision.tier})\n`);
+      process.stdout.write(`  Reason: ${decision.explanation}\n\n`);
+      const { spawnSync } = await import('node:child_process');
+      const launchTool = decision.provider === 'openai' ? 'codex' : 'claude';
+      if (launchTool === 'codex') {
+        spawnSync('codex', [prompt], { stdio: 'inherit' });
+      } else {
+        spawnSync('claude', ['-p', prompt], { stdio: 'inherit' });
+      }
+      const freshSessions = importReplitSessions(cwd);
+      if (freshSessions.length > 0) {
+        saveTerminalState(cwd, getTerminalId(), freshSessions[0].id, launchTool);
+      }
+      current = 'main';
+      ctx = {};
+      continue;
+    }
+
     const screen = SCREENS[current];
     if (!screen) break;
     try {
       const result = await screen(rl, ask, ctx);
       current = result?.next || 'exit';
-      // Pass through context (e.g. selected session) to next screen
-      ctx = result?.session ? { session: result.session } : {};
+      // Pass through context (e.g. selected session, typed prompt) to next screen
+      ctx = result?.session ? { session: result.session }
+          : result?.prompt  ? { prompt: result.prompt }
+          : {};
     } catch (e) {
       console.error(`Error: ${e.message}`);
       current = 'main';
