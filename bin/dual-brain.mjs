@@ -998,112 +998,94 @@ function loadTerminalState(cwd, terminalId) {
   } catch { return null; }
 }
 
+// ─── Dashboard box helpers ────────────────────────────────────────────────────
+
+/**
+ * Build a provider status string for the dashboard status line.
+ * Returns a string like: "🟢 Claude $100×2 $20×1  🟢 OpenAI $100"
+ * Uses ANSI color codes for the dots (no emoji width issues).
+ */
+function buildProviderStatusLine(profile, auth) {
+  const GREEN = '\x1b[32m●\x1b[0m';
+  const RED   = '\x1b[31m●\x1b[0m';
+  const now   = Date.now();
+
+  function providerSegment(provKey, displayName) {
+    const sub    = profile?.providers?.[provKey];
+    const found  = provKey === 'claude' ? auth.claude.found : auth.openai.found;
+    if (!found) return `${RED} ${displayName}: not connected`;
+
+    const expired = sub?.expiresAt && Date.parse(sub.expiresAt) < now;
+    if (expired)  return `${RED} ${displayName}: expired`;
+
+    const dot = GREEN;
+    // Multi-sub: show aggregated plan amounts
+    const subs = sub?.subs;
+    if (subs && subs.length > 0) {
+      const agg = aggregatePlans(subs);
+      return `${dot} ${displayName} ${agg}`;
+    }
+    // Single plan
+    const planPrice = PLAN_PRICES[sub?.plan] || sub?.plan || 'connected';
+    return `${dot} ${displayName} ${planPrice}`;
+  }
+
+  const parts = [];
+  parts.push(providerSegment('claude', 'Claude'));
+  parts.push(providerSegment('openai', 'OpenAI'));
+  return parts.join('  ');
+}
+
+/**
+ * Render a box row padded to inner width W (stripping ANSI for length calculation).
+ * Returns a string like: "│ content padded to W │"
+ */
+function makeBoxRow(content, W) {
+  const plain = content.replace(/\x1b\[[0-9;]*m/g, '');
+  const padding = Math.max(0, W - plain.length);
+  return `│ ${content}${' '.repeat(padding)} │`;
+}
+
 // ─── Screen: mainScreen ───────────────────────────────────────────────────────
 
 async function mainScreen(rl, ask) {
-  const cwd = process.cwd();
+  const cwd     = process.cwd();
   const version = readVersion();
   const profile = loadProfile(cwd);
-  const auth = await detectAuth();
+  const auth    = await detectAuth();
 
   const claudeSub = profile?.providers?.claude;
   const openaiSub = profile?.providers?.openai;
-  const claudePlan = claudeSub?.plan ?? 'Pro';
-  const openaiPlan = openaiSub?.plan ?? 'Plus';
 
-  // Check subscription expiry
-  const now = Date.now();
+  // Check subscription expiry for auto-refresh
+  const now          = Date.now();
   const claudeExpired = claudeSub?.expiresAt && Date.parse(claudeSub.expiresAt) < now;
   const openaiExpired = openaiSub?.expiresAt && Date.parse(openaiSub.expiresAt) < now;
 
-  const claudeDays = daysUntil(claudeSub?.expiresAt);
-  const openaiDays = daysUntil(openaiSub?.expiresAt);
-
-  function subLine(name, plan, found, expired, days, sub) {
-    const label = sub?.label ? ` [${sub.label}]` : '';
-    if (!found) return `⚠️  ${name}: not logged in — run: ${name === 'Claude' ? 'claude auth login' : 'codex login'}`;
-    // Multi-sub: show aggregated counts when more than one sub exists
-    const subs = sub?.subs;
-    if (subs && subs.length > 1) {
-      const aggregate = aggregatePlans(subs);
-      return `✅ ${name}: ${aggregate}  [${subs.length} subs]`;
-    }
-    if (expired) return `🔴 ${name}: ${plan} expired${label} — will re-auth`;
-    const daysNote = (days !== null && days <= 7) ? ` (${days}d left)` : '';
-    return `✅ ${name}: ${plan}${label}${daysNote}`;
-  }
-
-  const headerLines = [
-    subLine('Claude', claudePlan, auth.claude.found, claudeExpired, claudeDays, claudeSub),
-    subLine('OpenAI', openaiPlan, auth.openai.found, openaiExpired, openaiDays, openaiSub),
-  ];
-
-  const rtMain = detectReplitTools(cwd);
-  const dtVersion = (rtMain.installed && rtMain.version) ? rtMain.version : null;
-  console.log(`🧠 Dual Brain v${version}`);
-  const latestVersion = await checkForUpdates(version);
-  if (latestVersion) {
-    console.log(`  ⬆️  Update available: v${version} → v${latestVersion}`);
-    console.log(`     Run: npx -y dual-brain@latest`);
-  }
-  console.log('');
-
-  // Provider status (outside the box)
-  for (const line of headerLines) {
-    console.log(`  ${line}`);
-  }
-  if (dtVersion) {
-    console.log(`  📦 data-tools v${dtVersion} detected`);
-  }
-
-  const sparkline = buildSparkline(cwd);
-  if (sparkline) {
-    console.log(`  Activity: ${sparkline}`);
-  }
-
-  // Silent OAuth token auto-refresh (like data-tools)
+  // Silent OAuth token auto-refresh
   try {
     const { autoRefreshToken } = await import('../src/profile.mjs');
-    const refreshResult = await autoRefreshToken(cwd);
-    if (refreshResult.status === 'refreshed') {
-      console.log(`  🔄 Token auto-refreshed (${refreshResult.hoursRemaining}h remaining)`);
-    }
+    await autoRefreshToken(cwd);
   } catch {}
 
-  // Append-only session archive sync (like data-tools)
+  // Append-only session archive sync
   try {
     const { syncSessionMirror } = await import('../src/session.mjs');
-    const mirror = syncSessionMirror(cwd);
-    if (mirror.copied > 0 || mirror.grew > 0) {
-      console.log(`  ✅ Archive mirror: +${mirror.copied} new, ${mirror.grew} updated`);
-    }
+    syncSessionMirror(cwd);
   } catch {}
 
   // Auto-refresh expired subscriptions
   if (claudeExpired || openaiExpired) {
     const { spawnSync } = await import('node:child_process');
-    const expired = [];
-    if (claudeExpired) expired.push('Claude');
-    if (openaiExpired) expired.push('OpenAI');
-    console.log(`\n  ${expired.join(' & ')} subscription expired. Re-authenticating...`);
     if (claudeExpired) {
       const r = spawnSync('claude', ['auth', 'login'], { stdio: 'inherit', timeout: 30000 });
-      if (r.status === 0) {
-        claudeSub.expiresAt = null;
-        saveProfile(profile, { cwd });
-        console.log('  ✓ Claude re-authenticated');
-      }
+      if (r.status === 0) { claudeSub.expiresAt = null; saveProfile(profile, { cwd }); }
     }
     if (openaiExpired) {
       const r = spawnSync('codex', ['login'], { stdio: 'inherit', timeout: 30000 });
-      if (r.status === 0) {
-        openaiSub.expiresAt = null;
-        saveProfile(profile, { cwd });
-        console.log('  ✓ OpenAI re-authenticated');
-      }
+      if (r.status === 0) { openaiSub.expiresAt = null; saveProfile(profile, { cwd }); }
     }
   }
-  console.log('');
 
   // Build session index in background (powers search + smart resume)
   try {
@@ -1111,244 +1093,152 @@ async function mainScreen(rl, ask) {
     buildSessionIndex(cwd);
   } catch {}
 
-  const recentSessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 7);
+  // Gather recent sessions
+  const recentSessions = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 3);
 
-  if (recentSessions.length > 0) {
-    console.log('  Recent Sessions:');
+  // Detect data-tools version
+  const rtMain    = detectReplitTools(cwd);
+  const dtVersion = (rtMain.installed && rtMain.version) ? rtMain.version : null;
+
+  // ── Box layout ────────────────────────────────────────────────────────────
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 60); // outer width (including │ │)
+  const W     = boxW - 4;                // inner content width (│ {content} │)
+
+  const top = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot = `└${'─'.repeat(boxW - 2)}┘`;
+
+  const row = (content) => makeBoxRow(content, W);
+
+  // ── Header: one line above the box ────────────────────────────────────────
+  process.stdout.write(`\n🧠 dual-brain v${version}\n`);
+
+  // ── Status section ────────────────────────────────────────────────────────
+  const providerLine = buildProviderStatusLine(profile, auth);
+
+  const statusRows = [row(providerLine)];
+  if (dtVersion) {
+    statusRows.push(row(`\x1b[2m📦 data-tools v${dtVersion}\x1b[0m`));
+  }
+
+  // ── Sessions section ──────────────────────────────────────────────────────
+  const sessionRows = [];
+  if (recentSessions.length === 0) {
+    const noSessMsg = 'No sessions yet. Press n to start.';
+    sessionRows.push(row(noSessMsg));
+  } else {
     recentSessions.forEach((sess, i) => {
-      const pin    = sess.pinned ? '📌 ' : '   ';
-      const active = sess.isActive ? ' ●' : '';
-      const cat    = sess.category ? `  [${sess.category}]` : '';
-      const tool = (sess.tool === 'codex') ? 'cdx' : 'cld';
-      // If the name is still the "Session XXXXXXXX" fallback, try the project path instead
+      // Normalize name: strip "Session XXXXXXXX" fallbacks
       let rawName = sess.name || '';
       if (/^Session [0-9a-f]{8,}$/i.test(rawName)) {
-        rawName = sess.project ? sess.project.replace(/^-/, '/').replace(/-/g, '/') : sess.id.slice(0, 8);
+        rawName = sess.project
+          ? sess.project.replace(/^-/, '/').replace(/-/g, '/')
+          : sess.id.slice(0, 8);
       }
-      const displayName = rawName.length > 40 ? rawName.slice(0, 37) + '...' : (rawName || sess.id.slice(0, 8));
-      console.log(`  [${i + 1}] ${pin}${tool}  ${sess.age.padEnd(8)} ${displayName}${active}${cat}`);
+      // Layout: "{num}  {name...}  {age}"
+      const numStr  = String(i + 1);
+      const ageStr  = sess.age || '';
+      // Available for name: W - numStr.length - 2 spaces - 2 spaces before age - ageStr.length
+      const nameMax = W - numStr.length - 2 - 2 - ageStr.length;
+      const name    = rawName.length > nameMax
+        ? rawName.slice(0, nameMax - 3) + '...'
+        : rawName.padEnd(nameMax);
+      const content = `${numStr}  ${name}  ${ageStr}`;
+      sessionRows.push(row(content));
     });
-    console.log('');
   }
 
-  const brandW = 37;
-  const brandTop    = `  ┌${'─'.repeat(brandW)}┐`;
-  const brandBottom = `  └${'─'.repeat(brandW)}┘`;
-  const brandPad = (s) => {
-    const leftPad = Math.floor((brandW - s.length) / 2);
-    const rightPad = brandW - s.length - leftPad;
-    return ' '.repeat(leftPad) + s + ' '.repeat(rightPad);
-  };
-  console.log(brandTop);
-  console.log(`  │ ${brandPad('Dual Brain Session Manager')}│`);
-  console.log(`  │ ${brandPad('Built on data-tools by Steve Moraco')}│`);
-  console.log(brandBottom);
-  console.log('');
+  // ── Actions bar ───────────────────────────────────────────────────────────
+  const actionsContent = '↵ Resume  n New  / Search  s Settings  q Quit';
+  const actionsRow     = row(actionsContent);
 
-  const running = countRunningInstances();
-  const runningParts = [];
-  if (running.claude > 0) runningParts.push(`${running.claude} claude`);
-  if (running.codex > 0)  runningParts.push(`${running.codex} codex`);
-  if (runningParts.length > 0) {
-    console.log(`  (${runningParts.join(', ')} running)`);
-    console.log('');
-  }
+  // ── Print the full box ────────────────────────────────────────────────────
+  const lines = [
+    top,
+    ...statusRows,
+    sep,
+    ...sessionRows,
+    sep,
+    actionsRow,
+    bot,
+  ];
+  process.stdout.write(lines.join('\n') + '\n');
+  process.stdout.write(`\x1b[2mBuilt on data-tools by Steve Moraco\x1b[0m\n\n`);
 
-  console.log('  [c] Continue last session');
-  console.log('  [n] New session');
-  console.log('');
-  if (recentSessions.length > 0) {
-    console.log('  [1-9] Resume numbered above');
-  }
-  console.log('  [r] Resume (full list)');
-  console.log('  [/] Search sessions');
-  console.log('  [e] Manage sessions');
-  console.log('  [m] Manage subscriptions');
-  console.log('  [s] Settings');
-  console.log('  [?] Help & shortcuts');
-  console.log('');
-  console.log('  \x1b[2mreplit-tools:\x1b[0m');
-  console.log('  [i] Import sessions');
-  console.log('  [d] Switch to data-tools');
-  console.log('');
-  console.log('  [q] Exit');
-  console.log('');
+  // ── Key handling ──────────────────────────────────────────────────────────
+  const raw = (await ask('')).trim();
+  const choice = raw.toLowerCase();
 
-  const choice = (await ask('  Choice: ')).trim().toLowerCase();
-
-  if (choice === '?') {
-    const W = 37;
-    const helpTop    = `  ┌${'─'.repeat(W)}┐`;
-    const helpSep    = `  ├${'─'.repeat(W)}┤`;
-    const helpBottom = `  └${'─'.repeat(W)}┘`;
-    const helpPad = (s) => s + ' '.repeat(Math.max(0, W - s.length));
-    console.log('');
-    console.log(helpTop);
-    console.log(`  │ ${helpPad('At ~/workspace$ prompt:')}│`);
-    console.log(`  │ ${helpPad('db = show this menu')}│`);
-    console.log(`  │ ${helpPad('j  = login to claude')}│`);
-    console.log(`  │ ${helpPad('k  = login to codex')}│`);
-    console.log(helpSep);
-    console.log(`  │ ${helpPad('In Claude:')}│`);
-    console.log(`  │ ${helpPad('Ctrl+C x2 = back to menu')}│`);
-    console.log(`  │ ${helpPad('Ctrl+C x3 = exit to shell')}│`);
-    console.log(helpBottom);
-    console.log('');
-    await ask('  Press Enter to continue...');
-    return { next: 'main' };
-  }
-
-  if (choice === 'n') { return { next: 'new-session' }; }
-
-  if (choice === 'c') {
-    const termId    = getTerminalId();
-    const termState = loadTerminalState(cwd, termId);
-    const sessions  = importReplitSessions(cwd);
-
-    // Priority: terminal-specific last session, then global last session
-    const targetId = termState?.sessionId || (sessions.length > 0 ? sessions[0].id : null);
-
-    if (!targetId) {
-      console.log('\n  No recent sessions found.\n');
-      await ask('  Press Enter to continue...');
-      return { next: 'main' };
+  // Enter (empty) → resume most recent session
+  if (raw === '' || choice === '\r') {
+    if (recentSessions.length === 0) {
+      return { next: 'new-session' };
     }
-
-    // Smart resume preview
-    try {
-      const { getSessionContext } = await import('../src/session.mjs');
-      const ctx = getSessionContext(targetId, cwd);
-      if (ctx) {
-        console.log('');
-        if (ctx.lastPrompt) console.log(`  Last working on: ${ctx.lastPrompt}`);
-        if (ctx.filesTouched.length > 0) console.log(`  Files touched: ${ctx.filesTouched.join(', ')}`);
-      }
-    } catch {}
-
+    const sess = recentSessions[0];
     const { spawnSync } = await import('node:child_process');
-    const tool = termState?.tool || 'claude';
-    console.log(`\n  Resuming: ${tool} --resume ${targetId}\n`);
-    spawnSync(tool === 'codex' ? 'codex' : 'claude', ['--resume', targetId], { stdio: 'inherit' });
-    saveTerminalState(cwd, termId, targetId, tool);
-    return { next: 'main' };
-  }
-
-  const numChoice = parseInt(choice, 10);
-  if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= recentSessions.length) {
-    const sess = recentSessions[numChoice - 1];
-
-    // Smart resume preview
-    try {
-      const { getSessionContext } = await import('../src/session.mjs');
-      const ctx = getSessionContext(sess.id, cwd);
-      if (ctx) {
-        console.log('');
-        if (ctx.lastPrompt) console.log(`  Last working on: ${ctx.lastPrompt}`);
-        if (ctx.filesTouched.length > 0) console.log(`  Files touched: ${ctx.filesTouched.join(', ')}`);
-      }
-    } catch {}
-
-    const { spawnSync } = await import('node:child_process');
-    console.log(`\n  Launching: claude --resume ${sess.id}\n`);
+    process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
     spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
     saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
     return { next: 'main' };
   }
 
-  if (choice === 'r') {
-    const allSessions = enrichSessions(importReplitSessions(cwd), cwd);
-    if (allSessions.length === 0) {
-      console.log('\n  No sessions found.\n');
-      await ask('  Press Enter to continue...');
-      return { next: 'main' };
-    }
-
-    console.log('\n  All Sessions:');
-    allSessions.forEach((sess, i) => {
-      const pin    = sess.pinned ? '📌 ' : '   ';
-      const active = sess.isActive ? ' ●' : '';
-      const cat    = sess.category ? `  [${sess.category}]` : '';
-      const tool   = (sess.tool === 'codex') ? 'cdx' : 'cld';
-      console.log(`  [${String(i + 1).padStart(2)}] ${pin}${tool}  ${sess.age.padEnd(8)} ${sess.name}${active}${cat}`);
-    });
-    console.log('');
-
-    const pick = (await ask('  Enter number to resume (or Enter to cancel): ')).trim();
-    const num = parseInt(pick, 10);
-    if (!isNaN(num) && num >= 1 && num <= allSessions.length) {
-      const sess = allSessions[num - 1];
-      const { spawnSync } = await import('node:child_process');
-      const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-      console.log(`\n  Launching: ${tool} --resume ${sess.id}\n`);
-      spawnSync(tool, ['--resume', sess.id], { stdio: 'inherit' });
-    }
+  // Number 1-3 → resume that session
+  const numChoice = parseInt(raw, 10);
+  if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= recentSessions.length) {
+    const sess = recentSessions[numChoice - 1];
+    try {
+      const { getSessionContext } = await import('../src/session.mjs');
+      const ctx = getSessionContext(sess.id, cwd);
+      if (ctx) {
+        if (ctx.lastPrompt) process.stdout.write(`\n  Last working on: ${ctx.lastPrompt}\n`);
+        if (ctx.filesTouched.length > 0) process.stdout.write(`  Files touched: ${ctx.filesTouched.join(', ')}\n`);
+      }
+    } catch {}
+    const { spawnSync } = await import('node:child_process');
+    process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
+    spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
     return { next: 'main' };
   }
+
+  if (choice === 'n') { return { next: 'new-session' }; }
 
   if (choice === '/') {
     const query = (await ask('  Search: ')).trim();
     if (!query) return { next: 'main' };
 
     const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
-    // Build index if needed (silent)
     try { buildSessionIndex(cwd); } catch {}
 
     const results = searchSessions(query, cwd);
     if (results.length === 0) {
-      console.log(`\n  No sessions matching "${query}"\n`);
+      process.stdout.write(`\n  No sessions matching "${query}"\n\n`);
       await ask('  Press Enter to continue...');
       return { next: 'main' };
     }
 
-    console.log(`\n  Found ${results.length} session${results.length === 1 ? '' : 's'}:`);
+    process.stdout.write(`\n  Found ${results.length} session${results.length === 1 ? '' : 's'}:\n`);
     results.slice(0, 9).forEach((sess, i) => {
-      const tool = sess.tool === 'codex' ? 'cdx' : 'cld';
-      const date = sess.date ? new Date(sess.date).toLocaleDateString() : '?';
+      const tool   = sess.tool === 'codex' ? 'cdx' : 'cld';
+      const date   = sess.date ? new Date(sess.date).toLocaleDateString() : '?';
       const topics = sess.topics.slice(0, 3).join(', ');
-      console.log(`  [${i + 1}] ${tool}  ${date}  ${sess.prompts.first || sess.id.slice(0, 8)}`);
-      if (topics) console.log(`       topics: ${topics}`);
+      process.stdout.write(`  [${i + 1}] ${tool}  ${date}  ${sess.prompts.first || sess.id.slice(0, 8)}\n`);
+      if (topics) process.stdout.write(`       topics: ${topics}\n`);
     });
-    console.log('');
+    process.stdout.write('\n');
 
     const pick = (await ask('  Enter number to resume (or Enter to cancel): ')).trim();
-    const num = parseInt(pick, 10);
+    const num  = parseInt(pick, 10);
     if (!isNaN(num) && num >= 1 && num <= Math.min(results.length, 9)) {
       const sess = results[num - 1];
       const { spawnSync } = await import('node:child_process');
       const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-      console.log(`\n  Launching: ${tool} --resume ${sess.id}\n`);
+      process.stdout.write(`\n  Launching: ${tool} --resume ${sess.id}\n\n`);
       spawnSync(tool, ['--resume', sess.id], { stdio: 'inherit' });
     }
     return { next: 'main' };
   }
-
-  if (choice === 'e') { return { next: 'sessions' }; }
-
-  if (choice === 'i') {
-    const sessions = importReplitSessions(cwd);
-    if (sessions.length === 0) {
-      console.log('\n  No replit-tools sessions found to import.\n');
-    } else {
-      console.log(`\n  ✅ Found ${sessions.length} sessions from replit-tools.`);
-      console.log('  Sessions are automatically available in the list above.\n');
-    }
-    await ask('  Press Enter to continue...');
-    return { next: 'main' };
-  }
-
-  if (choice === 'd') {
-    const { spawnSync } = await import('node:child_process');
-    const which = spawnSync('which', ['claude-menu'], { encoding: 'utf8' });
-    if (which.status === 0) {
-      spawnSync('claude-menu', { stdio: 'inherit' });
-    } else {
-      console.log('\n  data-tools not found — install with: npm i -g replit-tools\n');
-      await ask('  Press Enter to continue...');
-    }
-    return { next: 'main' };
-  }
-
-  if (choice === 'm') { return { next: 'subscriptions' }; }
 
   if (choice === 's') { return { next: 'settings' }; }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
@@ -1391,84 +1281,90 @@ async function newSessionScreen(rl, ask) {
 
 async function settingsScreen(rl, ask) {
   const cwd = process.cwd();
-  const profile = loadProfile(cwd);
-  const auth = await detectAuth();
 
-  let guardCount = 0;
-  try {
-    const settingsFile = join(cwd, '.claude', 'settings.json');
-    if (existsSync(settingsFile)) {
-      const settings = JSON.parse(readFileSync(settingsFile, 'utf8'));
-      const preToolUse = settings?.hooks?.PreToolUse ?? [];
-      const guardCmd = 'node .claude/hooks/head-guard.mjs';
-      const tierCmd  = 'node .claude/hooks/enforce-tier.mjs';
-      const hasEdit  = preToolUse.some(e => e.matcher === 'Edit'  && e.hooks?.some(h => h.command === guardCmd));
-      const hasWrite = preToolUse.some(e => e.matcher === 'Write' && e.hooks?.some(h => h.command === guardCmd));
-      const hasBash  = preToolUse.some(e => e.matcher === 'Bash'  && e.hooks?.some(h => h.command === guardCmd));
-      const hasAgent = preToolUse.some(e => e.matcher === 'Agent' && e.hooks?.some(h => h.command === tierCmd));
-      guardCount = [hasEdit, hasWrite, hasBash, hasAgent].filter(Boolean).length;
-    }
-  } catch { /* ignore */ }
+  // Box layout matching dashboard
+  const termW = process.stdout.columns || 60;
+  const boxW  = Math.min(termW - 2, 60);
+  const W     = boxW - 4;
 
-  const modeLabel = (m) => m === profile.mode ? `${m} (active)` : m;
+  const top = `┌${'─'.repeat(boxW - 2)}┐`;
+  const sep = `├${'─'.repeat(boxW - 2)}┤`;
+  const bot = `└${'─'.repeat(boxW - 2)}┘`;
+  const row = (content) => makeBoxRow(content, W);
 
-  const claudeSub = profile?.providers?.claude;
-  const openaiSub = profile?.providers?.openai;
-  const claudePlanLabel = claudeSub?.enabled
-    ? (CLAUDE_PLAN_LABELS[claudeSub.plan] ?? claudeSub.plan ?? 'n/a')
-    : 'disabled';
-  const openaiPlanLabel = openaiSub?.enabled
-    ? (OPENAI_PLAN_LABELS[openaiSub.plan] ?? openaiSub.plan ?? 'n/a')
-    : 'disabled';
-
-  const settingsLines = [
-    `Mode:`,
-    `  [1] ${modeLabel('cost-saver')}`,
-    `  [2] ${modeLabel('balanced')}`,
-    `  [3] ${modeLabel('quality-first')}`,
-    '',
-    `Subscriptions:`,
-    `  Claude: ${auth.claude.found ? 'logged in' : 'not logged in'} — ${claudePlanLabel}${claudeSub?.label ? ` [${claudeSub.label}]` : ''}`,
-    `  OpenAI: ${auth.openai.found ? 'logged in' : 'not logged in'} — ${openaiPlanLabel}${openaiSub?.label ? ` [${openaiSub.label}]` : ''}`,
-    '',
-    `Enforcement: ${guardCount}/4 guards active`,
+  const lines = [
+    top,
+    row('Settings'),
+    sep,
+    row('[m] Manage subscriptions'),
+    row('[e] Manage sessions'),
+    row('[i] Import from replit-tools'),
+    row('[d] Switch to data-tools'),
+    row('[?] Help & shortcuts'),
+    row('[x] Diagnostics'),
+    row(''),
+    row('[Esc/b] Back to dashboard'),
+    bot,
   ];
+  process.stdout.write('\n' + lines.join('\n') + '\n\n');
 
-  console.log('');
-  console.log(box('Settings', settingsLines));
-  console.log('');
-  console.log(menu([
-    { key: '1', label: 'Switch to cost-saver',       section: 'Mode' },
-    { key: '2', label: 'Switch to balanced',          section: 'Mode' },
-    { key: '3', label: 'Switch to quality-first',     section: 'Mode' },
-    { key: 'a', label: 'Manage subscriptions',        section: 'Subscriptions' },
-    { key: 'i', label: 'Reinstall hooks',             section: 'Enforcement' },
-    { key: 'b', label: 'Back',                        section: '' },
-  ]));
-  console.log('');
+  const raw    = (await ask('  Choice: ')).trim();
+  const choice = raw.toLowerCase();
 
-  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+  if (choice === 'm') { return { next: 'subscriptions' }; }
 
-  if (choice === '1' || choice === '2' || choice === '3') {
-    const modeMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
-    profile.mode = modeMap[choice];
-    saveProfile(profile, { cwd });
-    console.log(`  Mode set to: ${profile.mode}`);
-    return { next: 'settings' };
-  }
-
-  if (choice === 'a') {
-    return { next: 'subscriptions' };
-  }
+  if (choice === 'e') { return { next: 'sessions' }; }
 
   if (choice === 'i') {
-    await cmdInstall();
+    const sessions = importReplitSessions(cwd);
+    if (sessions.length === 0) {
+      process.stdout.write('\n  No replit-tools sessions found to import.\n\n');
+    } else {
+      process.stdout.write(`\n  Found ${sessions.length} sessions from replit-tools.\n`);
+      process.stdout.write('  Sessions are automatically available in the Recent list.\n\n');
+    }
+    await ask('  Press Enter to continue...');
     return { next: 'settings' };
   }
 
-  if (choice === 'b' || choice === 'back') { return { next: 'main' }; }
+  if (choice === 'd') {
+    const { spawnSync } = await import('node:child_process');
+    const which = spawnSync('which', ['claude-menu'], { encoding: 'utf8' });
+    if (which.status === 0) {
+      spawnSync('claude-menu', { stdio: 'inherit' });
+    } else {
+      process.stdout.write('\n  data-tools not found — install with: npm i -g replit-tools\n\n');
+      await ask('  Press Enter to continue...');
+    }
+    return { next: 'settings' };
+  }
 
-  return { next: 'settings' };
+  if (choice === '?') {
+    const W2 = 37;
+    const helpTop    = `  ┌${'─'.repeat(W2)}┐`;
+    const helpSep    = `  ├${'─'.repeat(W2)}┤`;
+    const helpBottom = `  └${'─'.repeat(W2)}┘`;
+    const helpPad    = (s) => s + ' '.repeat(Math.max(0, W2 - s.length));
+    process.stdout.write('\n');
+    process.stdout.write(helpTop + '\n');
+    process.stdout.write(`  │ ${helpPad('At ~/workspace$ prompt:')}│\n`);
+    process.stdout.write(`  │ ${helpPad('db = show this menu')}│\n`);
+    process.stdout.write(`  │ ${helpPad('j  = login to claude')}│\n`);
+    process.stdout.write(`  │ ${helpPad('k  = login to codex')}│\n`);
+    process.stdout.write(helpSep + '\n');
+    process.stdout.write(`  │ ${helpPad('In Claude:')}│\n`);
+    process.stdout.write(`  │ ${helpPad('Ctrl+C x2 = back to menu')}│\n`);
+    process.stdout.write(`  │ ${helpPad('Ctrl+C x3 = exit to shell')}│\n`);
+    process.stdout.write(helpBottom + '\n\n');
+    await ask('  Press Enter to continue...');
+    return { next: 'settings' };
+  }
+
+  if (choice === 'x') { return { next: 'diagnostics' }; }
+
+  if (choice === 'b' || choice === 'back' || raw === '\x1b') { return { next: 'main' }; }
+
+  return { next: 'main' };
 }
 
 // ─── Helper: aggregatePlans ───────────────────────────────────────────────────
