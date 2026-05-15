@@ -12,6 +12,88 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+// ─── Auth status (delegates to replit-tools when available) ──────────────────
+
+/**
+ * Get Claude auth status, preferring replit-tools as the authoritative source.
+ *
+ * Returns:
+ *   { ok: boolean, detail: string, source: 'replit-tools' | 'direct' | 'unknown' }
+ *
+ * @param {string} [cwd]
+ */
+export async function getAuthHealthStatus(cwd) {
+  const root = cwd ?? process.cwd();
+
+  // Try replit-tools first (dynamic import — never breaks if absent)
+  try {
+    const { getAuthStatus } = await import('./replit.mjs');
+    const status = getAuthStatus(root);
+    if (status.available) {
+      const tokenOk = status.tokenStatus === 'valid' || status.tokenStatus === 'unknown';
+      const detail = status.tokenStatus === 'valid'
+        ? `Auth: OK (via replit-tools${status.expiresAt ? ', expires ' + status.expiresAt : ''})`
+        : status.tokenStatus === 'expired'
+          ? 'Auth: expired (via replit-tools)'
+          : status.tokenStatus === 'expiring'
+            ? 'Auth: expiring soon (via replit-tools)'
+            : 'Auth: status unknown (via replit-tools)';
+      return { ok: tokenOk, detail, source: 'replit-tools' };
+    }
+  } catch {
+    // replit-tools unavailable — fall through to direct check
+  }
+
+  // Fall back: check for .credentials.json directly
+  const home = process.env.HOME || '/root';
+  const credPaths = [
+    join(home, '.claude', '.credentials.json'),
+    join(root, '.replit-tools', '.claude-persistent', '.credentials.json'),
+    join(root, '.claude-persistent', '.credentials.json'),
+  ];
+
+  for (const p of credPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const creds = JSON.parse(readFileSync(p, 'utf8'));
+      const oauth = creds?.claudeAiOauth;
+      if (oauth?.accessToken) {
+        const remainingMs = oauth.expiresAt ? oauth.expiresAt - Date.now() : Infinity;
+        const remainingHours = Math.floor(remainingMs / 1000 / 60 / 60);
+        if (remainingMs <= 0) {
+          return { ok: false, detail: 'Auth: token expired (direct check)', source: 'direct' };
+        }
+        return {
+          ok: true,
+          detail: `Auth: OK (direct check, ${remainingHours}h remaining)`,
+          source: 'direct',
+        };
+      }
+    } catch {
+      // continue to next path
+    }
+  }
+
+  // .claude.json oauthAccount check
+  const claudeJsonPaths = [
+    join(root, '.replit-tools', '.claude-persistent', '.claude.json'),
+    join(home, '.claude', '.claude.json'),
+  ];
+  for (const p of claudeJsonPaths) {
+    if (!existsSync(p)) continue;
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf8'));
+      if (data?.oauthAccount || data?.apiKey) {
+        return { ok: true, detail: 'Auth: OK (direct check via .claude.json)', source: 'direct' };
+      }
+    } catch {
+      // continue
+    }
+  }
+
+  return { ok: false, detail: 'Auth: no credentials found (direct check)', source: 'unknown' };
+}
+
 const HEALTH_FILE = '.dualbrain/health.json';
 
 // Cooldown ladder in minutes: index = attempts - 1, capped at last entry

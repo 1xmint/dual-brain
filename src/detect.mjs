@@ -280,9 +280,112 @@ function classifyReasoningDepth(prompt, files = [], priorOutcomes = []) {
   return { depth: 'low', signals: lowSignals.length > 0 ? lowSignals : ['no elevated signals detected'] };
 }
 
-/** Main detection function. Input: { prompt, files?, priorFailures? } */
+// ─── Plugin-aware detection helpers ───────────────────────────────────────────
+
+/**
+ * Known plugin service keywords → plugin IDs.
+ * Maps common service names and their aliases to Codex plugin directory names.
+ * Static map so detect.mjs stays self-contained (no I/O at classify time).
+ */
+const PLUGIN_KEYWORD_MAP = {
+  // Payments
+  stripe: 'stripe',
+  payment: 'stripe',
+  checkout: 'stripe',
+  subscription: 'stripe',
+  webhook: 'stripe',
+  // Collaboration / messaging
+  slack: 'slack',
+  teams: 'teams',
+  // Data / backend
+  supabase: 'supabase',
+  neondb: 'neon-postgres',
+  // Dev tools
+  github: 'github',
+  'pull request': 'github',
+  linear: 'linear',
+  jira: 'atlassian-rovo',
+  atlassian: 'atlassian-rovo',
+  // Comms / productivity
+  gmail: 'gmail',
+  outlook: 'outlook-email',
+  notion: 'notion',
+  'google calendar': 'google-calendar',
+  'google drive': 'google-drive',
+  // Monitoring / infra
+  sentry: 'sentry',
+  vercel: 'vercel',
+  netlify: 'netlify',
+  cloudflare: 'cloudflare',
+  // Analytics
+  amplitude: 'amplitude',
+  // Design
+  figma: 'figma',
+  canva: 'canva',
+  // CRM / sales
+  hubspot: 'hubspot',
+  pipedrive: 'pipedrive',
+  // Communication
+  sendgrid: 'sendgrid',
+  twilio: 'twilio-developer-kit',
+  // Storage
+  sharepoint: 'sharepoint',
+  box: 'box',
+  // AI / ML
+  openai: 'openai-developers',
+  'hugging face': 'hugging-face',
+  // Other
+  razorpay: 'razorpay',
+  render: 'render',
+  monday: 'monday-com',
+  asana: 'asana',
+  clickup: 'clickup',
+};
+
+/**
+ * Detect Codex plugin IDs that match keywords in the prompt.
+ * Returns an array of matched plugin IDs (deduplicated, max 5).
+ * @param {string} prompt
+ * @returns {string[]}
+ */
+function detectSuggestedPlugins(prompt) {
+  if (!prompt) return [];
+  const lower = prompt.toLowerCase();
+  const matched = new Set();
+
+  // Check multi-word phrases first (longer matches take priority)
+  const sortedEntries = Object.entries(PLUGIN_KEYWORD_MAP).sort((a, b) => b[0].length - a[0].length);
+  for (const [keyword, pluginId] of sortedEntries) {
+    if (lower.includes(keyword)) {
+      matched.add(pluginId);
+      if (matched.size >= 5) break;
+    }
+  }
+
+  return [...matched];
+}
+
+/** Main detection function. Input: { prompt, files?, priorFailures?, sessionContext? } */
 function detectTask(input) {
-  const { prompt = '', files = [], priorFailures = 0 } = input;
+  const { prompt = '', files = [], sessionContext = null } = input;
+  let { priorFailures = 0 } = input;
+
+  // Session context: bump priorFailures if session history shows failures on similar tasks
+  let repeatedFailure = false;
+  if (sessionContext) {
+    const sessionFailures = Array.isArray(sessionContext.priorAttempts)
+      ? sessionContext.priorAttempts.filter(a => a && (a.failed || a.status === 'failed')).length
+      : 0;
+    if (sessionFailures > 0) {
+      priorFailures = Math.max(priorFailures, sessionFailures);
+    }
+    // Flag repeated_failure if riskSignals contains failure indicators
+    const riskSignals = sessionContext.riskSignals ?? [];
+    if (riskSignals.some(s => s && (s.type === 'failure' || s.failed || /fail/i.test(String(s))))) {
+      repeatedFailure = true;
+    }
+    if (sessionFailures >= 2) repeatedFailure = true;
+  }
 
   // 1. Intent
   const intent = classifyIntent(prompt);
@@ -299,7 +402,14 @@ function detectTask(input) {
     if (regex.test(prompt)) { keywordRisk = level; break; }
   }
 
-  const risk = higherRisk(pathRiskLevel, keywordRisk);
+  let risk = higherRisk(pathRiskLevel, keywordRisk);
+
+  // Session context: bump risk one level if prior session attempts failed on similar tasks
+  if (repeatedFailure && LEVEL_ORDER[risk] < LEVEL_ORDER['high']) {
+    const riskLevels = ['low', 'medium', 'high', 'critical'];
+    const currentIdx = riskLevels.indexOf(risk);
+    risk = riskLevels[Math.min(currentIdx + 1, riskLevels.length - 1)];
+  }
   const fileCount = files.length;
 
   // 4. Complexity
@@ -342,6 +452,9 @@ function detectTask(input) {
     : [];
   const { depth: reasoningDepth, signals: reasoningSignals } = classifyReasoningDepth(prompt, files, priorOutcomes);
 
+  // 10. Suggested Codex plugins (keyword-based, static map — no I/O)
+  const suggestedPlugins = detectSuggestedPlugins(prompt);
+
   return {
     intent,
     risk,
@@ -356,6 +469,8 @@ function detectTask(input) {
     specialist: specialistResult,
     reasoningDepth,
     reasoningSignals,
+    suggestedPlugins,
+    ...(repeatedFailure && { repeatedFailure: true }),
   };
 }
 
@@ -474,4 +589,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   console.log(JSON.stringify(result, null, 2));
 }
 
-export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths, classifySpecialist, classifyReasoningDepth };
+export { detectTask, classifyIntent, classifyRisk, estimateComplexity, inferTier, extractPaths, classifySpecialist, classifyReasoningDepth, detectSuggestedPlugins };

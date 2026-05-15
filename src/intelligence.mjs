@@ -357,8 +357,11 @@ export function detectContradictions(projectBrief, taskBrief, plan = {}) {
 
 /**
  * Format a compact situational awareness summary (max 15 lines) for agent prompts.
+ * @param {object} projectBrief
+ * @param {object} taskBrief
+ * @param {object|null} [sessionContext]  Optional: { relatedSessions, riskSignals, priorAttempts, relevantFiles }
  */
-export function formatBrief(projectBrief, taskBrief) {
+export function formatBrief(projectBrief, taskBrief, sessionContext = null) {
   const lines = [];
 
   const dirtyLabel = projectBrief.dirty ? 'dirty' : 'clean';
@@ -416,6 +419,27 @@ export function formatBrief(projectBrief, taskBrief) {
 
     if (taskBrief.filesInScope?.length > 0) {
       lines.push(`IN SCOPE: ${taskBrief.filesInScope.slice(0, 4).join(', ')}`);
+    }
+  }
+
+  // Session context: include 1-2 lines about prior cross-session work when available
+  if (sessionContext) {
+    const priorAttempts = Array.isArray(sessionContext.priorAttempts) ? sessionContext.priorAttempts : [];
+    const failures = priorAttempts.filter(a => a && (a.failed || a.status === 'failed'));
+    const successes = priorAttempts.filter(a => a && !a.failed && a.status !== 'failed');
+
+    if (failures.length > 0) {
+      const lastFail = failures[failures.length - 1];
+      const age = lastFail.daysAgo != null ? `${lastFail.daysAgo}d ago` : (lastFail.when ?? 'recently');
+      const reason = lastFail.error ?? lastFail.reason ?? '';
+      const reasonClip = reason ? ` (${reason.slice(0, 40)})` : '';
+      lines.push(`PRIOR: similar task failed ${age}${reasonClip}`);
+    } else if (successes.length > 0) {
+      const lastSuccess = successes[successes.length - 1];
+      const age = lastSuccess.daysAgo != null ? `${lastSuccess.daysAgo}d ago` : (lastSuccess.when ?? 'recently');
+      lines.push(`PRIOR: related work completed successfully ${age}`);
+    } else if (Array.isArray(sessionContext.relatedSessions) && sessionContext.relatedSessions.length > 0) {
+      lines.push(`PRIOR: ${sessionContext.relatedSessions.length} related session(s) found`);
     }
   }
 

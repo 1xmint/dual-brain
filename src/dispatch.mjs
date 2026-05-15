@@ -737,6 +737,25 @@ async function dispatch(input = {}) {
   }
   // ── End specialist injection ─────────────────────────────────────────────────
 
+  // ── Plugin hint injection (Codex path) ──────────────────────────────────────
+  // When dispatching to OpenAI/Codex, check if any Codex plugins match the task
+  // and append an advisory hint so the agent can choose to use them.
+  // Uses dynamic import so failure is always non-fatal.
+  const targetProvider = decision.provider ?? 'claude';
+  if (targetProvider === 'openai') {
+    try {
+      const { matchPluginsForTask } = await import('./replit.mjs');
+      const matched = matchPluginsForTask(prompt, undefined, cwd);
+      if (matched.length > 0) {
+        const pluginNames = matched.slice(0, 3).map(m => m.plugin.id).join(', ');
+        const hint = `\n\n[Available Codex plugins for this task: ${pluginNames}. Consider using the matching plugin for direct API access.]`;
+        prompt = prompt + hint;
+        if (verbose) process.stderr.write(`[dual-brain] plugin hint injected: ${pluginNames}\n`);
+      }
+    } catch { /* non-fatal — never block dispatch */ }
+  }
+  // ── End plugin hint injection ────────────────────────────────────────────────
+
   const tier     = decision.tier ?? 'execute';
   const timeoutMs = TIER_TIMEOUT_MS[tier] ?? 120_000;
 

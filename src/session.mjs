@@ -216,6 +216,9 @@ export function formatSessionCard(session, repo, health, profile) {
 
 // ─── Replit-tools session import ──────────────────────────────────────────────
 
+const ARCHIVE_BASE = '/home/runner/workspace/.replit-tools/.session-archive/claude';
+const ARCHIVE_PROJECTS = `${ARCHIVE_BASE}/projects/-home-runner-workspace`;
+
 /**
  * Returns true if the text looks like a real user prompt (not a status line,
  * slash command, paste marker, or agent-generated noise).
@@ -231,7 +234,38 @@ function isRealPrompt(text) {
   if (t === 'login' || t === 'logout') return false;
   if (t.startsWith('/')) return false;
   if (t.startsWith('[Pasted')) return false;
+  if (t.startsWith('<')) return false;
+  if (t.startsWith('[Request interrupted')) return false;
   return true;
+}
+
+/**
+ * Extract the text content from a user message entry.
+ * Handles string content and content-block arrays.
+ * @param {object} entry
+ * @returns {string}
+ */
+function extractMessageText(entry) {
+  if (!entry) return '';
+  const content = entry.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(c => c.text || '').join(' ');
+  return '';
+}
+
+/**
+ * Compute recency multiplier: today=2x, this week=1.5x, older=1x
+ * @param {string|number} dateOrTs
+ * @returns {number}
+ */
+function recencyMultiplier(dateOrTs) {
+  const ts = typeof dateOrTs === 'number' ? dateOrTs : Date.parse(dateOrTs);
+  if (!ts) return 1;
+  const age = Date.now() - ts;
+  const day = 86400000;
+  if (age < day) return 2;
+  if (age < 7 * day) return 1.5;
+  return 1;
 }
 
 /**
@@ -1166,41 +1200,133 @@ export function buildSessionIndex(cwd = process.cwd()) {
 }
 
 /**
- * Search the session index by keyword. Returns matching sessions sorted by relevance.
+ * Search sessions using the replit-tools archive as primary source.
+ * Falls back to the parallel session index when archive is unavailable.
+ *
+ * Results include: { sessionId, date, relevance, files, summary, matchingLines }
+ * Sorted by relevance * recencyMultiplier descending.
  *
  * @param {string} query
  * @param {string} [cwd]
  * @returns {Array<object>} sessions with `_score` field, sorted descending
  */
 export function searchSessions(query, cwd = process.cwd()) {
+  const terms = query.toLowerCase().split(/\W+/).filter(Boolean);
+  if (!terms.length) return [];
+
+  // Try archive-backed search first
+  const archiveResults = archiveBackedSearch(terms, cwd);
+  if (archiveResults.length > 0) return archiveResults;
+
+  // Fallback: parallel index
   const indexPath = join(cwd, '.dualbrain', 'session-index.json');
   let index = {};
   try { index = JSON.parse(readFileSync(indexPath, 'utf8')); } catch {}
+  if (Object.keys(index).length === 0) index = buildSessionIndex(cwd);
 
-  if (Object.keys(index).length === 0) {
-    index = buildSessionIndex(cwd);
-  }
-
-  const terms = query.toLowerCase().split(/\W+/).filter(Boolean);
   const results = [];
-
   for (const session of Object.values(index)) {
     let score = 0;
     const searchText = [
-      ...session.topics,
-      ...session.files,
-      session.prompts.first,
-      session.prompts.last,
+      ...(session.topics || []),
+      ...(session.files || []),
+      session.prompts?.first || '',
+      session.prompts?.last  || '',
     ].join(' ').toLowerCase();
 
     for (const term of terms) {
       if (searchText.includes(term)) score++;
-      if (session.topics.includes(term)) score += 2;
-      if (session.files.some(f => f.includes(term))) score += 2;
+      if ((session.topics || []).includes(term)) score += 2;
+      if ((session.files || []).some(f => f.includes(term))) score += 2;
     }
 
     if (score > 0) {
-      results.push({ ...session, _score: score });
+      const mult = recencyMultiplier(session.date);
+      results.push({ ...session, _score: score * mult });
+    }
+  }
+
+  return results.sort((a, b) => b._score - a._score);
+}
+
+/**
+ * Search session JSONL files in the archive directly (streaming, no full load).
+ * @param {string[]} terms
+ * @param {string} cwd
+ * @returns {Array<object>}
+ */
+function archiveBackedSearch(terms, cwd) {
+  const projectDir = existsSync(ARCHIVE_PROJECTS) ? ARCHIVE_PROJECTS
+    : join(cwd, '.replit-tools', '.session-archive', 'claude', 'projects', '-home-runner-workspace');
+  if (!existsSync(projectDir)) return [];
+
+  let files;
+  try { files = readdirSync(projectDir).filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-')); }
+  catch { return []; }
+
+  const results = [];
+
+  for (const file of files) {
+    const sessionId = file.replace(/\.jsonl$/, '');
+    const filePath = join(projectDir, file);
+    let content;
+    try { content = readFileSync(filePath, 'utf8'); } catch { continue; }
+
+    const lines = content.split('\n').filter(Boolean);
+    const matchingLines = [];
+    const fileSet = new Set();
+    let firstPrompt = null;
+    let lastTimestamp = 0;
+    let messageCount = 0;
+    let baseScore = 0;
+
+    for (const line of lines) {
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+
+      // Track timestamps
+      if (entry.timestamp) {
+        const ts = typeof entry.timestamp === 'number'
+          ? (entry.timestamp > 1e12 ? entry.timestamp : entry.timestamp * 1000)
+          : Date.parse(entry.timestamp);
+        if (ts > lastTimestamp) lastTimestamp = ts;
+      }
+
+      if (entry.type !== 'user') continue;
+      const text = extractMessageText(entry);
+      if (!text) continue;
+      messageCount++;
+      if (!firstPrompt && isRealPrompt(text)) firstPrompt = text;
+
+      // Extract file references
+      const filePaths = text.match(/[\w./~-]+\.(?:mjs|js|ts|tsx|jsx|json|md|css|html|py|sh|sql|toml|yaml|yml)\b/g);
+      if (filePaths) filePaths.forEach(p => fileSet.add(p));
+
+      // Score against terms
+      const lower = text.toLowerCase();
+      let lineScore = 0;
+      for (const term of terms) {
+        if (lower.includes(term)) lineScore++;
+      }
+      if (lineScore > 0) {
+        baseScore += lineScore;
+        const excerpt = text.slice(0, 500);
+        matchingLines.push(excerpt);
+      }
+    }
+
+    if (baseScore > 0) {
+      const mult = recencyMultiplier(lastTimestamp);
+      results.push({
+        sessionId,
+        date: lastTimestamp ? new Date(lastTimestamp).toISOString() : null,
+        relevance: baseScore,
+        _score: baseScore * mult,
+        files: [...fileSet].slice(0, 20),
+        summary: (firstPrompt || sessionId).slice(0, 100),
+        matchingLines: matchingLines.slice(0, 5),
+        messageCount,
+      });
     }
   }
 
@@ -1369,6 +1495,151 @@ export function getSessionContext(sessionId, cwd = process.cwd()) {
       totalLines: lines.length,
     };
   } catch { return null; }
+}
+
+// ─── Archive-backed metadata extraction ──────────────────────────────────────
+
+/**
+ * Extract structured metadata from a session JSONL file.
+ * Reads the file once; handles malformed entries gracefully.
+ *
+ * @param {string} sessionPath — absolute path to a .jsonl file
+ * @returns {{ id, date, messageCount, files: string[], taskSummary, firstPrompt, lastPrompt, duration }}
+ */
+export function extractSessionMeta(sessionPath) {
+  const id = sessionPath.split('/').pop().replace(/\.jsonl$/, '');
+  const result = { id, date: null, messageCount: 0, files: [], taskSummary: null, firstPrompt: null, lastPrompt: null, duration: null };
+
+  let content;
+  try { content = readFileSync(sessionPath, 'utf8'); } catch { return result; }
+
+  const fileSet = new Set();
+  let minTs = Infinity;
+  let maxTs = 0;
+
+  for (const line of content.split('\n')) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+
+    // Timestamps
+    if (entry.timestamp) {
+      const ts = typeof entry.timestamp === 'number'
+        ? (entry.timestamp > 1e12 ? entry.timestamp : entry.timestamp * 1000)
+        : Date.parse(entry.timestamp);
+      if (ts && ts < minTs) minTs = ts;
+      if (ts && ts > maxTs) maxTs = ts;
+    }
+
+    if (entry.type !== 'user') continue;
+    const text = extractMessageText(entry);
+    if (!text || !text.trim()) continue;
+
+    result.messageCount++;
+
+    // File paths (src/, bin/, common extensions)
+    const filePaths = text.match(/[\w./~-]+\.(?:mjs|js|ts|tsx|jsx|json|md|css|html|py|sh|sql|toml|yaml|yml)\b/g);
+    if (filePaths) filePaths.forEach(p => fileSet.add(p));
+    // Also catch src/ or bin/ paths without extensions
+    const dirPaths = text.match(/(?:src|bin|lib|test|tests|\.claude\/hooks)\/[\w./~-]+/g);
+    if (dirPaths) dirPaths.forEach(p => fileSet.add(p));
+
+    if (isRealPrompt(text)) {
+      if (!result.firstPrompt) {
+        result.firstPrompt = text.slice(0, 100);
+        result.taskSummary = text.slice(0, 100);
+      }
+      result.lastPrompt = text.slice(0, 100);
+    }
+  }
+
+  result.files = [...fileSet].slice(0, 30);
+  if (maxTs) result.date = new Date(maxTs).toISOString();
+  if (minTs !== Infinity && maxTs) result.duration = Math.round((maxTs - minTs) / 1000); // seconds
+
+  return result;
+}
+
+// ─── Routing context from session history ────────────────────────────────────
+
+/**
+ * Build routing context from recent sessions (last 7 days) related to a task.
+ * Used by the dispatch pipeline to detect prior attempts and flag risk signals.
+ *
+ * @param {string} cwd
+ * @param {string} taskDescription
+ * @returns {{ relatedSessions: [], riskSignals: [], priorAttempts: [], relevantFiles: [] }}
+ */
+export function getRoutingContext(cwd, taskDescription) {
+  const result = { relatedSessions: [], riskSignals: [], priorAttempts: [], relevantFiles: [] };
+  const projectDir = existsSync(ARCHIVE_PROJECTS) ? ARCHIVE_PROJECTS
+    : join(cwd, '.replit-tools', '.session-archive', 'claude', 'projects', '-home-runner-workspace');
+  if (!existsSync(projectDir)) return result;
+
+  let files;
+  try { files = readdirSync(projectDir).filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-')); }
+  catch { return result; }
+
+  const taskLower = (taskDescription || '').toLowerCase();
+  const taskTerms = taskLower.split(/\W+/).filter(w => w.length > 3);
+  const sevenDaysAgo = Date.now() - 7 * 86400000;
+  const fileSet = new Set();
+
+  for (const file of files) {
+    const filePath = join(projectDir, file);
+    let meta;
+    try { meta = extractSessionMeta(filePath); } catch { continue; }
+
+    // Only consider last 7 days
+    if (!meta.date || Date.parse(meta.date) < sevenDaysAgo) continue;
+
+    // Score relevance to task
+    const sessionText = [meta.firstPrompt || '', meta.lastPrompt || '', ...meta.files].join(' ').toLowerCase();
+    let score = 0;
+    for (const term of taskTerms) {
+      if (sessionText.includes(term)) score++;
+    }
+
+    if (score === 0) continue;
+
+    // Collect relevant files
+    meta.files.forEach(f => fileSet.add(f));
+
+    const sessionEntry = {
+      sessionId: meta.id,
+      date: meta.date,
+      taskSummary: meta.taskSummary,
+      score,
+      messageCount: meta.messageCount,
+      files: meta.files,
+    };
+
+    result.relatedSessions.push(sessionEntry);
+
+    // Detect prior attempts: same task keywords, short session (< 5 min or few messages)
+    if (score >= 2 && (meta.duration < 300 || meta.messageCount < 3)) {
+      result.priorAttempts.push({
+        sessionId: meta.id,
+        date: meta.date,
+        summary: meta.taskSummary,
+        likelyIncomplete: true,
+      });
+      result.riskSignals.push(`Prior attempt on similar task may have stalled (session ${meta.id.slice(0, 8)})`);
+    }
+
+    // Risk signal: auth/security keywords in related sessions
+    if (/auth|secret|token|credential|password/.test(sessionText)) {
+      result.riskSignals.push(`Related session ${meta.id.slice(0, 8)} touched auth/security code`);
+    }
+  }
+
+  // Deduplicate risk signals
+  result.riskSignals = [...new Set(result.riskSignals)];
+  result.relevantFiles = [...fileSet].slice(0, 20);
+  result.relatedSessions.sort((a, b) => b.score - a.score);
+  result.relatedSessions = result.relatedSessions.slice(0, 5);
+
+  return result;
 }
 
 // ─── CLI (direct invocation) ──────────────────────────────────────────────────

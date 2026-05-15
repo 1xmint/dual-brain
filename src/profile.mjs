@@ -602,6 +602,34 @@ async function autoSetup(cwd) {
  * @param {string} [cwd]
  */
 async function autoRefreshToken(cwd) {
+  // Delegate to replit-tools auth refresh script when available,
+  // to avoid competing token refreshes from two different code paths.
+  try {
+    const { getAuthStatus, inspectReplitTools } = await import('./replit.mjs');
+    const tools = inspectReplitTools(cwd || process.cwd());
+    if (tools.authRefresh?.available) {
+      const status = getAuthStatus(cwd || process.cwd());
+      if (status.available) {
+        // replit-tools owns the refresh cycle — report current status and exit
+        const hoursRemaining = status.expiresAt
+          ? Math.max(0, Math.floor((Date.parse(status.expiresAt) - Date.now()) / 3_600_000))
+          : null;
+        if (status.tokenStatus === 'valid') {
+          return { status: 'valid', hoursRemaining: hoursRemaining ?? 999, delegatedTo: 'replit-tools' };
+        }
+        if (status.tokenStatus === 'expired') {
+          // replit-tools will handle the actual refresh on its own schedule;
+          // we note the state but do not attempt our own refresh.
+          return { status: 'expiring_no_refresh', hoursRemaining: 0, delegatedTo: 'replit-tools' };
+        }
+        // expiring or unknown — note delegation and skip our own refresh attempt
+        return { status: 'valid', hoursRemaining: hoursRemaining ?? 1, delegatedTo: 'replit-tools' };
+      }
+    }
+  } catch {
+    // replit.mjs unavailable — fall through to direct refresh
+  }
+
   const home = process.env.HOME || '/root';
   const credPaths = [
     join(home, '.claude', '.credentials.json'),

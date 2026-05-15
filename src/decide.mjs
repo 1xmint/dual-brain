@@ -682,10 +682,10 @@ function applyCriticalRiskFloor(model, provider, available, risk) {
 
 /**
  * Main routing decision function.
- * @param {{ profile: object, detection: object, cwd?: string, thinkResult?: object }} input
+ * @param {{ profile: object, detection: object, cwd?: string, thinkResult?: object, sessionContext?: object }} input
  * @returns {object} Routing decision
  */
-export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult } = {}) {
+export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, sessionContext = null } = {}) {
   const available = getAvailableModels(profile);
 
   // Resolve active work style
@@ -829,6 +829,50 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult } =
       }
     }
     // 'standard', 'deep', 'ultra' — leave model unchanged; existing routing already picked correctly
+  }
+
+  // Session context: escalate or prefer model based on cross-session history
+  if (sessionContext) {
+    const sessionAttempts = Array.isArray(sessionContext.priorAttempts) ? sessionContext.priorAttempts : [];
+    const sessionFailures = sessionAttempts.filter(a => a && (a.failed || a.status === 'failed'));
+    const sessionSuccesses = sessionAttempts.filter(a => a && !a.failed && a.status !== 'failed');
+
+    // Prior failures on similar work → escalate from sonnet to opus (Claude) or gpt-4o to o3 (OpenAI)
+    if (sessionFailures.length >= 2 && !isHighStakes) {
+      if (provider === 'claude') {
+        const claudeRank = ['haiku', 'sonnet', 'opus'];
+        const currentIdx = claudeRank.indexOf(toShortName(model, 'claude'));
+        if (currentIdx !== -1 && currentIdx < claudeRank.length - 1) {
+          const escalated = claudeRank[currentIdx + 1];
+          if (available.claude.includes(escalated)) model = escalated;
+        }
+      } else {
+        const oaiRank = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+        const currentIdx = oaiRank.indexOf(model);
+        if (currentIdx !== -1 && currentIdx < oaiRank.length - 1) {
+          const escalated = oaiRank[currentIdx + 1];
+          if (available.openai.includes(escalated)) model = escalated;
+        }
+      }
+    }
+
+    // Prior successful approach → prefer same provider/model that worked before
+    if (sessionSuccesses.length > 0) {
+      const lastSuccess = sessionSuccesses[sessionSuccesses.length - 1];
+      if (lastSuccess.provider && lastSuccess.model && !isHighStakes) {
+        const successProvider = lastSuccess.provider;
+        const successModel = lastSuccess.model;
+        const providerEnabled = profile?.providers?.[successProvider]?.enabled;
+        const providerHealthy = (healthScores[successProvider] ?? 0) > 0;
+        if (providerEnabled && providerHealthy) {
+          const shortSuccess = toShortName(successModel, successProvider);
+          if (available[successProvider]?.includes(shortSuccess)) {
+            provider = successProvider;
+            model = shortSuccess;
+          }
+        }
+      }
+    }
   }
 
   // Safety floor: critical-risk tasks must never use haiku/gpt-4.1-mini even in cost-saver mode

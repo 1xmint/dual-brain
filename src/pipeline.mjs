@@ -76,6 +76,14 @@ export function createPipelineRun(trigger = '', prompt = '') {
     thinkResult: null,       // from think-engine
     decisionPreflight: null, // from lookupDecision
 
+    // Session history context (populated in Phase 0 from session.mjs)
+    sessionContext: null,    // { relatedSessions, riskSignals, priorAttempts, relevantFiles }
+
+    // Replit context (populated in Phase 0 when running inside Replit)
+    replitEnvironment: null, // from replit.detectReplitEnvironment()
+    replitTools: null,       // from replit.inspectReplitTools()
+    replitConfig: null,      // from replit.getReplitToolsConfig()
+
     completedAt: null,
   };
 }
@@ -247,12 +255,12 @@ export function outcomeGate(run) {
  * @param {string} cwd
  * @returns {object}
  */
-async function buildContextPack(prompt, files = [], cwd = process.cwd()) {
+async function buildContextPack(prompt, files = [], cwd = process.cwd(), sessionContext = null) {
   const profile = await _loadProfileSafe(cwd);
 
   const priorFailures = _getPriorFailures(prompt, cwd);
 
-  const detection = detectTask({ prompt, files, priorFailures });
+  const detection = detectTask({ prompt, files, priorFailures, sessionContext });
 
   return {
     prompt,
@@ -261,6 +269,7 @@ async function buildContextPack(prompt, files = [], cwd = process.cwd()) {
     profile,
     priorFailures,
     cwd,
+    sessionContext,
   };
 }
 
@@ -389,7 +398,7 @@ export function buildExecutionPlan(contextPack, trigger, options = {}) {
     effort: depthToEffort[reasoningDepth] ?? detection.effort,
   };
 
-  const decision = decideRoute({ profile, detection: detectionWithDepth, cwd: contextPack.cwd, thinkResult: options.thinkResult });
+  const decision = decideRoute({ profile, detection: detectionWithDepth, cwd: contextPack.cwd, thinkResult: options.thinkResult, sessionContext: contextPack.sessionContext ?? null });
 
   // Resolve full model ID for display (mirrors dispatch.mjs CLAUDE_MODEL_IDS)
   const CLAUDE_MODEL_IDS = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5-20251001' };
@@ -657,11 +666,19 @@ export async function runPipeline(trigger, prompt, options = {}) {
   try {
     // ── Phase 0: Situational awareness ───────────────────────────────────────
 
+    // Session history context — load first so Phase 0 modules (intelligence, formatBrief) can use it
+    try {
+      const session = await import('./session.mjs');
+      if (session.getRoutingContext) {
+        run.sessionContext = session.getRoutingContext(cwd, prompt);
+      }
+    } catch {} // session.mjs not available or getRoutingContext not exported — non-blocking
+
     try {
       const { deriveProjectState, deriveTaskContext, detectContradictions, formatBrief } = await import('./intelligence.mjs');
       run.projectBrief = await deriveProjectState(options.cwd || process.cwd());
       run.taskBrief = deriveTaskContext(prompt, options.recentEvents || []);
-      run.situationBrief = formatBrief(run.projectBrief, run.taskBrief);
+      run.situationBrief = formatBrief(run.projectBrief, run.taskBrief, run.sessionContext);
     } catch (e) {
       // intelligence module not available — continue without it (degraded)
     }
@@ -741,6 +758,17 @@ export async function runPipeline(trigger, prompt, options = {}) {
       // awareness not available
     }
 
+    // Replit context enrichment — augment run with Replit environment data
+    try {
+      const replit = await import('./replit.mjs');
+      const replitEnv = replit.detectReplitEnvironment(cwd);
+      if (replitEnv.isReplit) {
+        run.replitEnvironment = replitEnv;
+        run.replitTools = replit.inspectReplitTools(cwd);
+        run.replitConfig = replit.getReplitToolsConfig(cwd);
+      }
+    } catch {} // replit.mjs not available — non-blocking
+
     // Knowledge preflight — check if we already know the answer
     try {
       const { lookupDecision, triageQuestion } = await import('./think-engine.mjs');
@@ -806,8 +834,8 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     const effectivePrompt = run.enrichedPrompt || prompt;
 
-    // Build context pack
-    run.context = await buildContextPack(effectivePrompt, files, cwd);
+    // Build context pack (pass sessionContext so detect can use cross-session signals)
+    run.context = await buildContextPack(effectivePrompt, files, cwd, run.sessionContext);
 
     // Query failure history (must happen before context gate)
     try {
@@ -830,6 +858,10 @@ export async function runPipeline(trigger, prompt, options = {}) {
     // Gate 1: Context gate
     if (!runGate(run, 'context', contextGate)) {
       run.completedAt = Date.now();
+      try {
+        const { recordEvent } = await import('./doctor.mjs');
+        recordEvent({ type: 'gate_failure', checkId: 'context-gate', severity: 'fail', outcome: 'blocked', evidence: run.gates.context.reason, sessionId: run.id }, cwd);
+      } catch { /* non-blocking */ }
       return { success: false, gateFailure: 'context', reason: run.gates.context.reason, run };
     }
 
@@ -878,6 +910,10 @@ export async function runPipeline(trigger, prompt, options = {}) {
         const blockers = run.contradictions.filter(c => c.severity === 'block');
         if (blockers.length > 0) {
           run.completedAt = Date.now();
+          try {
+            const { recordEvent } = await import('./doctor.mjs');
+            recordEvent({ type: 'contradiction_caught', severity: 'fail', outcome: 'blocked', evidence: blockers.map(b => b.message).join('; ').slice(0, 200), sessionId: run.id }, cwd);
+          } catch { /* non-blocking */ }
           return {
             success: false,
             gateFailure: 'contradiction',
@@ -894,12 +930,20 @@ export async function runPipeline(trigger, prompt, options = {}) {
     // Gate 2: Planning gate
     if (!runGate(run, 'planning', planningGate)) {
       run.completedAt = Date.now();
+      try {
+        const { recordEvent } = await import('./doctor.mjs');
+        recordEvent({ type: 'gate_failure', checkId: 'planning-gate', severity: 'fail', outcome: 'blocked', evidence: run.gates.planning.reason, sessionId: run.id }, cwd);
+      } catch { /* non-blocking */ }
       return { success: false, gateFailure: 'planning', reason: run.gates.planning.reason, run };
     }
 
     // Gate 3: Principle gate
     if (!runGate(run, 'principle', principleGate)) {
       run.completedAt = Date.now();
+      try {
+        const { recordEvent } = await import('./doctor.mjs');
+        recordEvent({ type: 'gate_failure', checkId: 'principle-gate', severity: 'fail', outcome: 'blocked', evidence: run.gates.principle.reason, sessionId: run.id }, cwd);
+      } catch { /* non-blocking */ }
       return { success: false, gateFailure: 'principle', reason: run.gates.principle.reason, run };
     }
 
@@ -925,6 +969,10 @@ export async function runPipeline(trigger, prompt, options = {}) {
     // Gate 4: Execution gate (cleared to work?)
     if (!runGate(run, 'execution', executionGate)) {
       run.completedAt = Date.now();
+      try {
+        const { recordEvent } = await import('./doctor.mjs');
+        recordEvent({ type: 'gate_failure', checkId: 'execution-gate', severity: 'fail', outcome: 'blocked', evidence: run.gates.execution.reason, sessionId: run.id }, cwd);
+      } catch { /* non-blocking */ }
       return { success: false, gateFailure: 'execution', reason: run.gates.execution.reason, run };
     }
 
@@ -1037,6 +1085,22 @@ export async function runPipeline(trigger, prompt, options = {}) {
     } catch (e) {
       // living-docs not available — non-blocking
     }
+
+    // Doctor: record execution outcome event (fail-silent)
+    try {
+      const { recordEvent } = await import('./doctor.mjs');
+      const successFlag = run.result && !run.result.error && run.verification?.ok;
+      recordEvent({
+        type: successFlag ? 'execution_success' : 'gate_failure',
+        checkId: 'execution',
+        severity: successFlag ? 'pass' : 'fail',
+        outcome: successFlag ? 'pass' : 'fail',
+        evidence: successFlag
+          ? `Completed ${trigger}: ${prompt.slice(0, 100)}`
+          : (run.result?.error || 'Execution failed'),
+        sessionId: run.id,
+      }, cwd);
+    } catch { /* non-blocking */ }
 
     // Doctor: record learning from this execution outcome (fail-silent)
     try {

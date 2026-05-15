@@ -40,6 +40,10 @@ const ROOT = join(__dirname, '..', '..');
 const args = process.argv.slice(2);
 const JSON_MODE = args.includes('--json');
 const FIX_MODE = args.includes('--fix');
+const RECONCILE_MODE = args.includes('--reconcile');
+const PROMOTE_ID = (() => { const i = args.indexOf('--promote'); return i !== -1 ? args[i + 1] : null; })();
+const DEMOTE_ID  = (() => { const i = args.indexOf('--demote');  return i !== -1 ? args[i + 1] : null; })();
+const SENTINEL_ID = (() => { const i = args.indexOf('--sentinel'); return i !== -1 ? args[i + 1] : null; })();
 
 function abs(rel) {
   return join(ROOT, rel);
@@ -523,9 +527,130 @@ function printReport(results) {
   }
 }
 
+// ─── Registry helpers (graceful — never throws) ───────────────────────────────
+
+let _registry = null;
+let _recordEvent = null;
+let _updateCheckStats = null;
+let _registerCheck = null;
+let _reconcile = null;
+
+async function loadRegistryFunctions() {
+  try {
+    const mod = await import('../../src/doctor.mjs');
+    _recordEvent     = mod.recordEvent;
+    _updateCheckStats = mod.updateCheckStats;
+    _registerCheck   = mod.registerCheck;
+    _reconcile       = mod.reconcile;
+    _registry        = mod.getCheckRegistry(ROOT);
+  } catch {
+    // doctor.mjs unavailable — degrade silently
+  }
+}
+
+function recordEventSafe(event) {
+  if (!_recordEvent) return;
+  try { _recordEvent({ ...event, source: 'repo-doctor' }, ROOT); } catch { /* ignore */ }
+}
+
+function updateCheckStatsSafe(checkId, outcome) {
+  if (!_updateCheckStats) return;
+  try { _updateCheckStats(checkId, outcome, ROOT); } catch { /* ignore */ }
+}
+
+function getChecksByStatus(status) {
+  if (!_registry) return [];
+  return _registry.filter(c => c.status === status);
+}
+
+// Map check names (as returned by check functions) to registry IDs
+const NAME_TO_ID = {
+  'package-name':     'package-name',
+  'version-scheme':   'version-scheme',
+  'bin-target':       'bin-target',
+  'exports':          'exports',
+  'required-files':   'required-files',
+  'branding-check':   'branding-check',
+  'readme-commands':  'readme-commands',
+  'dead-exports':     'dead-exports',
+  'files-array':      'files-array',
+  'cli-smoke-test':   'cli-smoke-test',
+  'npm-pack-dry-run': 'npm-pack-dry-run',
+};
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Load registry (non-blocking)
+  await loadRegistryFunctions();
+
+  // ── Management flags (run before normal checks) ───────────────────────────
+  if (PROMOTE_ID || DEMOTE_ID || SENTINEL_ID) {
+    if (!_registerCheck) {
+      console.error('Registry unavailable — cannot update check status.');
+      process.exit(1);
+    }
+    if (PROMOTE_ID) {
+      try {
+        _registerCheck({ id: PROMOTE_ID, status: 'active' }, ROOT);
+        console.log(`Promoted check "${PROMOTE_ID}" to active.`);
+        recordEventSafe({ type: 'check_promoted', checkId: PROMOTE_ID, outcome: 'promoted' });
+      } catch (e) { console.error('Promote failed:', e.message); process.exit(1); }
+    }
+    if (DEMOTE_ID) {
+      try {
+        _registerCheck({ id: DEMOTE_ID, status: 'archived' }, ROOT);
+        console.log(`Demoted check "${DEMOTE_ID}" to archived.`);
+        recordEventSafe({ type: 'check_demoted', checkId: DEMOTE_ID, outcome: 'archived' });
+      } catch (e) { console.error('Demote failed:', e.message); process.exit(1); }
+    }
+    if (SENTINEL_ID) {
+      try {
+        _registerCheck({ id: SENTINEL_ID, sentinel: true }, ROOT);
+        console.log(`Marked check "${SENTINEL_ID}" as sentinel.`);
+        recordEventSafe({ type: 'check_sentineled', checkId: SENTINEL_ID, outcome: 'sentinel' });
+      } catch (e) { console.error('Sentinel failed:', e.message); process.exit(1); }
+    }
+    process.exit(0);
+  }
+
+  // ── Reconcile flag ────────────────────────────────────────────────────────
+  if (RECONCILE_MODE) {
+    if (!_reconcile) {
+      console.error('Registry unavailable — cannot reconcile.');
+      process.exit(1);
+    }
+    const result = _reconcile(ROOT);
+    console.log('\n  dual-brain repo-doctor --reconcile\n');
+    if (result.proposals.length === 0 && result.demotions.length === 0 && result.sentinels.length === 0) {
+      console.log('  No proposals. System looks healthy.\n');
+    }
+    if (result.proposals.length > 0) {
+      console.log('  PROPOSED NEW CHECKS:');
+      for (const p of result.proposals) {
+        console.log(`    + [${p.kind}] ${p.candidateId} — ${p.rationale}`);
+      }
+      console.log('');
+    }
+    if (result.demotions.length > 0) {
+      console.log('  DEMOTION RECOMMENDATIONS:');
+      for (const d of result.demotions) {
+        console.log(`    - ${d.checkId} — ${d.reason}`);
+        console.log(`      Run: node .claude/hooks/repo-doctor.mjs --demote ${d.checkId}`);
+      }
+      console.log('');
+    }
+    if (result.sentinels.length > 0) {
+      console.log('  SENTINEL CANDIDATES:');
+      for (const s of result.sentinels) {
+        console.log(`    ~ ${s.checkId} — ${s.reason}`);
+        console.log(`      Run: node .claude/hooks/repo-doctor.mjs --sentinel ${s.checkId}`);
+      }
+      console.log('');
+    }
+    process.exit(0);
+  }
+
   // Load package.json once; pass mutable ref so --fix can update it
   const pkg = readJson('package.json');
   if (!pkg) {
@@ -535,8 +660,11 @@ async function main() {
     process.exit(1);
   }
 
-  // Run all checks (order matters: cheap/structural first, expensive last)
-  const results = await Promise.all([
+  // Generate a session ID for event correlation
+  const sessionId = `repo-doctor-${Date.now()}`;
+
+  // Run all active checks (order matters: cheap/structural first, expensive last)
+  const rawResults = await Promise.all([
     // Structural / fast
     Promise.resolve(checkPackageName(pkg)),
     checkVersionScheme(pkg),
@@ -554,14 +682,91 @@ async function main() {
     Promise.resolve(checkInstallSmokeTest()),
   ]);
 
+  // Post-run: update registry stats and record events for each active check
+  for (const r of rawResults) {
+    const checkId = NAME_TO_ID[r.name] || r.name;
+    updateCheckStatsSafe(checkId, r.status);
+    recordEventSafe({
+      type: 'check_result',
+      checkId,
+      severity: r.status === 'fail' ? 'fail' : r.status === 'warn' ? 'warn' : 'pass',
+      outcome: r.status,
+      evidence: r.message?.slice(0, 200),
+      sessionId,
+    });
+  }
+
+  // ── Shadow / quarantine checks ────────────────────────────────────────────
+  // Run any quarantine/shadow checks but don't count toward exit code
+  const shadowSpecs = getChecksByStatus('shadow').concat(getChecksByStatus('quarantine'));
+  const shadowResults = [];
+
+  for (const spec of shadowSpecs) {
+    // We can only run checks that have a matching runner — skip unknowns gracefully
+    try {
+      let result = null;
+      // Map to available runners by check kind/id
+      if (spec.id === 'package-name')     result = checkPackageName(pkg);
+      else if (spec.id === 'version-scheme') result = checkVersionScheme(pkg);
+      else if (spec.id === 'bin-target')   result = checkBinTarget(pkg);
+      else if (spec.id === 'exports')      result = await checkExports(pkg);
+      else if (spec.id === 'required-files') result = checkRequiredFiles();
+      else if (spec.id === 'branding-check') result = checkBranding();
+      else if (spec.id === 'readme-commands') result = checkReadmeCommands(pkg);
+      else if (spec.id === 'dead-exports') result = await checkDeadExports(pkg);
+      else if (spec.id === 'files-array')  result = checkFilesArray(pkg);
+      else if (spec.id === 'cli-smoke-test') result = checkCliSmokeTest();
+      else if (spec.id === 'npm-pack-dry-run') result = checkInstallSmokeTest();
+      // For custom/proposed checks with no runner, skip
+      if (result) {
+        shadowResults.push({ ...result, _shadowStatus: spec.status, _shadowId: spec.id });
+        recordEventSafe({
+          type: 'check_result',
+          checkId: spec.id,
+          severity: result.status,
+          outcome: result.status,
+          evidence: result.message?.slice(0, 200),
+          sessionId,
+          shadow: true,
+        });
+      }
+    } catch { /* individual shadow check failure is non-fatal */ }
+  }
+
+  const results = rawResults; // active checks only — shadow results displayed separately
+
   if (JSON_MODE) {
     const exitCode = results.some(r => r.status === 'fail') ? 1 : 0;
-    console.log(JSON.stringify({ results, exitCode, policies: POLICIES.notes }, null, 2));
+    console.log(JSON.stringify({ results, shadowResults, exitCode, policies: POLICIES.notes }, null, 2));
     process.exit(exitCode);
   }
 
   printReport(results);
+
+  // Display shadow results (informational only)
+  if (shadowResults.length > 0) {
+    console.log(dim('  Shadow / quarantine checks (not counted toward gate):'));
+    for (const r of shadowResults) {
+      const wouldFail = r.status === 'fail' || r.status === 'warn';
+      const label = wouldFail ? colorize('warn', 'WOULD FAIL') : colorize('pass', 'would pass');
+      console.log(`  ${dim('◌')} [${r._shadowStatus}] ${dim(r._shadowId.padEnd(22))} ${label}  ${r.message}`);
+    }
+    console.log('');
+  }
+
   const anyFail = results.some(r => r.status === 'fail');
+
+  // Record gate-level event
+  if (anyFail) {
+    recordEventSafe({
+      type: 'gate_failure',
+      severity: 'fail',
+      outcome: 'blocked',
+      evidence: results.filter(r => r.status === 'fail').map(r => r.name).join(', '),
+      sessionId,
+    });
+  }
+
   process.exit(anyFail ? 1 : 0);
 }
 

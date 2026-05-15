@@ -20,7 +20,7 @@
  *   verify, verifyAll, getVerificationCache, getStaleAssumptions, formatVerifications
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, appendFileSync, mkdirSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { readdir, readFile } from 'fs/promises';
 import { exec, execSync } from 'child_process';
@@ -1262,6 +1262,321 @@ export function formatDiscovery(result) {
   }
 
   return lines.join('\n');
+}
+
+// ─── EVENT LEDGER ─────────────────────────────────────────────────────────────
+// Append-only event log at .dualbrain/doctor/events.jsonl
+// Event types: check_result, gate_failure, contradiction_caught, agent_drift,
+//              manual_fix, incident, check_proposed, check_promoted, check_demoted, check_sentineled
+
+function doctorDir(cwd) {
+  return join(cwd || process.cwd(), '.dualbrain', 'doctor');
+}
+
+function eventsPath(cwd) {
+  return join(doctorDir(cwd), 'events.jsonl');
+}
+
+function checksDir(cwd) {
+  return join(doctorDir(cwd), 'checks');
+}
+
+function ensureDoctorDir(cwd) {
+  try { mkdirSync(checksDir(cwd), { recursive: true }); } catch { /* ignore */ }
+}
+
+/**
+ * recordEvent(event, cwd) — append an event to the doctor event ledger.
+ * Event schema: { ts, type, source, checkId, severity, outcome, evidence, sessionId, release }
+ */
+export function recordEvent(event, cwd = process.cwd()) {
+  try {
+    ensureDoctorDir(cwd);
+    const entry = {
+      ts: new Date().toISOString(),
+      type: event.type || 'unknown',
+      source: event.source || 'pipeline',
+      checkId: event.checkId || null,
+      severity: event.severity || null,
+      outcome: event.outcome || null,
+      evidence: event.evidence || null,
+      sessionId: event.sessionId || null,
+      release: event.release || null,
+      ...event,  // allow extra fields
+    };
+    appendFileSync(eventsPath(cwd), JSON.stringify(entry) + '\n', 'utf8');
+    return entry;
+  } catch { return null; }
+}
+
+/**
+ * getRecentEvents(cwd, days) — read events from the last N days.
+ */
+export function getRecentEvents(cwd = process.cwd(), days = 7) {
+  const p = eventsPath(cwd);
+  if (!existsSync(p)) return [];
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+  try {
+    return readFileSync(p, 'utf8').trim().split('\n').filter(Boolean)
+      .flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } })
+      .filter(e => e.ts >= cutoff);
+  } catch { return []; }
+}
+
+/**
+ * getEventsForCheck(checkId, cwd) — filter ledger events by checkId.
+ */
+export function getEventsForCheck(checkId, cwd = process.cwd()) {
+  const p = eventsPath(cwd);
+  if (!existsSync(p)) return [];
+  try {
+    return readFileSync(p, 'utf8').trim().split('\n').filter(Boolean)
+      .flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } })
+      .filter(e => e.checkId === checkId);
+  } catch { return []; }
+}
+
+// ─── CHECK REGISTRY ───────────────────────────────────────────────────────────
+// Each check spec is stored as a JSON file in .dualbrain/doctor/checks/<id>.json
+
+const STATIC_CHECK_SEEDS = [
+  { id: 'package-name',     kind: 'package-json-field',  severity: 'fail' },
+  { id: 'version-scheme',   kind: 'package-json-field',  severity: 'fail' },
+  { id: 'bin-target',       kind: 'export-target',       severity: 'fail' },
+  { id: 'exports',          kind: 'export-target',       severity: 'fail' },
+  { id: 'required-files',   kind: 'file-exists',         severity: 'fail' },
+  { id: 'branding-check',   kind: 'forbidden-string',    severity: 'fail' },
+  { id: 'readme-commands',  kind: 'readme-contract',     severity: 'warn' },
+  { id: 'dead-exports',     kind: 'export-target',       severity: 'warn' },
+  { id: 'files-array',      kind: 'file-exists',         severity: 'warn' },
+  { id: 'cli-smoke-test',   kind: 'command-exit',        severity: 'fail' },
+  { id: 'npm-pack-dry-run', kind: 'command-exit',        severity: 'fail' },
+];
+
+function checkSpecPath(checkId, cwd) {
+  return join(checksDir(cwd), `${checkId}.json`);
+}
+
+function defaultSpec(seed) {
+  return {
+    id: seed.id,
+    kind: seed.kind,
+    severity: seed.severity,
+    source: seed.source || 'static',
+    status: seed.status || 'active',
+    sentinel: seed.sentinel || false,
+    createdAt: seed.createdAt || new Date().toISOString().slice(0, 10),
+    createdFrom: seed.createdFrom || null,
+    signal: {
+      hits: 0,
+      falsePositives: 0,
+      truePositives: 0,
+      lastSeen: null,
+      lastFailed: null,
+    },
+  };
+}
+
+/**
+ * getCheckRegistry(cwd) — load all check specs from the registry directory.
+ * Seeds static checks if they don't exist yet.
+ */
+export function getCheckRegistry(cwd = process.cwd()) {
+  try {
+    ensureDoctorDir(cwd);
+    // Seed static checks on first call
+    for (const seed of STATIC_CHECK_SEEDS) {
+      const p = checkSpecPath(seed.id, cwd);
+      if (!existsSync(p)) {
+        try {
+          writeFileSync(p, JSON.stringify(defaultSpec(seed), null, 2) + '\n', 'utf8');
+        } catch { /* ignore */ }
+      }
+    }
+    // Load all check specs
+    let entries;
+    try { entries = readdirSync(checksDir(cwd)).filter(f => f.endsWith('.json')); }
+    catch { return []; }
+    return entries.flatMap(fname => {
+      try { return [JSON.parse(readFileSync(join(checksDir(cwd), fname), 'utf8'))]; }
+      catch { return []; }
+    });
+  } catch { return []; }
+}
+
+/**
+ * registerCheck(spec, cwd) — add or update a check spec in the registry.
+ */
+export function registerCheck(spec, cwd = process.cwd()) {
+  if (!spec || !spec.id) throw new Error('registerCheck: spec.id is required');
+  try {
+    ensureDoctorDir(cwd);
+    const p = checkSpecPath(spec.id, cwd);
+    const existing = existsSync(p)
+      ? (() => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } })()
+      : null;
+    const merged = existing ? { ...existing, ...spec } : { ...defaultSpec(spec), ...spec };
+    writeFileSync(p, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+    return merged;
+  } catch (e) { throw new Error(`registerCheck failed: ${e.message}`); }
+}
+
+/**
+ * updateCheckStats(checkId, outcome, cwd) — increment signal stats for a check.
+ * outcome: 'pass' | 'fail' | 'warn' | 'false_positive'
+ */
+export function updateCheckStats(checkId, outcome, cwd = process.cwd()) {
+  try {
+    ensureDoctorDir(cwd);
+    const p = checkSpecPath(checkId, cwd);
+    if (!existsSync(p)) return; // not registered — skip silently
+    let spec; try { spec = JSON.parse(readFileSync(p, 'utf8')); } catch { return; }
+    const signal = spec.signal || { hits: 0, falsePositives: 0, truePositives: 0, lastSeen: null, lastFailed: null };
+    const now = new Date().toISOString();
+    if (outcome === 'fail' || outcome === 'warn') {
+      signal.hits = (signal.hits || 0) + 1;
+      signal.truePositives = (signal.truePositives || 0) + 1;
+      signal.lastSeen = now;
+      signal.lastFailed = now;
+    } else if (outcome === 'false_positive') {
+      signal.hits = (signal.hits || 0) + 1;
+      signal.falsePositives = (signal.falsePositives || 0) + 1;
+      signal.lastSeen = now;
+    } else if (outcome === 'pass') {
+      signal.lastSeen = now;
+    }
+    spec.signal = signal;
+    writeFileSync(p, JSON.stringify(spec, null, 2) + '\n', 'utf8');
+  } catch { /* graceful degradation */ }
+}
+
+/**
+ * getCheckHealth(cwd) — summary of all checks with signal stats.
+ */
+export function getCheckHealth(cwd = process.cwd()) {
+  const registry = getCheckRegistry(cwd);
+  return registry.map(spec => {
+    const sig = spec.signal || {};
+    const hits = sig.hits || 0;
+    const fp = sig.falsePositives || 0;
+    const fpRate = hits >= 5 ? fp / hits : null;
+    return {
+      id: spec.id,
+      kind: spec.kind,
+      status: spec.status,
+      sentinel: spec.sentinel,
+      hits,
+      falsePositives: fp,
+      truePositives: sig.truePositives || 0,
+      fpRate,
+      lastSeen: sig.lastSeen,
+      lastFailed: sig.lastFailed,
+    };
+  });
+}
+
+// ─── RECONCILE ────────────────────────────────────────────────────────────────
+// Core invariant checks that should become sentinel candidates
+const SENTINEL_INVARIANTS = new Set(['version-scheme', 'package-name', 'bin-target']);
+
+const VALID_PRIMITIVES = new Set([
+  'file-exists', 'forbidden-string', 'command-exit', 'command-output',
+  'package-json-field', 'readme-contract', 'export-target',
+]);
+
+/**
+ * reconcile(cwd) — analyze events and check signal to surface improvement proposals.
+ * Returns { proposals, demotions, sentinels } — never auto-applies changes.
+ */
+export function reconcile(cwd = process.cwd()) {
+  const proposals = [];
+  const demotions = [];
+  const sentinels = [];
+
+  try {
+    const recentEvents = getRecentEvents(cwd, 7);
+    const registry = getCheckRegistry(cwd);
+    const checkMap = Object.fromEntries(registry.map(c => [c.id, c]));
+
+    // ── 1. Find incidents/gate_failures with no matching check_result failure ──
+    const incidents = recentEvents.filter(e =>
+      e.type === 'incident' || e.type === 'gate_failure'
+    );
+
+    for (const incident of incidents) {
+      const sessionId = incident.sessionId;
+      // Look for any check_result with outcome=fail in the same session
+      const caughtByCheck = recentEvents.some(e =>
+        e.type === 'check_result' &&
+        e.outcome === 'fail' &&
+        sessionId && e.sessionId === sessionId
+      );
+
+      if (!caughtByCheck && incident.evidence) {
+        // Propose a candidate check for this uncaught failure
+        const primitive = _inferPrimitive(incident.evidence);
+        if (primitive) {
+          proposals.push({
+            type: 'check_proposed',
+            candidateId: `auto-${Date.now()}-${proposals.length}`,
+            kind: primitive,
+            severity: 'warn',
+            source: 'reconcile',
+            status: 'quarantine',
+            createdFrom: incident.type,
+            evidence: incident.evidence,
+            rationale: `Uncaught ${incident.type}: ${String(incident.evidence).slice(0, 120)}`,
+          });
+        }
+      }
+    }
+
+    // ── 2. Checks with high false positive rate → recommend demotion ──────────
+    const health = getCheckHealth(cwd);
+    for (const h of health) {
+      if (h.status !== 'active') continue;
+      if (h.hits >= 5 && h.fpRate !== null && h.fpRate > 0.3) {
+        demotions.push({
+          checkId: h.id,
+          reason: `${Math.round(h.fpRate * 100)}% false positive rate over ${h.hits} runs`,
+          fpRate: h.fpRate,
+          hits: h.hits,
+        });
+      }
+    }
+
+    // ── 3. Checks that never fail in 20+ runs AND guard core invariants ────────
+    for (const h of health) {
+      if (h.status !== 'active') continue;
+      if (h.sentinel) continue; // already sentinel
+      const spec = checkMap[h.id];
+      if (!spec) continue;
+      const guardsInvariant = SENTINEL_INVARIANTS.has(h.id);
+      // Check hasn't fired but is tracking
+      const neverFailed = h.truePositives === 0 && h.hits >= 20;
+      if (guardsInvariant && neverFailed) {
+        sentinels.push({
+          checkId: h.id,
+          reason: `${h.hits} runs without failure — stable invariant guard`,
+          hits: h.hits,
+        });
+      }
+    }
+  } catch { /* graceful degradation — return empty results */ }
+
+  return { proposals, demotions, sentinels };
+}
+
+function _inferPrimitive(evidence) {
+  const s = String(evidence).toLowerCase();
+  if (s.includes('file') || s.includes('missing') || s.includes('not found')) return 'file-exists';
+  if (s.includes('string') || s.includes('branding') || s.includes('forbidden')) return 'forbidden-string';
+  if (s.includes('exit') || s.includes('failed') || s.includes('command')) return 'command-exit';
+  if (s.includes('package') || s.includes('version') || s.includes('name')) return 'package-json-field';
+  if (s.includes('readme') || s.includes('doc') || s.includes('contract')) return 'readme-contract';
+  if (s.includes('export')) return 'export-target';
+  if (s.includes('output')) return 'command-output';
+  return null; // can't infer — don't propose
 }
 
 // ─── Health Baseline Comparison ───────────────────────────────────────────────

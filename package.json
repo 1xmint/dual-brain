@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -22,7 +22,8 @@
     "./redact": "./src/redact.mjs",
     "./calibration": "./src/calibration.mjs",
     "./models": "./src/models.mjs",
-    "./prompt-intel": "./src/prompt-intel.mjs"
+    "./prompt-intel": "./src/prompt-intel.mjs",
+    "./replit": "./src/replit.mjs"
   },
   "keywords": [
     "claude-code",
@@ -83,6 +84,7 @@
     "src/install-hooks.mjs",
     "src/update-check.mjs",
     "src/prompt-intel.mjs",
+    "src/replit.mjs",
     "src/fx.mjs",
     "bin/*.mjs",
     "hooks/enforce-tier.mjs",

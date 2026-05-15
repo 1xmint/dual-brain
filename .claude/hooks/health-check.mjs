@@ -315,7 +315,39 @@ function checkCodexCli() {
   return check("codex CLI", STATUS.warn, `found at ${codexPath} — auth status unknown`);
 }
 
-/** 7. Git repo — verify we're in a git repo */
+/** 7a. replit-tools status — version, auth script, session archive */
+async function checkReplitTools() {
+  try {
+    const { inspectReplitTools, getAuthStatus } = await import('../../src/replit.mjs');
+    const tools = inspectReplitTools(WORKSPACE);
+    if (!tools.installed) {
+      return check('replit-tools', STATUS.warn, 'not installed');
+    }
+
+    const ver = tools.version ? `v${tools.version}` : 'installed';
+    const authAvail = tools.authRefresh?.available ? 'auth-refresh: yes' : 'auth-refresh: no';
+    const sessions = tools.sessionArchive?.sessionCount ?? 0;
+    const detail = `${ver} | ${authAvail} | sessions: ${sessions}`;
+
+    return check('replit-tools', STATUS.pass, detail);
+  } catch {
+    return check('replit-tools', STATUS.warn, 'unavailable (import failed)');
+  }
+}
+
+/** 7b. Claude auth status — delegates to replit-tools, falls back to direct */
+async function checkClaudeAuth() {
+  try {
+    const { getAuthHealthStatus } = await import('../../src/health.mjs');
+    const authStatus = await getAuthHealthStatus(WORKSPACE);
+    const status = authStatus.ok ? STATUS.pass : STATUS.warn;
+    return check('claude auth', status, authStatus.detail);
+  } catch {
+    return check('claude auth', STATUS.warn, 'check unavailable');
+  }
+}
+
+/** 8. Git repo — verify we're in a git repo */
 function checkGitRepo() {
   const result = spawnSync("git", ["-C", WORKSPACE, "status", "--porcelain"], {
     encoding: "utf8",
@@ -400,7 +432,12 @@ function renderTable(checks) {
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
+  const [replitToolsCheck, claudeAuthCheck] = await Promise.all([
+    checkReplitTools(),
+    checkClaudeAuth(),
+  ]);
+
   const checks = [
     checkOrchestratorJson(),
     checkPricingVerified(),
@@ -410,6 +447,8 @@ function main() {
     checkUsageJsonl(),
     checkCodexCli(),
     checkGitRepo(),
+    replitToolsCheck,
+    claudeAuthCheck,
   ];
 
   // Print formatted table
