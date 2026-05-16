@@ -46,6 +46,12 @@ export function acquire({ force = false } = {}) {
     return { acquired: true, sessionId: _sessionId, existingSession: null, mode: 'primary' };
   }
 
+  // Same process (re-entry within same session) — always grant
+  if (existing.pid === process.pid) {
+    _sessionId = existing.sessionId;
+    return { acquired: true, sessionId: _sessionId, existingSession: null, mode: 'primary' };
+  }
+
   const age = Date.now() - existing.heartbeat;
 
   if (age > STALE_THRESHOLD_MS || force) {

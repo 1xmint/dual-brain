@@ -197,6 +197,7 @@ export function enter(userMessage, context = {}) {
       plan,
       nextDispatch: prepared,
       suggestion: prepared.blockers[0],
+      mode,
     };
   }
 
@@ -209,6 +210,7 @@ export function enter(userMessage, context = {}) {
     plan,
     nextDispatch: prepared,
     estimatedCost: plan.estimatedCost,
+    mode,
   };
 }
 
