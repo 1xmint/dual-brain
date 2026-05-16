@@ -1,4 +1,43 @@
 {
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git rev-parse*)",
+      "Bash(git ls-files*)",
+      "Bash(git show*)",
+      "Bash(git blame*)",
+      "Bash(ls *)",
+      "Bash(pwd)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(echo *)",
+      "Bash(node --check*)",
+      "Bash(node -e *)",
+      "Bash(node */dual-brain*)",
+      "Bash(node .claude/hooks/*)",
+      "Bash(dual-brain *)",
+      "Bash(npm test*)",
+      "Bash(npm run test*)",
+      "Bash(npm whoami*)",
+      "Bash(npm pack --dry-run*)",
+      "Bash(which *)",
+      "Bash(type *)",
+      "Bash(env | grep*)",
+      "Bash(date*)",
+      "WebSearch",
+      "WebFetch",
+      "Agent"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -43,20 +82,15 @@
           {
             "type": "command",
             "command": "node .claude/hooks/enforce-tier.mjs"
+          },
+          {
+            "type": "command",
+            "command": "node .claude/hooks/deliberation-gate.mjs"
           }
         ]
       }
     ],
     "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node .claude/hooks/cost-logger.mjs"
-          }
-        ]
-      },
       {
         "matcher": "",
         "hooks": [

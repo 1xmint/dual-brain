@@ -283,6 +283,159 @@ export function getLintCommand(cwd = process.cwd()) {
   return detectRepo(cwd).commands.lint;
 }
 
+// ─── Ownership hints ──────────────────────────────────────────────────────────
+
+/**
+ * Return the last git author, last-modified date, and commit count for a file.
+ * @param {string} filePath
+ * @param {string} [cwd]
+ * @returns {{ lastAuthor: string, lastModified: string, totalCommits: number }|null}
+ */
+export function getFileOwnership(filePath, cwd) {
+  try {
+    const blame = execSync(`git log --format="%an" -1 -- "${filePath}"`, { cwd, encoding: 'utf8', timeout: 5000 }).trim();
+    const lastDate = execSync(`git log --format="%ci" -1 -- "${filePath}"`, { cwd, encoding: 'utf8', timeout: 5000 }).trim();
+    const commitCount = parseInt(execSync(`git rev-list --count HEAD -- "${filePath}"`, { cwd, encoding: 'utf8', timeout: 5000 }).trim()) || 0;
+    return { lastAuthor: blame, lastModified: lastDate, totalCommits: commitCount };
+  } catch { return null; }
+}
+
+// ─── Dependency edges ─────────────────────────────────────────────────────────
+
+/**
+ * Extract import/require edges from a source file.
+ * @param {string} filePath  — relative path from cwd
+ * @param {string} [cwd]
+ * @returns {{ local: string[], external: string[], total: number }}
+ */
+export function getDependencyEdges(filePath, cwd) {
+  try {
+    const content = readFileSync(join(cwd || process.cwd(), filePath), 'utf8');
+    const imports = [];
+    // ES module imports
+    for (const match of content.matchAll(/import\s+.*?from\s+['"]([^'"]+)['"]/g)) {
+      imports.push(match[1]);
+    }
+    // Dynamic imports
+    for (const match of content.matchAll(/import\(['"]([^'"]+)['"]\)/g)) {
+      imports.push(match[1]);
+    }
+    // CommonJS requires
+    for (const match of content.matchAll(/require\(['"]([^'"]+)['"]\)/g)) {
+      imports.push(match[1]);
+    }
+    const local = imports.filter(i => i.startsWith('.') || i.startsWith('/'));
+    const external = imports.filter(i => !i.startsWith('.') && !i.startsWith('/'));
+    return { local, external, total: imports.length };
+  } catch { return { local: [], external: [], total: 0 }; }
+}
+
+// ─── Test mapping ─────────────────────────────────────────────────────────────
+
+/**
+ * Find test files whose name matches the source file's base name.
+ * @param {string} filePath
+ * @param {string} [cwd]
+ * @returns {string[]}
+ */
+export function findRelatedTests(filePath, cwd) {
+  const root = cwd || process.cwd();
+  const base = filePath.replace(/\.(mjs|js|ts|tsx|jsx)$/, '');
+  const name = base.split('/').pop();
+
+  const found = [];
+  try {
+    const allTests = execSync(
+      `find . -type f \\( -name "*.test.*" -o -name "*.spec.*" -o -path "*/tests/*" -o -path "*/test/*" -o -path "*/__tests__/*" \\) -not -path "*/node_modules/*"`,
+      { cwd: root, encoding: 'utf8', timeout: 5000 }
+    ).trim().split('\n').filter(Boolean);
+
+    for (const t of allTests) {
+      if (t.includes(name)) found.push(t.replace(/^\.\//, ''));
+    }
+  } catch {}
+
+  return found;
+}
+
+// ─── Risk hotspots ────────────────────────────────────────────────────────────
+
+/**
+ * Return the files with highest churn × complexity risk in the last N days.
+ * @param {string} [cwd]
+ * @param {{ days?: number, limit?: number }} [opts]
+ * @returns {Array<{ file: string, changeCount: number, lineCount: number, risk: number }>}
+ */
+export function getRiskHotspots(cwd, opts = {}) {
+  const { days = 30, limit = 10 } = opts;
+  const root = cwd || process.cwd();
+  try {
+    const since = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
+    const log = execSync(
+      `git log --since="${since}" --name-only --pretty=format: | sort | uniq -c | sort -rn | head -${limit * 2}`,
+      { cwd: root, encoding: 'utf8', timeout: 10000 }
+    ).trim();
+
+    const hotspots = [];
+    for (const line of log.split('\n').filter(Boolean)) {
+      const match = line.trim().match(/^(\d+)\s+(.+)$/);
+      if (match) {
+        const changeCount = parseInt(match[1]);
+        const file = match[2];
+        if (changeCount >= 3 && existsSync(join(root, file))) {
+          let lineCount = 0;
+          try {
+            lineCount = readFileSync(join(root, file), 'utf8').split('\n').length;
+          } catch {}
+          hotspots.push({ file, changeCount, lineCount, risk: changeCount * Math.log2(Math.max(lineCount, 1)) });
+        }
+      }
+    }
+
+    return hotspots.sort((a, b) => b.risk - a.risk).slice(0, limit);
+  } catch { return []; }
+}
+
+// ─── Primary language detection ───────────────────────────────────────────────
+
+function detectPrimaryLanguage(cwd) {
+  try {
+    const files = execSync(
+      'git ls-files --cached | grep -oE "\\.[a-zA-Z]+$" | sort | uniq -c | sort -rn | head -5',
+      { cwd, encoding: 'utf8', timeout: 5000 }
+    ).trim();
+    const match = files.split('\n')[0]?.trim().match(/^\d+\s+\.(.+)$/);
+    const ext = match?.[1];
+    const langMap = {
+      js: 'JavaScript', mjs: 'JavaScript', ts: 'TypeScript', tsx: 'TypeScript',
+      py: 'Python', rb: 'Ruby', go: 'Go', rs: 'Rust', java: 'Java',
+      kt: 'Kotlin', swift: 'Swift', cpp: 'C++', c: 'C',
+    };
+    return langMap[ext] || ext || 'unknown';
+  } catch { return 'unknown'; }
+}
+
+// ─── Repo intelligence ────────────────────────────────────────────────────────
+
+/**
+ * Return consolidated repo intelligence for routing decisions.
+ * @param {string} [cwd]
+ * @returns {object}
+ */
+export function getRepoIntelligence(cwd) {
+  const root = cwd || process.cwd();
+  const cache = loadRepoCache(root);
+  const hotspots = getRiskHotspots(root);
+
+  return {
+    ...cache,
+    hotspots,
+    hasTests: hotspots.some(h => h.file.includes('test')),
+    primaryLanguage: detectPrimaryLanguage(root),
+    repoSize: cache?.fileCount || 0,
+  };
+}
+
 // ─── CLI (direct invocation) ──────────────────────────────────────────────────
 
 const isMain = process.argv[1]?.endsWith('repo.mjs');

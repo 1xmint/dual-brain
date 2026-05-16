@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 
-const LEDGER_PATH = '.dual-brain/ledger.jsonl';
+const LEDGER_PATH = '.dualbrain/ledger.jsonl';
 
 function ledgerPath(cwd) {
   return join(cwd || process.cwd(), LEDGER_PATH);
@@ -19,7 +19,7 @@ function readAllEntries(cwd) {
 
 function appendEntry(entry, cwd) {
   const p = ledgerPath(cwd);
-  mkdirSync(join(cwd || process.cwd(), '.dual-brain'), { recursive: true });
+  mkdirSync(join(cwd || process.cwd(), '.dualbrain'), { recursive: true });
   writeFileSync(p, JSON.stringify(entry) + '\n', { flag: 'a' });
 }
 

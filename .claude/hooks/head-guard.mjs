@@ -107,20 +107,52 @@ function checkBreakGlass() {
 
 const breakGlassToken = checkBreakGlass();
 
-// ── Parse stdin FIRST — subagent bypass must happen before any blocking logic ─
-
-// Read stdin JSON payload
-let input;
-try {
-  const raw = readFileSync('/dev/stdin', 'utf8');
-  input = JSON.parse(raw);
-} catch {
-  // If we can't read / parse input, fail open — don't break sessions
-  // that aren't using dual-brain at all.
+// ── Smoke-test mode ──────────────────────────────────────────────────────────
+// DUAL_BRAIN_SMOKE_TEST=1 → parse stdin, print result, exit 0. Never blocks.
+if (process.env.DUAL_BRAIN_SMOKE_TEST === '1') {
+  let smokeRaw, smokeParsed = false;
+  try {
+    smokeRaw = readFileSync('/dev/stdin', 'utf8');
+    JSON.parse(smokeRaw);
+    smokeParsed = true;
+  } catch { /* non-fatal for smoke test */ }
+  process.stdout.write(JSON.stringify({ smokeTest: true, parsed: smokeParsed, exitCode: 0 }) + '\n');
   process.exit(0);
 }
 
-const toolName = input.tool_name || '';
+// ── Parse stdin FIRST — subagent bypass must happen before any blocking logic ─
+
+// Read stdin JSON payload — two distinct failure modes:
+//   1. Can't read stdin at all  → not a dual-brain session, fail open (exit 0)
+//   2. Stdin read but JSON parse fails → malformed hook protocol, fail open with warning
+//   3. JSON parses but required fields missing → fail open with warning
+let input;
+let stdinRaw;
+try {
+  stdinRaw = readFileSync('/dev/stdin', 'utf8');
+} catch {
+  // Can't read stdin at all — not a dual-brain hook invocation. Fail open.
+  process.exit(0);
+}
+
+try {
+  input = JSON.parse(stdinRaw);
+} catch {
+  // Stdin present but JSON is malformed — warn and fail open. Don't break non-dual-brain sessions.
+  process.stderr.write('[dual-brain] head-guard: malformed hook protocol (JSON parse failed) — failing open\n');
+  process.exit(0);
+}
+
+if (!input || typeof input !== 'object') {
+  process.stderr.write('[dual-brain] head-guard: hook payload is not an object — failing open\n');
+  process.exit(0);
+}
+
+const toolName = String(input.tool_name ?? '');
+if (!toolName) {
+  process.stderr.write('[dual-brain] head-guard: required field tool_name missing from hook payload — failing open\n');
+  process.exit(0);
+}
 
 // ── Subagent bypass — MUST be before manifest check and all other guards ──────
 // If this hook is firing inside a subagent, ALLOW — subagents are work agents

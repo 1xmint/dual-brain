@@ -564,13 +564,13 @@ const VERIFIERS = {
     try { execSync('which claude', { stdio: 'pipe', timeout: 2000 }); return { status: 'verified', evidence: 'claude CLI found', probe: 'which claude' }; }
     catch { return { status: 'failed', evidence: 'claude CLI not found', probe: 'which claude' }; }
   }},
-  'openai-key': { ttl: TTL_RUNTIME, fn: () => {
-    const has = !!process.env.OPENAI_API_KEY;
-    return { status: has ? 'verified' : 'failed', evidence: has ? 'OPENAI_API_KEY present' : 'OPENAI_API_KEY missing', probe: 'env check' };
+  'openai-key': { ttl: TTL_TOOL, fn: () => {
+    try { execSync('which codex', { stdio: 'pipe', timeout: 2000 }); return { status: 'verified', evidence: 'codex CLI found (subscription auth)', probe: 'which codex' }; }
+    catch { return { status: 'failed', evidence: 'codex CLI not found — run: codex login', probe: 'which codex' }; }
   }},
-  'anthropic-key': { ttl: TTL_RUNTIME, fn: () => {
-    const has = !!(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY);
-    return { status: has ? 'verified' : 'failed', evidence: has ? 'API key present' : 'API key missing', probe: 'env check' };
+  'anthropic-key': { ttl: TTL_TOOL, fn: () => {
+    try { execSync('which claude', { stdio: 'pipe', timeout: 2000 }); return { status: 'verified', evidence: 'claude CLI found (subscription auth)', probe: 'which claude' }; }
+    catch { return { status: 'failed', evidence: 'claude CLI not found — run: claude login', probe: 'which claude' }; }
   }},
   'git-available': { ttl: TTL_TOOL, fn: () => {
     try { const v = execSync('git --version', { stdio: 'pipe', timeout: 2000 }).toString().trim(); return { status: 'verified', evidence: v, probe: 'git --version' }; }
@@ -594,8 +594,8 @@ const VERIFIERS = {
     catch { return { status: 'failed', evidence: 'ripgrep not found', probe: 'which rg' }; }
   }},
   'living-docs-init': { ttl: TTL_RUNTIME, fn: (cwd) => {
-    const exists = existsSync(join(cwd || process.cwd(), '.dual-brain'));
-    return { status: exists ? 'verified' : 'failed', evidence: exists ? '.dual-brain/ exists' : '.dual-brain/ not initialized', probe: 'fs check' };
+    const exists = existsSync(join(cwd || process.cwd(), '.dualbrain'));
+    return { status: exists ? 'verified' : 'failed', evidence: exists ? '.dualbrain/ exists' : '.dualbrain/ not initialized', probe: 'fs check' };
   }},
   'model-registry-fresh': { ttl: TTL_REGISTRY, fn: () => {
     try {
@@ -627,15 +627,15 @@ export function verify(claim, cwd) {
 }
 
 /**
- * verifyAll(cwd) — run all registered verifiers and append results to .dual-brain/verifications.jsonl.
+ * verifyAll(cwd) — run all registered verifiers and append results to .dualbrain/verifications.jsonl.
  * Returns array of verification result objects.
  */
 export function verifyAll(cwd = process.cwd()) {
   const results = Object.keys(VERIFIERS).map(claim => verify(claim, cwd));
 
-  // Persist to .dual-brain/verifications.jsonl (append-only)
+  // Persist to .dualbrain/verifications.jsonl (append-only)
   try {
-    const dir = join(cwd, '.dual-brain');
+    const dir = join(cwd, '.dualbrain');
     if (existsSync(dir)) {
       const logPath = join(dir, 'verifications.jsonl');
       const lines = results.map(r => JSON.stringify(r)).join('\n') + '\n';
@@ -647,11 +647,11 @@ export function verifyAll(cwd = process.cwd()) {
 }
 
 /**
- * getVerificationCache(cwd) — read .dual-brain/verifications.jsonl, return most recent
+ * getVerificationCache(cwd) — read .dualbrain/verifications.jsonl, return most recent
  * non-expired result per claim. Expired entries are skipped.
  */
 export function getVerificationCache(cwd = process.cwd()) {
-  const logPath = join(cwd, '.dual-brain', 'verifications.jsonl');
+  const logPath = join(cwd, '.dualbrain', 'verifications.jsonl');
   if (!existsSync(logPath)) return [];
 
   let lines;
@@ -718,7 +718,7 @@ const CODE_TASK_TYPES   = new Set(['fix', 'feature', 'refactor', 'implement', 't
 const REASONING_MODELS  = new Set(['o3']);
 
 function learningsPath(cwd) {
-  return join(cwd, '.dual-brain', 'learnings.jsonl');
+  return join(cwd, '.dualbrain', 'learnings.jsonl');
 }
 
 function readLearnings(cwd) {
@@ -802,7 +802,7 @@ export function recordLearning(taskResult, cwd = process.cwd()) {
     };
 
     const p = learningsPath(cwd);
-    const dir = join(cwd, '.dual-brain');
+    const dir = join(cwd, '.dualbrain');
     if (existsSync(dir)) {
       appendFileSync(p, JSON.stringify(record) + '\n', 'utf8');
     }
@@ -1167,7 +1167,7 @@ function discoverReplitFeatures(cwd) {
 }
 
 function loadLastDiscovery(cwd) {
-  const logPath = join(cwd, '.dual-brain', 'discoveries.jsonl');
+  const logPath = join(cwd, '.dualbrain', 'discoveries.jsonl');
   if (!existsSync(logPath)) return null;
   try {
     const lines = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
@@ -1177,7 +1177,7 @@ function loadLastDiscovery(cwd) {
 }
 
 function appendDiscoveryLog(cwd, entry) {
-  const dir = join(cwd, '.dual-brain');
+  const dir = join(cwd, '.dualbrain');
   try {
     if (!existsSync(dir)) execSync(`mkdir -p "${dir}"`, { timeout: 2000 });
     appendFileSync(join(dir, 'discoveries.jsonl'), JSON.stringify(entry) + '\n', 'utf8');
@@ -1217,10 +1217,10 @@ export function discover(cwd = process.cwd()) {
 }
 
 /**
- * getDiscoveryLog(cwd, limit) — read recent discovery entries from .dual-brain/discoveries.jsonl.
+ * getDiscoveryLog(cwd, limit) — read recent discovery entries from .dualbrain/discoveries.jsonl.
  */
 export function getDiscoveryLog(cwd = process.cwd(), limit = 20) {
-  const logPath = join(cwd, '.dual-brain', 'discoveries.jsonl');
+  const logPath = join(cwd, '.dualbrain', 'discoveries.jsonl');
   if (!existsSync(logPath)) return [];
   try {
     const lines = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);

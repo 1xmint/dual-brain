@@ -20,10 +20,10 @@
  */
 
 import { spawnSync } from 'child_process';
-import { appendFileSync, mkdirSync } from 'fs';
+import { appendFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { redact } from '../../src/redact.mjs';
+import { scorePrompt, logPromptExchange } from '../../src/prompt-audit.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
@@ -70,30 +70,13 @@ function isCodexAuthenticated(result) {
 // Prompt builder
 // ---------------------------------------------------------------------------
 
-const DESIGN_REVIEW_TEMPLATE = `DESIGN REVIEW — dual-brain self-change
-
-Before analyzing the proposed change, evaluate these gates:
-
-1. EXISTING TOOLS: Does replit-tools, data-tools, or an existing dual-brain module already handle this? If yes, should we extend it instead of building new?
-2. BETTER APPROACH: Is there a simpler or more effective way to achieve this goal? Consider: fewer files, less code, leveraging existing patterns.
-3. VISION ALIGNMENT: Does this change align with VISION.md principles? (sessions first, provider invisible, one screen, box everything, 10-second setup, team-friendly)
-4. TEST FIRST: Should we prototype or test this before full implementation? What's the minimum viable change?
-5. BLAST RADIUS: What existing features could this break? What screens/flows need re-testing?
-
-Now analyze the actual question:
-`;
-
-function buildGptPrompt({ question, context, files, round, claudePerspective, designReview }) {
-  const effectiveQuestion = designReview
-    ? `${DESIGN_REVIEW_TEMPLATE}${question}`
-    : question;
-
+function buildGptPrompt({ question, context, files, round, claudePerspective }) {
   if (round === 2 && claudePerspective) {
     return `You are GPT-5.5 in a collaborative architectural discussion with Claude (Opus).
 You gave your initial analysis on a question. Claude has now provided its independent perspective.
 This is a professional dialogue — two experts refining a decision together.
 
-Original question: ${effectiveQuestion}
+Original question: ${question}
 ${context ? `\nContext: ${context}` : ''}
 
 Claude's perspective:
@@ -115,7 +98,7 @@ If you still disagree after considering their points, explain what specific evid
 This is Round 1 of a dual-brain analysis — Claude (Opus) will independently analyze the same question,
 then send you their perspective for a collaborative discussion in Round 2.
 
-Question: ${effectiveQuestion}
+Question: ${question}
 ${context ? `\nContext: ${context}` : ''}
 ${files?.length ? `\nRelevant files: ${files.join(', ')}` : ''}
 
@@ -193,9 +176,7 @@ function runGptAnalysis(codexBin, prompt) {
 // ---------------------------------------------------------------------------
 
 function logUsage({ durationMs, usage, success }) {
-  const usageDir = join(__dirname, '..', '..', '.dualbrain', 'usage');
-  mkdirSync(usageDir, { recursive: true });
-  const logFile = join(usageDir, `usage-${new Date().toISOString().slice(0, 10)}.jsonl`);
+  const logFile = join(__dirname, `usage-${new Date().toISOString().slice(0, 10)}.jsonl`);
   const entry = JSON.stringify({
     schema_version: 2,
     timestamp: new Date().toISOString(),
@@ -219,7 +200,7 @@ function logUsage({ durationMs, usage, success }) {
 // Core exported function
 // ---------------------------------------------------------------------------
 
-export async function dualThink({ question, context, files, round, claudePerspective, designReview } = {}) {
+export async function dualThink({ question, context, files, round, claudePerspective } = {}) {
   if (!question) {
     return {
       gpt: null,
@@ -252,10 +233,26 @@ export async function dualThink({ question, context, files, round, claudePerspec
     };
   }
 
-  const prompt = redact(buildGptPrompt({ question, context, files, round: effectiveRound, claudePerspective, designReview }));
+  const prompt = buildGptPrompt({ question, context, files, round: effectiveRound, claudePerspective });
+
+  // Score the question prompt for quality before sending to GPT
+  const promptScore = scorePrompt(question, { type: 'think' });
+
   const raw = runGptAnalysis(codexBin, prompt);
 
   logUsage({ durationMs: raw.durationMs, usage: raw.usage, success: raw.success });
+
+  // Log the exchange for audit trail
+  logPromptExchange({
+    type: 'think',
+    round: effectiveRound,
+    prompt: question,
+    response: raw.success ? raw.text : null,
+    provider: 'gpt',
+    model: MODEL,
+    durationMs: raw.durationMs,
+    promptScore,
+  });
 
   if (!raw.success) {
     return {
@@ -276,6 +273,7 @@ export async function dualThink({ question, context, files, round, claudePerspec
         durationMs: raw.durationMs,
         tokens: raw.usage,
       },
+      promptQuality: { score: promptScore.score, grade: promptScore.grade, issues: promptScore.issues },
       instructions: `GPT has responded to your analysis. Now synthesize both rounds into a FINAL DECISION:
 1. Where you both agree → high confidence, proceed
 2. Where GPT pushed back on your points → re-evaluate honestly
@@ -293,6 +291,7 @@ export async function dualThink({ question, context, files, round, claudePerspec
       durationMs: raw.durationMs,
       tokens: raw.usage,
     },
+    promptQuality: { score: promptScore.score, grade: promptScore.grade, issues: promptScore.issues },
     instructions: `Round 1 complete. Now:
 1. Provide YOUR independent analysis of the same question (same structure: recommendation, rationale, alternatives, risks, confidence, verification)
 2. Then call Round 2 to send your perspective back to GPT:
@@ -368,6 +367,14 @@ function printResult(result, question) {
   const gptData = result.gpt;
   const durSec = (gptData.durationMs / 1000).toFixed(1);
   console.log(`║ 🤖 GPT-5.5 (${durSec}s):`.padEnd(51) + '║');
+
+  if (result.promptQuality) {
+    const pq = result.promptQuality;
+    const issueStr = pq.issues.length ? ` [${pq.issues.map(i => i.rule).join(', ')}]` : '';
+    const qualityLine = `Prompt quality: ${pq.grade} (${pq.score}/100)${issueStr}`;
+    console.log(`║ ${qualityLine.slice(0, 48).padEnd(48)} ║`);
+  }
+
   console.log(BAR);
   console.log('');
   console.log(gptData.recommendation || gptData.rebuttal);
@@ -395,7 +402,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
   if (!args.question) {
     console.error(
-      'Usage: node dual-brain-think.mjs --question "<question>" [--context "<ctx>"] [--files f1,f2] [--design-review]\n' +
+      'Usage: node dual-brain-think.mjs --question "<question>" [--context "<ctx>"] [--files f1,f2]\n' +
       '       node dual-brain-think.mjs --question "<question>" --round 2 --claude-says "<analysis>"'
     );
     process.exit(1);
@@ -407,7 +414,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     files: args.files,
     round: args.round ? parseInt(args.round, 10) : 1,
     claudePerspective: args['claude-says'] || null,
-    designReview: args['design-review'] === true || args['design-review'] === 'true',
   });
 
   printResult(result, args.question);

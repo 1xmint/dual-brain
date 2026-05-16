@@ -111,7 +111,7 @@ export function formatFailureReceipt(receipt, failureContext) {
 
 // ─── Persistent session receipt ──────────────────────────────────────────────
 
-const RECEIPTS_DIR = '.dual-brain/receipts';
+const RECEIPTS_DIR = '.dualbrain/receipts';
 
 function receiptsDir(cwd) {
   return join(cwd, RECEIPTS_DIR);
@@ -130,7 +130,7 @@ function gitChangedFiles(cwd) {
 
 function readDecisionsRecent(cwd, limit = 5) {
   try {
-    const raw = readFileSync(join(cwd, '.dual-brain', 'decisions.jsonl'), 'utf8');
+    const raw = readFileSync(join(cwd, '.dualbrain', 'decisions.jsonl'), 'utf8');
     const lines = raw.split('\n').filter(l => l.trim());
     return lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   } catch {

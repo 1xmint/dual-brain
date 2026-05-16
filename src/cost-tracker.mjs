@@ -1,4 +1,4 @@
-// cost-tracker.mjs — Lightweight cost estimation and efficiency tracking for .dual-brain/costs.jsonl.
+// cost-tracker.mjs — Lightweight cost estimation and efficiency tracking for .dualbrain/costs.jsonl.
 
 import { readFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -21,7 +21,7 @@ export function estimateTokenCost(model, tokens) {
 
 export function trackCost(action, cwd = process.cwd()) {
   try {
-    const dir = join(cwd, '.dual-brain');
+    const dir = join(cwd, '.dualbrain');
     mkdirSync(dir, { recursive: true });
     const entry = {
       timestamp:      new Date().toISOString(),
@@ -41,7 +41,7 @@ export function trackCost(action, cwd = process.cwd()) {
 }
 
 function readCostLines(cwd) {
-  const p = join(cwd, '.dual-brain', 'costs.jsonl');
+  const p = join(cwd, '.dualbrain', 'costs.jsonl');
   if (!existsSync(p)) return [];
   try {
     return readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).flatMap(line => {

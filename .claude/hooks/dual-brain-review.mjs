@@ -16,7 +16,6 @@ import { spawnSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { redact } from '../../src/redact.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
@@ -177,14 +176,13 @@ function tryCodexReview(diff, { round = 1, claudeReview = null } = {}) {
 
   try {
     const model = getThinkModel();
-    const rawDiff = diff.length > MAX_DIFF_CHARS
+    const truncated = diff.length > MAX_DIFF_CHARS
       ? diff.slice(0, MAX_DIFF_CHARS) + '\n[truncated]'
       : diff;
-    const truncated = redact(rawDiff);
 
     let basePrompt;
     if (round === 2 && claudeReview) {
-      basePrompt = REVIEW_PROMPT_R2.replace('---CLAUDE_REVIEW---', redact(claudeReview));
+      basePrompt = REVIEW_PROMPT_R2.replace('---CLAUDE_REVIEW---', claudeReview);
     } else {
       basePrompt = REVIEW_PROMPT_R1;
     }
@@ -254,14 +252,13 @@ async function tryApiReview(diff, { round = 1, claudeReview = null } = {}) {
   if (!apiKey) return null;
 
   const model = getThinkModel();
-  const rawDiff = diff.length > MAX_DIFF_CHARS
+  const truncated = diff.length > MAX_DIFF_CHARS
     ? diff.slice(0, MAX_DIFF_CHARS) + '\n[truncated]'
     : diff;
-  const truncated = redact(rawDiff);
 
   let basePrompt;
   if (round === 2 && claudeReview) {
-    basePrompt = REVIEW_PROMPT_R2.replace('---CLAUDE_REVIEW---', redact(claudeReview));
+    basePrompt = REVIEW_PROMPT_R2.replace('---CLAUDE_REVIEW---', claudeReview);
   } else {
     basePrompt = REVIEW_PROMPT_R1;
   }

@@ -1,11 +1,11 @@
-// living-docs.mjs — Living document system for .dual-brain/.
+// living-docs.mjs — Living document system for .dualbrain/.
 // Manages project.json, vision.md, roadmap.md, state.md, actions.jsonl, decisions.jsonl, checkpoints.jsonl.
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { execSync } from 'node:child_process';
 
-const DIR = '.dual-brain';
+const DIR = '.dualbrain';
 
 function docsDir(cwd = process.cwd()) {
   return join(cwd, DIR);

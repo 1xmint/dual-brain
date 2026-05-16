@@ -13,6 +13,15 @@ import { loadProfile } from './profile.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+// Lazy-load collaboration module
+let _collab = null;
+async function getCollab() {
+  if (!_collab) {
+    try { _collab = await import('./collaboration.mjs'); } catch { _collab = false; }
+  }
+  return _collab || null;
+}
+
 // ─── PipelineRun factory ──────────────────────────────────────────────────────
 
 /**
@@ -83,6 +92,15 @@ export function createPipelineRun(trigger = '', prompt = '') {
     replitEnvironment: null, // from replit.detectReplitEnvironment()
     replitTools: null,       // from replit.inspectReplitTools()
     replitConfig: null,      // from replit.getReplitToolsConfig()
+
+    // Execution safety (populated in Phase 3 when risk is high/critical)
+    checkpoint: null,        // from checkpoint.mjs — { success, id, label, timestamp } or null
+
+    // HEAD cognitive judgment (populated in Phase 0 from head.mjs)
+    headJudgment: null,      // from processTurn — situation, uncertainties, obligations, noticings, result
+
+    // Collaboration (populated when multi-agent patterns are used)
+    collaboration: null,     // from collaboration.mjs — session object with blackboard, events, agents
 
     completedAt: null,
   };
@@ -255,12 +273,12 @@ export function outcomeGate(run) {
  * @param {string} cwd
  * @returns {object}
  */
-async function buildContextPack(prompt, files = [], cwd = process.cwd(), sessionContext = null) {
+async function buildContextPack(prompt, files = [], cwd = process.cwd(), sessionContext = null, headJudgment = null) {
   const profile = await _loadProfileSafe(cwd);
 
   const priorFailures = _getPriorFailures(prompt, cwd);
 
-  const detection = detectTask({ prompt, files, priorFailures, sessionContext });
+  const detection = detectTask({ prompt, files, priorFailures, sessionContext, headJudgment });
 
   return {
     prompt,
@@ -664,170 +682,215 @@ export async function runPipeline(trigger, prompt, options = {}) {
   const run = createPipelineRun(trigger, prompt);
 
   try {
-    // ── Phase 0: Situational awareness ───────────────────────────────────────
+    // ── Phase 0: HEAD Cognitive Judgment ─────────────────────────────────────
+    // HEAD perceives the situation FIRST. Its judgment gates everything else:
+    // - depth controls how much intelligence the pipeline loads
+    // - shouldAskUser can block dispatch and surface uncertainty
+    // - obligations flow into dispatched agent prompts
+    // - noticings inform the user of things they should know
 
-    // Session history context — load first so Phase 0 modules (intelligence, formatBrief) can use it
+    try {
+      const head = await import('./head.mjs');
+      const headState = head.loadState();
+      const headContext = {
+        files: files,
+        priorFailures: 0,
+        uncommittedFiles: [],
+        recentFiles: [],
+        patterns: [],
+      };
+
+      // Enrich head context from git state (best-effort)
+      try {
+        const gitStatus = execSync('git status --porcelain -u', { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+        headContext.uncommittedFiles = gitStatus.split('\n').map(l => l.slice(3).trim()).filter(Boolean);
+      } catch {}
+
+      run.headJudgment = head.processTurn(headState, prompt, headContext);
+
+      // HEAD says to ask the user — block pipeline with the uncertainty + noticings
+      if (run.headJudgment.shouldAskUser && !options.forceDispatch) {
+        const reasons = [];
+        if (run.headJudgment.result.confidence.level !== 'sufficient') {
+          reasons.push(`Confidence: ${run.headJudgment.result.confidence.level} (${run.headJudgment.result.confidence.score})`);
+          for (const gap of run.headJudgment.result.confidence.gaps || []) {
+            reasons.push(`  Uncertain: ${gap}`);
+          }
+        }
+        for (const n of run.headJudgment.result.surfaceNoticings || []) {
+          reasons.push(`  ${n.type}: ${n.observation}`);
+        }
+        if (run.headJudgment.result.action.type === 'clarify') {
+          reasons.push(`HEAD recommends clarifying before acting`);
+        }
+
+        run.completedAt = Date.now();
+        return {
+          success: false,
+          gateFailure: 'head-judgment',
+          reason: reasons.join('\n'),
+          headJudgment: run.headJudgment,
+          run,
+        };
+      }
+
+      if (verbose) {
+        log(`[pipeline] HEAD depth: ${run.headJudgment.depth}, action: ${run.headJudgment.action.type}/${run.headJudgment.action.mode}`);
+        if (run.headJudgment.result.surfaceNoticings.length > 0) {
+          for (const n of run.headJudgment.result.surfaceNoticings) {
+            log(`[pipeline] HEAD noticed: ${n.observation}`);
+          }
+        }
+      }
+    } catch {
+      // head.mjs unavailable — continue degraded (no cognitive layer)
+    }
+
+    // ── Phase 0: Situational awareness ───────────────────────────────────────
+    // HEAD's depth assessment controls how much intelligence we load.
+    // reflexive = skip heavy modules, light = core only, full/deep = everything
+    const headDepth = run.headJudgment?.depth || 'full';
+    const loadFull = headDepth === 'full' || headDepth === 'deep';
+    const loadLight = loadFull || headDepth === 'light';
+
+    // Session history — always load (lightweight, index-only)
     try {
       const session = await import('./session.mjs');
       if (session.getRoutingContext) {
         run.sessionContext = session.getRoutingContext(cwd, prompt);
       }
-    } catch {} // session.mjs not available or getRoutingContext not exported — non-blocking
+    } catch {} // non-blocking
 
-    try {
-      const { deriveProjectState, deriveTaskContext, detectContradictions, formatBrief } = await import('./intelligence.mjs');
-      run.projectBrief = await deriveProjectState(options.cwd || process.cwd());
-      run.taskBrief = deriveTaskContext(prompt, options.recentEvents || []);
-      run.situationBrief = formatBrief(run.projectBrief, run.taskBrief, run.sessionContext);
-    } catch (e) {
-      // intelligence module not available — continue without it (degraded)
+    // Intelligence module — skip for reflexive
+    if (loadLight) {
+      try {
+        const { deriveProjectState, deriveTaskContext, detectContradictions, formatBrief } = await import('./intelligence.mjs');
+        run.projectBrief = await deriveProjectState(options.cwd || process.cwd());
+        run.taskBrief = deriveTaskContext(prompt, options.recentEvents || []);
+        run.situationBrief = formatBrief(run.projectBrief, run.taskBrief, run.sessionContext);
+      } catch (e) {
+        // intelligence module not available — continue without it (degraded)
+      }
     }
 
-    // Doctor: discover capabilities (cached per process via discovery log)
-    try {
-      const { discover, verifyAll } = await import('./doctor.mjs');
-      const doctorCwd = options.cwd || process.cwd();
-      discover(doctorCwd);    // writes to .dual-brain/discoveries.jsonl (idempotent)
-      verifyAll(doctorCwd);   // writes to .dual-brain/verifications.jsonl
-    } catch (e) {
-      // doctor not available — non-blocking
+    // Doctor, ledger, calibration, awareness, replit, think-engine, prompt-intel
+    // — only load for light/full/deep depth
+    if (loadLight) {
+      // Doctor: discover capabilities (cached per process)
+      try {
+        const { discover, verifyAll } = await import('./doctor.mjs');
+        const doctorCwd = options.cwd || process.cwd();
+        discover(doctorCwd);
+        verifyAll(doctorCwd);
+      } catch (e) {}
+
+      // Ledger: check open tasks + create task
+      try {
+        const { getOpenTasks, createTask, reconcile } = await import('./ledger.mjs');
+        const cwd = options.cwd || process.cwd();
+        run.openTasks = getOpenTasks(cwd);
+        const staleTasks = reconcile(cwd);
+        const task = createTask({
+          intent: prompt,
+          owner: 'head',
+          priority: run.projectBrief?.recentFailures?.length > 0 ? 'high' : 'medium',
+          files: options.files || []
+        }, cwd);
+        run.taskId = task.id;
+      } catch (e) {}
+
+      if (run.openTasks.length > 0) {
+        const preview = run.openTasks.slice(0, 3).map(t => t.intent).join(', ');
+        const pendingLine = `PENDING TASKS: ${run.openTasks.length} open (${preview})`;
+        run.situationBrief = run.situationBrief
+          ? `${run.situationBrief}\n${pendingLine}`
+          : pendingLine;
+      }
     }
 
-    // Ledger: check open tasks + create task for this run
-    try {
-      const { getOpenTasks, createTask, reconcile } = await import('./ledger.mjs');
-      const cwd = options.cwd || process.cwd();
+    // Heavy intelligence modules — only for full/deep
+    if (loadFull) {
+      // Calibration
+      try {
+        const { analyzeInput, getAdaptation, detectCorrection, updateCalibration } = await import('./calibration.mjs');
+        const { getProjectState, updateProject } = await import('./living-docs.mjs');
+        const cwd = options.cwd || process.cwd();
+        const projectState = getProjectState(cwd);
+        const currentCal = projectState?.project?.userCalibration || { specificity: 3, corrections: 3, autonomy: 3, interactions: 0 };
+        const isCorrection = detectCorrection(prompt);
+        run.calibration = updateCalibration(currentCal, prompt, isCorrection);
+        run.adaptation = getAdaptation(run.calibration);
+        updateProject({ userCalibration: run.calibration }, cwd);
+      } catch (e) {}
 
-      // Check for stale tasks on session start
-      run.openTasks = getOpenTasks(cwd);
-      const staleTasks = reconcile(cwd);
-
-      // Create a ledger task for this pipeline run
-      const task = createTask({
-        intent: prompt,
-        owner: 'head',
-        priority: run.projectBrief?.recentFailures?.length > 0 ? 'high' : 'medium',
-        files: options.files || []
-      }, cwd);
-      run.taskId = task.id;
-    } catch (e) {
-      // ledger not available — continue degraded
-    }
-
-    // Append open tasks to situation brief if any exist
-    if (run.openTasks.length > 0) {
-      const preview = run.openTasks.slice(0, 3).map(t => t.intent).join(', ');
-      const pendingLine = `PENDING TASKS: ${run.openTasks.length} open (${preview})`;
-      run.situationBrief = run.situationBrief
-        ? `${run.situationBrief}\n${pendingLine}`
-        : pendingLine;
-    }
-
-    // Calibration: analyze user input and adapt
-    try {
-      const { analyzeInput, getAdaptation, detectCorrection, updateCalibration } = await import('./calibration.mjs');
-      const { getProjectState, updateProject } = await import('./living-docs.mjs');
-      const cwd = options.cwd || process.cwd();
-
-      const projectState = getProjectState(cwd);
-      const currentCal = projectState?.project?.userCalibration || { specificity: 3, corrections: 3, autonomy: 3, interactions: 0 };
-      const isCorrection = detectCorrection(prompt);
-
-      run.calibration = updateCalibration(currentCal, prompt, isCorrection);
-      run.adaptation = getAdaptation(run.calibration);
-
-      // Persist updated calibration
-      updateProject({ userCalibration: run.calibration }, cwd);
-    } catch (e) {
-      // calibration not available — continue degraded
-    }
-
-    // Environment awareness
-    try {
-      const { scanEnvironment, getCapabilitySummary } = await import('./awareness.mjs');
-      run.environment = scanEnvironment(cwd);
-
-      // Add capabilities to situation brief
-      if (run.situationBrief && run.environment) {
-        const caps = getCapabilitySummary(run.environment);
-        if (caps.length > 0) {
-          run.situationBrief += '\nCAPABILITIES: ' + caps.join(', ');
+      // Environment awareness
+      try {
+        const { scanEnvironment, getCapabilitySummary } = await import('./awareness.mjs');
+        run.environment = scanEnvironment(cwd);
+        if (run.situationBrief && run.environment) {
+          const caps = getCapabilitySummary(run.environment);
+          if (caps.length > 0) {
+            run.situationBrief += '\nCAPABILITIES: ' + caps.join(', ');
+          }
         }
-      }
-    } catch (e) {
-      // awareness not available
-    }
+      } catch (e) {}
 
-    // Replit context enrichment — augment run with Replit environment data
-    try {
-      const replit = await import('./replit.mjs');
-      const replitEnv = replit.detectReplitEnvironment(cwd);
-      if (replitEnv.isReplit) {
-        run.replitEnvironment = replitEnv;
-        run.replitTools = replit.inspectReplitTools(cwd);
-        run.replitConfig = replit.getReplitToolsConfig(cwd);
-      }
-    } catch {} // replit.mjs not available — non-blocking
+      // Replit context
+      try {
+        const replit = await import('./replit.mjs');
+        const replitEnv = replit.detectReplitEnvironment(cwd);
+        if (replitEnv.isReplit) {
+          run.replitEnvironment = replitEnv;
+          run.replitTools = replit.inspectReplitTools(cwd);
+          run.replitConfig = replit.getReplitToolsConfig(cwd);
+        }
+      } catch {}
 
-    // Knowledge preflight — check if we already know the answer
-    try {
-      const { lookupDecision, triageQuestion } = await import('./think-engine.mjs');
-      const cwd = options.cwd || process.cwd();
-
-      run.decisionPreflight = lookupDecision(prompt, options.tags || [], cwd);
-
-      // If exact reuse found, we can short-circuit
-      if (run.decisionPreflight.recommendation === 'reuse' && run.decisionPreflight.candidates[0]) {
-        // Add cached decision info to situation brief
+      // Knowledge preflight
+      try {
+        const { lookupDecision, triageQuestion } = await import('./think-engine.mjs');
+        const cwd = options.cwd || process.cwd();
+        run.decisionPreflight = lookupDecision(prompt, options.tags || [], cwd);
+        if (run.decisionPreflight.recommendation === 'reuse' && run.decisionPreflight.candidates[0]) {
+          if (run.situationBrief) {
+            run.situationBrief += '\nCACHED DECISION: Found prior decision with ' +
+              Math.round(run.decisionPreflight.candidates[0].relevance * 100) + '% relevance';
+          }
+        }
+        const triage = triageQuestion(prompt, run.projectBrief, run.decisionPreflight);
+        run.thinkResult = { tier: triage.recommendedTier, estimatedTokens: triage.estimatedTokens, triage };
         if (run.situationBrief) {
-          run.situationBrief += '\nCACHED DECISION: Found prior decision with ' +
-            Math.round(run.decisionPreflight.candidates[0].relevance * 100) + '% relevance';
+          run.situationBrief += '\nTHINK TIER: ' + triage.recommendedTier + ' (' + triage.estimatedTokens + ' tokens est.)';
         }
-      }
+      } catch (e) {}
 
-      // Triage to determine thinking tier
-      const triage = triageQuestion(prompt, run.projectBrief, run.decisionPreflight);
-      run.thinkResult = { tier: triage.recommendedTier, estimatedTokens: triage.estimatedTokens, triage };
+      // Prompt intelligence
+      try {
+        const { analyzePrompt, enrichPrompt, shouldBlock, getBlockReason } = await import('./prompt-intel.mjs');
+        run.promptAnalysis = analyzePrompt(prompt, run.projectBrief, run.calibration);
 
-      // Add to situation brief
-      if (run.situationBrief) {
-        run.situationBrief += '\nTHINK TIER: ' + triage.recommendedTier + ' (' + triage.estimatedTokens + ' tokens est.)';
-      }
-    } catch (e) {
-      // think-engine not available
-    }
-
-    // Prompt intelligence
-    try {
-      const { analyzePrompt, enrichPrompt, shouldBlock, getBlockReason } = await import('./prompt-intel.mjs');
-
-      run.promptAnalysis = analyzePrompt(prompt, run.projectBrief, run.calibration);
-
-      // Hard block on dangerous intent
-      if (shouldBlock(run.promptAnalysis)) {
-        const reason = getBlockReason(run.promptAnalysis);
-        if (run.taskId) {
-          try {
-            const { failTask } = await import('./ledger.mjs');
-            failTask(run.taskId, 'Blocked by risk detection: ' + reason, cwd);
-          } catch (e) {}
+        if (shouldBlock(run.promptAnalysis)) {
+          const reason = getBlockReason(run.promptAnalysis);
+          if (run.taskId) {
+            try {
+              const { failTask } = await import('./ledger.mjs');
+              failTask(run.taskId, 'Blocked by risk detection: ' + reason, cwd);
+            } catch (e) {}
+          }
+          run.completedAt = Date.now();
+          return {
+            success: false,
+            gateFailure: 'risk',
+            reason: 'Prompt blocked: ' + reason,
+            promptAnalysis: run.promptAnalysis,
+            run
+          };
         }
-        run.completedAt = Date.now();
-        return {
-          success: false,
-          gateFailure: 'risk',
-          reason: 'Prompt blocked: ' + reason,
-          promptAnalysis: run.promptAnalysis,
-          run
-        };
-      }
 
-      // Enrich prompt if intervention says so
-      if (run.promptAnalysis.intervention === 'silent_enrich' || run.promptAnalysis.intervention === 'confirm_rewrite') {
-        run.enrichedPrompt = enrichPrompt(prompt, run.projectBrief, run.promptAnalysis);
-      }
-    } catch (e) {
-      // prompt-intel not available
+        if (run.promptAnalysis.intervention === 'silent_enrich' || run.promptAnalysis.intervention === 'confirm_rewrite') {
+          run.enrichedPrompt = enrichPrompt(prompt, run.projectBrief, run.promptAnalysis);
+        }
+      } catch (e) {}
     }
 
     // ── Phase 1: Context ──────────────────────────────────────────────────────
@@ -835,7 +898,7 @@ export async function runPipeline(trigger, prompt, options = {}) {
     const effectivePrompt = run.enrichedPrompt || prompt;
 
     // Build context pack (pass sessionContext so detect can use cross-session signals)
-    run.context = await buildContextPack(effectivePrompt, files, cwd, run.sessionContext);
+    run.context = await buildContextPack(effectivePrompt, files, cwd, run.sessionContext, run.headJudgment);
 
     // Query failure history (must happen before context gate)
     try {
@@ -867,14 +930,21 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     // ── Phase 2: Plan ─────────────────────────────────────────────────────────
 
-    run.plan = buildExecutionPlan(run.context, trigger, { forceDepth, forceChallenger, thinkResult: run.thinkResult });
+    // HEAD's depth assessment can influence the plan's reasoning depth
+    const headDepthMap = { reflexive: 'low', light: 'medium', full: 'high', deep: 'ultra' };
+    const headSuggestedDepth = run.headJudgment?.depth
+      ? headDepthMap[run.headJudgment.depth]
+      : undefined;
+    const effectiveForceDepth = forceDepth || headSuggestedDepth;
+
+    run.plan = buildExecutionPlan(run.context, trigger, { forceDepth: effectiveForceDepth, forceChallenger, thinkResult: run.thinkResult });
 
     // Model intelligence
     try {
       const { suggestModel, getRegistryAge } = await import('./models.mjs');
       const availableProviders = [];
-      if (run.environment?.secrets?.ANTHROPIC_API_KEY || run.environment?.claudeCode?.isInsideClaude) availableProviders.push('anthropic');
-      if (run.environment?.secrets?.OPENAI_API_KEY) availableProviders.push('openai');
+      if (run.environment?.claudeCode?.isInsideClaude || run.environment?.tools?.claude?.available) availableProviders.push('anthropic');
+      if (run.environment?.tools?.codex?.available) availableProviders.push('openai');
 
       const intent = run.promptAnalysis?.intent?.type || 'execute';
       const risk = run.plan?.risk || 'medium';
@@ -978,25 +1048,166 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
     // ── Phase 3: Execute ──────────────────────────────────────────────────────
 
-    // Checkpoint (best-effort, before execute)
+    // Checkpoint (best-effort, before execute).
+    // The pipeline-internal createCheckpoint handles git stash/HEAD recording.
+    // Additionally, use the dedicated checkpoint.mjs module for high/critical risk
+    // tasks so the result is surfaced in the run object.
     if (run.plan.checkpointRequired) {
       await createCheckpoint(cwd, run.context);
     }
 
+    const detectedRisk = run.context?.detection?.risk ?? 'low';
+    if (detectedRisk === 'high' || detectedRisk === 'critical') {
+      try {
+        const { createCheckpoint: cpCreate } = await import('./checkpoint.mjs');
+        const cpLabel = `before: ${prompt.slice(0, 80)}`;
+        const cpResult = cpCreate(cpLabel, { cwd });
+        run.checkpoint = cpResult;
+        if (verbose) log(`[pipeline] checkpoint created: ${cpResult.id} (${cpResult.success ? 'ok' : 'failed'})`);
+      } catch {
+        // checkpoint.mjs unavailable — non-blocking
+        run.checkpoint = null;
+      }
+    }
+
     const decision = { ...run.plan._decision };
 
-    run.result = await dispatch({
-      decision,
-      prompt: effectivePrompt,
-      files,
-      cwd,
-      dryRun: false,
-      verbose,
-      profile: run.context.profile,
-      situationBrief: run.situationBrief,
-      adaptation: run.adaptation,
-      modelSuggestion: run.modelSuggestion,
-    });
+    // ── HEAD judgment injection into agent prompts ─────────────────────────────
+    // HEAD's obligations, noticings, and uncertainties flow to the work agent
+    // so it knows what to be careful about, what HEAD was worried about, and
+    // what to double-check.
+    let headJudgmentBlock = '';
+    if (run.headJudgment) {
+      const hj = run.headJudgment;
+      const hjLines = ['[HEAD JUDGMENT]'];
+
+      // Critical obligations the agent must respect
+      const criticalObs = (hj.result?.obligations || []).filter(o => o.priority === 'critical' || o.priority === 'high');
+      if (criticalObs.length > 0) {
+        hjLines.push('Obligations:');
+        for (const o of criticalObs) hjLines.push(`- ${o.description}`);
+      }
+
+      // Uncertainties the agent should verify
+      const gaps = (hj.uncertainties || []).filter(u => u.confidence < 0.6);
+      if (gaps.length > 0) {
+        hjLines.push('Verify these (HEAD is uncertain):');
+        for (const g of gaps) hjLines.push(`- ${g.claim} (confidence: ${Math.round(g.confidence * 100)}%) — ${g.wouldChangeIf}`);
+      }
+
+      // Noticings the agent should be aware of
+      const surfaced = hj.result?.surfaceNoticings || [];
+      if (surfaced.length > 0) {
+        hjLines.push('HEAD noticed:');
+        for (const n of surfaced) hjLines.push(`- ${n.observation}`);
+      }
+
+      hjLines.push('[/HEAD JUDGMENT]');
+
+      if (hjLines.length > 2) {
+        headJudgmentBlock = hjLines.join('\n');
+      }
+    }
+
+    // Collaborative dispatch: when challenger is active or cross-review is
+    // warranted, wrap the dispatch in a collaboration session so agents share
+    // context and results chain forward.
+    const collab = await getCollab();
+    const useCollaboration = collab && (
+      run.plan.useChallenger ||
+      detectedRisk === 'high' || detectedRisk === 'critical'
+    );
+
+    if (useCollaboration) {
+      const session = collab.createSession(run.id, effectivePrompt, {
+        crossReview: run.plan.useChallenger,
+      });
+
+      // Register primary agent
+      const primaryId = `primary-${run.id.slice(0, 8)}`;
+      collab.registerAgent(session, primaryId, 'implementer', decision.provider, decision.model);
+      collab.startAgent(session, primaryId);
+
+      // Inject collaboration context + HEAD judgment into prompt
+      const collabContext = collab.buildAgentContext(session, primaryId);
+      const promptParts = [collabContext, headJudgmentBlock, effectivePrompt].filter(Boolean);
+      const collabPrompt = promptParts.join('\n\n');
+
+      run.result = await dispatch({
+        decision,
+        prompt: collabPrompt,
+        files,
+        cwd,
+        dryRun: false,
+        verbose,
+        profile: run.context.profile,
+        situationBrief: run.situationBrief,
+        adaptation: run.adaptation,
+        modelSuggestion: run.modelSuggestion,
+      });
+
+      // Record agent completion
+      collab.completeAgent(session, primaryId, run.result, run.result?.summary);
+
+      // Extract findings from result
+      if (run.result?.filesChanged?.length) {
+        for (const f of run.result.filesChanged) collab.trackFile(session, f, primaryId);
+      }
+
+      // Cross-review: symmetric — works Claude→OpenAI and OpenAI→Claude
+      const availableProviders = [];
+      if (run.context?.profile?.providers?.claude?.enabled !== false) availableProviders.push('claude');
+      if (run.context?.profile?.providers?.openai?.enabled && run.context?.profile?.providers?.openai?.plan) availableProviders.push('openai');
+
+      if (run.plan.useChallenger && run.plan.challengerModel && run.result?.status === 'completed') {
+        const reviewSpec = collab.buildCrossReviewPrompt(session, primaryId, availableProviders);
+        if (reviewSpec) {
+          const reviewId = `reviewer-${run.id.slice(0, 8)}`;
+          collab.registerAgent(session, reviewId, 'cross-reviewer', reviewSpec.provider, reviewSpec.model || run.plan.challengerModel);
+          collab.startAgent(session, reviewId);
+
+          try {
+            const reviewResult = await dispatch({
+              decision: { provider: reviewSpec.provider, model: reviewSpec.model || run.plan.challengerModel, tier: 'search' },
+              prompt: reviewSpec.prompt,
+              files,
+              cwd,
+              dryRun: false,
+              verbose,
+              profile: run.context.profile,
+              situationBrief: run.situationBrief,
+            });
+            collab.completeAgent(session, reviewId, reviewResult, reviewResult?.summary);
+          } catch {
+            collab.completeAgent(session, reviewId, { error: 'review dispatch failed' });
+          }
+        }
+      }
+
+      // Synthesize and attach to run
+      run.collaboration = collab.synthesize(session);
+
+      // Persist collaboration session
+      try { collab.saveSession(session, cwd); } catch {}
+      try { collab.persistEvents(session, cwd); } catch {}
+    } else {
+      const directPrompt = headJudgmentBlock
+        ? `${headJudgmentBlock}\n\n${effectivePrompt}`
+        : effectivePrompt;
+
+      run.result = await dispatch({
+        decision,
+        prompt: directPrompt,
+        files,
+        cwd,
+        dryRun: false,
+        verbose,
+        profile: run.context.profile,
+        situationBrief: run.situationBrief,
+        adaptation: run.adaptation,
+        modelSuggestion: run.modelSuggestion,
+      });
+    }
 
     // Update ledger task with result
     if (run.taskId) {
@@ -1134,6 +1345,38 @@ export async function runPipeline(trigger, prompt, options = {}) {
       return { success: false, gateFailure: 'outcome', reason: run.gates.outcome.reason, run };
     }
 
+    // Provider-aware compaction survival — adapts format for Claude vs Codex.
+    // Claude: tagged blocks that survive automatic context compression.
+    // Codex: compact header block at prompt start (no native compaction).
+    try {
+      const { buildSurvivalBlock } = await import('./provider-context.mjs');
+      const effectiveProvider = run.result?.provider || run.plan?.primaryProvider || 'claude';
+      const survivalKit = buildSurvivalBlock(effectiveProvider, {
+        activeTask: prompt.slice(0, 120),
+        provider: effectiveProvider,
+        model: run.result?.model || run.plan?.primaryModel,
+        tier: run.plan?.tier,
+        risk: run.context?.detection?.risk,
+        filesInProgress: run.result?.filesChanged || [],
+        decisions: run.collaboration?.decisions?.map(d => d.decision) || [],
+        warnings: run.contradictions?.map(c => c.message) || [],
+        routingRules: [
+          `provider=${effectiveProvider}`,
+          `model=${run.result?.model || run.plan?.primaryModel}`,
+          `tier=${run.plan?.tier}`,
+        ],
+      });
+      if (run.situationBrief) {
+        run.situationBrief = `${survivalKit}\n\n${run.situationBrief}`;
+      }
+    } catch { /* non-blocking */ }
+
+    // Post-session receipt — capture what happened and seed next session's context
+    try {
+      const { generateReceipt } = await import('./receipt.mjs');
+      generateReceipt(run, cwd);
+    } catch { /* non-blocking */ }
+
     // Persist decision for future recall
     if (run.result && !run.result?.error) {
       try {
@@ -1151,6 +1394,44 @@ export async function runPipeline(trigger, prompt, options = {}) {
       }
     }
 
+    // Provider-aware continuity handoff — tracks which provider ran the task
+    // so the next session (on either provider) gets appropriate context.
+    try {
+      const { generateHandoff, saveHandoff, pruneHandoffs } = await import('./continuity.mjs');
+      const { generateProviderHandoff } = await import('./provider-context.mjs');
+      const handoffCwd = options.cwd || process.cwd();
+      const handoffProvider = run.result?.provider || run.plan?.primaryProvider || 'claude';
+
+      const sessionState = {
+        taskDescription: prompt.slice(0, 200),
+        filesChanged: run.result?.filesChanged || run.plan?.targetFiles || [],
+        testsRun: run.verification?.notes || [],
+        decisions: run.plan ? [{
+          provider: run.plan.primaryProvider,
+          model: run.plan.primaryModel,
+          tier: run.plan.tier,
+          reasoningDepth: run.plan.reasoningDepth,
+        }] : [],
+        unresolved: run.contradictions?.filter(c => c.severity !== 'block').map(c => c.message) || [],
+        routingHistory: {
+          lastProvider: handoffProvider,
+          lastModel: run.result?.model || run.plan?.primaryModel || null,
+          failedProviders: run.result?.error ? [run.plan?.primaryProvider].filter(Boolean) : [],
+        },
+        activePreferences: run.context?.profile?.preferences || [],
+        resumeHint: run.result && !run.result?.error
+          ? null
+          : `retry: ${prompt.slice(0, 100)}`,
+      };
+
+      // Save both standard + provider-aware handoff
+      const handoff = generateProviderHandoff(sessionState, handoffProvider);
+      saveHandoff(handoff, handoffCwd);
+      pruneHandoffs(handoffCwd, 10);
+    } catch {
+      // continuity is best-effort — never block pipeline completion
+    }
+
   } catch (err) {
     log(`[pipeline] error in pipeline step: ${err.message}`);
     run.result = { status: 'error', error: err.message };
@@ -1166,6 +1447,8 @@ export async function runPipeline(trigger, prompt, options = {}) {
   return {
     success: true,
     run,
+    // HEAD cognitive judgment
+    headJudgment: run.headJudgment,
     // Intelligence fields for callers to inspect
     projectBrief: run.projectBrief,
     contradictions: run.contradictions,
@@ -1174,6 +1457,10 @@ export async function runPipeline(trigger, prompt, options = {}) {
     modelSuggestion: run.modelSuggestion,
     thinkResult: run.thinkResult,
     decisionPreflight: run.decisionPreflight,
+    // Execution safety
+    checkpoint: run.checkpoint,
+    // Collaboration
+    collaboration: run.collaboration,
     // Legacy compatibility
     plan: run.plan,
     result: run.result,

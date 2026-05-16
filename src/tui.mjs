@@ -171,6 +171,85 @@ export function menu(options, opts = {}) {
   return rows.join('\n');
 }
 
+// ── Modern box rendering with rounded corners ────────────────────────────────
+
+const ROUNDED = { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', ml: '├', mr: '┤' };
+
+export function panel(title, content, opts = {}) {
+  const { width = 70, titleColor = '\x1b[36m', borderColor = '\x1b[2m', reset = '\x1b[0m' } = opts;
+  const lines = [];
+  const innerW = width - 2;
+
+  // Top border with title
+  if (title) {
+    const titleStr = ` ${title} `;
+    const remaining = innerW - titleStr.length - 1;
+    lines.push(`${borderColor}${ROUNDED.tl}${ROUNDED.h} ${titleColor}${title}${borderColor} ${ROUNDED.h.repeat(Math.max(0, remaining))}${ROUNDED.tr}${reset}`);
+  } else {
+    lines.push(`${borderColor}${ROUNDED.tl}${ROUNDED.h.repeat(innerW)}${ROUNDED.tr}${reset}`);
+  }
+
+  // Content lines
+  const contentLines = (typeof content === 'string' ? content.split('\n') : content);
+  for (const line of contentLines) {
+    const stripped = line.replace(/\x1b\[[0-9;]*m/g, '');
+    const pad = Math.max(0, innerW - stripped.length);
+    lines.push(`${borderColor}${ROUNDED.v}${reset} ${line}${' '.repeat(pad)}${borderColor}${ROUNDED.v}${reset}`);
+  }
+
+  // Bottom border
+  lines.push(`${borderColor}${ROUNDED.bl}${ROUNDED.h.repeat(innerW)}${ROUNDED.br}${reset}`);
+
+  return lines.join('\n');
+}
+
+export function divider(width = 70) {
+  const borderColor = '\x1b[2m';
+  const reset = '\x1b[0m';
+  return `${borderColor}${ROUNDED.ml}${ROUNDED.h.repeat(width - 2)}${ROUNDED.mr}${reset}`;
+}
+
+export function statusChip(label, healthy, opts = {}) {
+  const green = '\x1b[32m';
+  const red = '\x1b[31m';
+  const dim = '\x1b[2m';
+  const reset = '\x1b[0m';
+  const icon = healthy ? `${green}●${reset}` : `${red}●${reset}`;
+  return `${icon} ${dim}${label}${reset}`;
+}
+
+export function headerBar(left, right, width = 70) {
+  const leftStripped = left.replace(/\x1b\[[0-9;]*m/g, '');
+  const rightStripped = right.replace(/\x1b\[[0-9;]*m/g, '');
+  const gap = Math.max(1, width - leftStripped.length - rightStripped.length);
+  return `${left}${' '.repeat(gap)}${right}`;
+}
+
+export function prompt(text = '> task or /help') {
+  const cyan = '\x1b[36m';
+  const dim = '\x1b[2m';
+  const reset = '\x1b[0m';
+  return `${cyan}>${reset} ${dim}${text.replace(/^>\s*/, '')}${reset}`;
+}
+
+export function signalLine(type, text, meta = '') {
+  const green = '\x1b[32m';
+  const yellow = '\x1b[33m';
+  const dim = '\x1b[2m';
+  const reset = '\x1b[0m';
+
+  let icon;
+  switch (type) {
+    case 'success': icon = `${green}✓${reset}`; break;
+    case 'warning': icon = `${yellow}!${reset}`; break;
+    case 'info': icon = `${dim}·${reset}`; break;
+    default: icon = `${dim}·${reset}`;
+  }
+
+  const metaStr = meta ? `${dim}${meta}${reset}` : '';
+  return `${icon}  ${text}${metaStr ? '  ' + metaStr : ''}`;
+}
+
 // ─── Self-test ────────────────────────────────────────────────────────────────
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

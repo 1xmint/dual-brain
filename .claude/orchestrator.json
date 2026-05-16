@@ -260,7 +260,7 @@
       "command": "node .claude/hooks/budget-balancer.mjs"
     }
   },
-  "pricing_verified": "2026-05-15",
+  "pricing_verified": "2026-05-16",
   "budgets": {
     "session_warn_usd": 5,
     "session_limit_usd": 10,

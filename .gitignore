@@ -1,4 +1,6 @@
 node_modules/
+.env
+.env.*
 hooks/usage-*.jsonl
 hooks/usage.jsonl
 hooks/.drift-warned

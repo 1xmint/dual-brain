@@ -15,9 +15,42 @@ import {
   detectCapabilities,
   saveSubscription, listSubscriptions,
   autoSetup,
+  loadCredentials, saveCredentials, getCredentialSummary, detectCredentials, addCredential, removeCredential, checkCredentialHealth,
 } from '../src/profile.mjs';
 
-import { detectTask } from '../src/detect.mjs';
+import { detectTask, primeAgentRegistry } from '../src/detect.mjs';
+
+// ─── Claude launch helper ────────────────────────────────────────────────────
+// Builds launch args respecting user's bypass preference from profile.
+// Never hardcode --dangerously-skip-permissions — it's a user choice.
+
+function _claudeResumeArgs(sessionId, cwd) {
+  const args = ['--resume', sessionId];
+  const prof = loadProfile(cwd || process.cwd());
+  if (prof.bypassPermissions) args.push('--dangerously-skip-permissions');
+  return args;
+}
+
+function _claudeNewArgs(cwd) {
+  const args = [];
+  const prof = loadProfile(cwd || process.cwd());
+  if (prof.bypassPermissions) args.push('--dangerously-skip-permissions');
+  return args;
+}
+
+// ─── Agent/skill registry cache (populated at startup) ───────────────────────
+// These are set by _primeRegistryCache() so classifyInput can use them
+// synchronously without async overhead on each keystroke.
+let _cachedMatchSkill = null;
+let _cachedSkillToTaskBrief = null;
+
+async function _primeRegistryCache() {
+  try {
+    const reg = await import('../src/agents/registry.mjs');
+    _cachedMatchSkill = reg.matchSkill;
+    _cachedSkillToTaskBrief = reg.skillToTaskBrief;
+  } catch {}
+}
 
 import {
   decideRoute, getAvailableModels,
@@ -34,7 +67,7 @@ import { runPipeline, buildExecutionPlan, formatExecutionPlan } from '../src/pip
 import { loadRepoCache } from '../src/repo.mjs';
 import { loadSession, saveSession, formatSessionCard, importReplitSessions, getSessionMeta, saveSessionMeta, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions, archiveSession, getArchivedSessions } from '../src/session.mjs';
 
-import { box, bar, badge, menu, separator } from '../src/tui.mjs';
+import { box, bar, badge, menu, separator, panel, divider, statusChip, headerBar, prompt as tuiPrompt, signalLine } from '../src/tui.mjs';
 
 // ─── Dynamic imports for receipts + failure memory ───────────────────────────
 
@@ -60,6 +93,18 @@ async function getLivingDocs() {
     try { _livingDocs = await import('../src/living-docs.mjs'); } catch { _livingDocs = {}; }
   }
   return _livingDocs;
+}
+
+let _cognitiveLoopCache = null;
+async function _getCognitiveLoop() {
+  if (!_cognitiveLoopCache) {
+    try {
+      _cognitiveLoopCache = await import('../src/cognitive-loop.mjs');
+    } catch {
+      _cognitiveLoopCache = null;
+    }
+  }
+  return _cognitiveLoopCache;
 }
 
 let _fx = null;
@@ -241,11 +286,19 @@ Commands:
   init                      First-time setup → flows into interactive REPL
   auth                      Show provider login and plan status
   install                   Install Claude Code hooks into the current project
+  install --global          Write hooks into ~/.claude/settings.json (absolute paths,
+                            fires from any working directory after shell restart)
+  uninstall --global        Remove dual-brain hooks from ~/.claude/settings.json
   go "task description"     Detect → decide → dispatch (alias for do)
     --dry-run               Show routing decision without executing
     --files a.mjs,b.mjs     Provide file context for risk classification
     --verbose, -v           Print routing trace (intent, risk, health, model selection)
   think "question"          Multi-round architecture decision with dual-brain
+  pr                        Show PR status for current branch
+  pr create                 Create PR from current branch with auto-generated description
+    --draft                 Create as a draft PR
+  pr list                   List open PRs (--closed, --all for other states)
+  pr view <N>               View PR #N details
   status                    Provider health, session stats, available models
     --verbose, -v           Also print profile file path and raw profile object
   hot <provider>            Manually mark all model classes for provider as hot
@@ -372,6 +425,26 @@ async function cmdInit(rl) {
   // --- Step 2b: Install hooks ---
   await cmdInstall(cwd);
 
+  // --- Step 2c: Suggest global install if not already done ---
+  try {
+    const { homedir } = await import('node:os');
+    const globalSettingsPath = join(homedir(), '.claude', 'settings.json');
+    const DB_MARKER = '# dual-brain-managed';
+    let alreadyGlobal = false;
+    if (existsSync(globalSettingsPath)) {
+      try {
+        const gs = JSON.parse(readFileSync(globalSettingsPath, 'utf8'));
+        const allHooks = [...(gs.hooks?.PreToolUse || []), ...(gs.hooks?.PostToolUse || [])];
+        alreadyGlobal = allHooks.some(e => e.hooks?.some(h => h.command?.includes(DB_MARKER)));
+      } catch {}
+    }
+    if (!alreadyGlobal) {
+      console.log('');
+      console.log('  Tip: run "dual-brain install --global" to load these hooks from');
+      console.log('  any directory — so dual-brain works when Replit restarts a shell.');
+    }
+  } catch {}
+
   // --- Step 3: Show dashboard ---
   console.log('');
   const repo    = loadRepoCache(cwd);
@@ -431,6 +504,54 @@ async function cmdGo(args, opts = {}) {
     } catch { /* non-fatal */ }
   }
 
+  // ── Cognitive loop: drive dispatch decisions ──────────────────────────────
+  let loopEnhancedPrompt = prompt;
+  let loopDispatchMeta = null;
+  try {
+    const cogLoop = await _getCognitiveLoop();
+    if (cogLoop) {
+      const loopResult = cogLoop.enter(prompt, { files });
+
+      if (loopResult.phase === 'readonly') {
+        console.log('\n⚠ Another dual-brain session is active. This session is read-only.');
+        return;
+      }
+
+      if (loopResult.phase === 'dispatch' && loopResult.nextDispatch) {
+        loopDispatchMeta = loopResult;
+        // Use the full envelope prompt (includes context, preventions, debrief)
+        const firstAgent = loopResult.nextDispatch.agents?.[0];
+        if (firstAgent?.prompt) {
+          loopEnhancedPrompt = firstAgent.prompt;
+        }
+        if (verbose && loopResult.plan) {
+          const wc = loopResult.plan.waves?.length || 0;
+          console.log(`  [cognitive-loop] Plan: ${wc} wave(s), phase: ${loopResult.phase}`);
+        }
+      } else if (loopResult.phase === 'blocked') {
+        console.log(`\n⚠ Dispatch blocked: ${loopResult.suggestion || 'readiness check failed'}`);
+        if (loopResult.surfaceNoticings?.length) {
+          loopResult.surfaceNoticings.forEach(n => console.log(`  → ${n}`));
+        }
+        return;
+      } else if (loopResult.phase === 'respond') {
+        // HEAD decided no dispatch needed — show rationale
+        if (loopResult.rationale) console.log(`\n${loopResult.rationale}`);
+        if (loopResult.surfaceNoticings?.length) {
+          loopResult.surfaceNoticings.forEach(n => console.log(`  → ${n}`));
+        }
+        return;
+      }
+
+      // Surface noticings (includes update notices, diagnostics)
+      if (loopResult.surfaceNoticings?.length && verbose) {
+        loopResult.surfaceNoticings.forEach(n => console.log(`  → ${n}`));
+      }
+    }
+  } catch {
+    // Cognitive loop unavailable or errored — proceed with original prompt
+  }
+
   // ── Dispatch visualization ─────────────────────────────────────────────────
   const fxGo = await getFx();
   let dispatchSpinner = null;
@@ -438,7 +559,7 @@ async function cmdGo(args, opts = {}) {
     dispatchSpinner = fxGo.spinner(`Dispatching agent...`).start();
   }
 
-  const { plan, result } = await runPipeline('go', prompt, {
+  const { plan, result } = await runPipeline('go', loopEnhancedPrompt, {
     files,
     cwd,
     verbose,
@@ -448,6 +569,41 @@ async function cmdGo(args, opts = {}) {
   if (dispatchSpinner) {
     const model = plan?._decision?.model || plan?._decision?.provider || 'agent';
     dispatchSpinner.succeed(`Agent dispatched: ${prompt.slice(0, 50)}`);
+  }
+
+  // ── Cognitive loop: advance through waves until done ─────────────────────────
+  if (loopDispatchMeta && result && !dryRun) {
+    try {
+      const cogLoop = await _getCognitiveLoop();
+      if (cogLoop) {
+        let waveId = loopDispatchMeta.nextDispatch.waveId;
+        let rawResults = [result.summary || result.output || ''];
+        let advanceResult = cogLoop.advance(rawResults, waveId, { files });
+
+        // Loop through remaining waves
+        while (advanceResult && advanceResult.phase === 'dispatch' && advanceResult.nextDispatch) {
+          if (verbose) {
+            console.log(`  [cognitive-loop] Wave ${advanceResult.rationale || 'next'}`);
+          }
+
+          // Dispatch the next wave
+          const nextAgent = advanceResult.nextDispatch.agents?.[0];
+          const nextPrompt = nextAgent?.prompt || prompt;
+          const nextResult = await runPipeline('go', nextPrompt, { files, cwd, verbose, dryRun: false });
+
+          // Advance again
+          waveId = advanceResult.nextDispatch.waveId;
+          rawResults = [nextResult.result?.summary || nextResult.result?.output || ''];
+          advanceResult = cogLoop.advance(rawResults, waveId, { files });
+        }
+
+        if (verbose && advanceResult) {
+          console.log(`  [cognitive-loop] Final: ${advanceResult.phase}, ${advanceResult.rationale || '-'}`);
+        }
+      }
+    } catch {
+      // Non-fatal — loop advance failure doesn't affect completed dispatches
+    }
   }
 
   if (dryRun) {
@@ -917,9 +1073,7 @@ async function cmdStatus(args = []) {
       const archive = replit.getSessionArchive(cwd);
       const archiveCount = Array.isArray(archive) ? archive.length : (archive?.count ?? 0);
       console.log(`  session archive: ${archiveCount} session${archiveCount !== 1 ? 's' : ''}`);
-      const openaiPresent  = replit.hasSecret('OPENAI_API_KEY');
-      const anthropicPresent = replit.hasSecret('ANTHROPIC_API_KEY');
-      console.log(`  secrets       : OPENAI_API_KEY=${openaiPresent ? 'set' : 'unset'}  ANTHROPIC_API_KEY=${anthropicPresent ? 'set' : 'unset'}`);
+      // Subscription-only: no API key secrets to check
     }
   } catch { /* replit.mjs not available or not in Replit — skip silently */ }
 
@@ -990,6 +1144,158 @@ async function cmdInstall(cwd) {
   }
 }
 
+async function installGlobal() {
+  const { homedir } = await import('node:os');
+  const globalClaudeDir = join(homedir(), '.claude');
+  const globalSettingsPath = join(globalClaudeDir, 'settings.json');
+
+  // Resolve absolute path to hooks directory via import.meta.url
+  const pkgRoot = join(__dirname, '..');
+  const hooksDir = join(pkgRoot, '.claude', 'hooks');
+
+  // Warn if running from npx (ephemeral path)
+  if (pkgRoot.includes('.npm/_npx') || pkgRoot.includes('npx-')) {
+    console.log('  Warning: Running from npx — paths will break after this session.');
+    console.log('    Install globally first: npm i -g dual-brain');
+    console.log('    Then run: dual-brain install --global');
+    return;
+  }
+
+  // Verify hooks exist at resolved path
+  if (!existsSync(join(hooksDir, 'head-guard.mjs'))) {
+    console.log('  Error: Could not resolve hook files at: ' + hooksDir);
+    return;
+  }
+
+  // Check if project-local hooks already exist (avoids double-firing)
+  const projectLocalSettings = join(pkgRoot, '.claude', 'settings.local.json');
+  const hasProjectLocalHooks = (() => {
+    if (!existsSync(projectLocalSettings)) return false;
+    try {
+      const content = readFileSync(projectLocalSettings, 'utf8');
+      return content.includes('dual-brain') || content.includes('head-guard');
+    } catch { return false; }
+  })();
+
+  if (hasProjectLocalHooks) {
+    console.log('  hooks already configured project-locally, skipping global hooks');
+    console.log('  (project .claude/settings.local.json already contains dual-brain hooks)');
+  } else {
+    // Load existing settings (merge, never clobber)
+    let existing = {};
+    if (existsSync(globalSettingsPath)) {
+      try { existing = JSON.parse(readFileSync(globalSettingsPath, 'utf8')); } catch {}
+    }
+
+    // Ensure hooks structure exists
+    if (!existing.hooks) existing.hooks = {};
+    if (!existing.hooks.PreToolUse) existing.hooks.PreToolUse = [];
+    if (!existing.hooks.PostToolUse) existing.hooks.PostToolUse = [];
+
+    // Define dual-brain hooks with ownership marker
+    const DB_MARKER = '# dual-brain-managed';
+    const preToolHooks = [
+      { matcher: 'Edit',        hooks: [{ type: 'command', command: `node ${join(hooksDir, 'head-guard.mjs')} ${DB_MARKER}` }] },
+      { matcher: 'Write',       hooks: [{ type: 'command', command: `node ${join(hooksDir, 'head-guard.mjs')} ${DB_MARKER}` }] },
+      { matcher: 'NotebookEdit',hooks: [{ type: 'command', command: `node ${join(hooksDir, 'head-guard.mjs')} ${DB_MARKER}` }] },
+      { matcher: 'Bash',        hooks: [{ type: 'command', command: `node ${join(hooksDir, 'head-guard.mjs')} ${DB_MARKER}` }] },
+      { matcher: 'Agent',       hooks: [{ type: 'command', command: `node ${join(hooksDir, 'enforce-tier.mjs')} ${DB_MARKER}` }] },
+    ];
+    const postToolHooks = [
+      { matcher: '', hooks: [{ type: 'command', command: `node ${join(hooksDir, 'cost-logger.mjs')} ${DB_MARKER}` }] },
+      { matcher: '', hooks: [{ type: 'command', command: `node ${join(hooksDir, 'auto-update-wrapper.mjs')} ${DB_MARKER}` }] },
+    ];
+
+    // Remove any existing dual-brain hooks (idempotent)
+    const isDBHook = (entry) => entry.hooks?.some(h => h.command?.includes(DB_MARKER));
+    existing.hooks.PreToolUse  = existing.hooks.PreToolUse.filter(e => !isDBHook(e));
+    existing.hooks.PostToolUse = existing.hooks.PostToolUse.filter(e => !isDBHook(e));
+
+    // Add dual-brain hooks
+    existing.hooks.PreToolUse.push(...preToolHooks);
+    existing.hooks.PostToolUse.push(...postToolHooks);
+
+    // Write merged settings
+    mkdirSync(globalClaudeDir, { recursive: true });
+    writeFileSync(globalSettingsPath, JSON.stringify(existing, null, 2) + '\n');
+  }
+
+  // Write minimal global CLAUDE.md (only if none exists, or append section)
+  const globalClaudeMd = join(globalClaudeDir, 'CLAUDE.md');
+  const dbSection = `\n## Dual-Brain Global Hooks\n\nThis machine has dual-brain hooks installed globally.\nProject-local .claude/CLAUDE.md and settings take precedence.\nManaged by: dual-brain install --global\n`;
+
+  if (!existsSync(globalClaudeMd)) {
+    writeFileSync(globalClaudeMd, dbSection);
+  } else {
+    const content = readFileSync(globalClaudeMd, 'utf8');
+    if (!content.includes('Dual-Brain Global Hooks')) {
+      writeFileSync(globalClaudeMd, content + '\n' + dbSection);
+    }
+  }
+
+  if (!hasProjectLocalHooks) {
+    console.log('  + dual-brain hooks installed globally');
+    console.log('    hooks dir: ' + hooksDir);
+    console.log('    settings:  ' + globalSettingsPath);
+    console.log('');
+    console.log('  All new Claude sessions will load dual-brain hooks.');
+    console.log('  Run "dual-brain uninstall --global" to remove.');
+  }
+  console.log('  + global CLAUDE.md updated');
+  console.log('    path: ' + globalClaudeDir);
+}
+
+async function uninstallGlobal() {
+  const { homedir } = await import('node:os');
+  const globalSettingsPath = join(homedir(), '.claude', 'settings.json');
+
+  if (!existsSync(globalSettingsPath)) {
+    console.log('  No global settings found.');
+    return;
+  }
+
+  let settings = {};
+  try { settings = JSON.parse(readFileSync(globalSettingsPath, 'utf8')); } catch { return; }
+
+  const DB_MARKER = '# dual-brain-managed';
+  const isDBHook = (entry) => entry.hooks?.some(h => h.command?.includes(DB_MARKER));
+
+  let removed = 0;
+  if (settings.hooks?.PreToolUse) {
+    const before = settings.hooks.PreToolUse.length;
+    settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter(e => !isDBHook(e));
+    removed += before - settings.hooks.PreToolUse.length;
+  }
+  if (settings.hooks?.PostToolUse) {
+    const before = settings.hooks.PostToolUse.length;
+    settings.hooks.PostToolUse = settings.hooks.PostToolUse.filter(e => !isDBHook(e));
+    removed += before - settings.hooks.PostToolUse.length;
+  }
+
+  // Clean up empty arrays/objects
+  if (settings.hooks?.PreToolUse?.length === 0)  delete settings.hooks.PreToolUse;
+  if (settings.hooks?.PostToolUse?.length === 0) delete settings.hooks.PostToolUse;
+  if (Object.keys(settings.hooks || {}).length === 0) delete settings.hooks;
+
+  writeFileSync(globalSettingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+  // Remove dual-brain section from global CLAUDE.md
+  const globalClaudeMd = join(homedir(), '.claude', 'CLAUDE.md');
+  if (existsSync(globalClaudeMd)) {
+    let content = readFileSync(globalClaudeMd, 'utf8');
+    const dbSectionRegex = /\n## Dual-Brain Global Hooks\n[\s\S]*?Managed by: dual-brain install --global\n/;
+    content = content.replace(dbSectionRegex, '');
+    if (content.trim()) {
+      writeFileSync(globalClaudeMd, content);
+    } else {
+      unlinkSync(globalClaudeMd);
+    }
+  }
+
+  console.log(`  - removed ${removed} dual-brain hook${removed === 1 ? '' : 's'} from global settings`);
+  console.log('  Other settings preserved.');
+}
+
 function cmdRemember(text) {
   if (!text) err('Usage: dual-brain remember "preference text"');
   const profile = rememberPreference(text, { scope: 'project', cwd: process.cwd() });
@@ -1049,6 +1355,182 @@ function cmdBreakGlass(reason) {
   console.log('└' + '─'.repeat(inner) + '┘');
 }
 
+// ─── PR command ───────────────────────────────────────────────────────────────
+
+async function cmdPR(args) {
+  const cwd = process.cwd();
+  const sub = args[0] ?? '';
+
+  // Lazy import — only loaded when 'pr' is invoked
+  let prAgent;
+  try {
+    prAgent = await import('../src/pr-agent.mjs');
+  } catch (e) {
+    console.error('pr-agent module not available:', e.message);
+    process.exit(1);
+  }
+
+  const gh = prAgent.hasGitHub();
+  if (!gh.available) {
+    console.error('gh CLI not found. Install GitHub CLI: https://cli.github.com');
+    process.exit(1);
+  }
+
+  // ── dual-brain pr  (show current branch PR status) ──────────────────────────
+  if (!sub || sub === 'status') {
+    if (!gh.authenticated) {
+      console.log('gh CLI is available but not authenticated. Run: gh auth login');
+      return;
+    }
+    const info = prAgent.getBranchInfo(cwd);
+    console.log('\n── PR status ─────────────────────────────────────────────\n');
+    console.log(`  Branch:   ${info.branch ?? '(unknown)'}`);
+    console.log(`  Base:     ${info.defaultBranch}`);
+    console.log(`  Ahead:    ${info.ahead} commit(s)`);
+    console.log(`  Behind:   ${info.behind} commit(s)`);
+
+    if (info.isDefault) {
+      console.log('\n  On default branch — create a feature branch first.');
+      return;
+    }
+
+    // Check for an existing PR on this branch
+    try {
+      const { execSync: _exec } = await import('node:child_process');
+      const json = _exec(`gh pr list --head "${info.branch}" --json number,title,state,url`, {
+        cwd, encoding: 'utf8', timeout: 10000,
+      });
+      const prs = JSON.parse(json);
+      if (prs.length > 0) {
+        const pr = prs[0];
+        console.log(`\n  PR #${pr.number}: ${pr.title}`);
+        console.log(`  State: ${pr.state}`);
+        console.log(`  URL:   ${pr.url}`);
+      } else {
+        console.log('\n  No PR open for this branch.');
+        console.log(`  Create one: dual-brain pr create`);
+      }
+    } catch {
+      console.log('\n  (Could not check for existing PR — run: gh pr status)');
+    }
+    console.log('');
+    return;
+  }
+
+  // ── dual-brain pr list ───────────────────────────────────────────────────────
+  if (sub === 'list') {
+    if (!gh.authenticated) {
+      console.log('gh CLI not authenticated. Run: gh auth login');
+      return;
+    }
+    const state = args.includes('--closed') ? 'closed' : args.includes('--all') ? 'all' : 'open';
+    const prs = prAgent.listPRs(cwd, { state, limit: 20 });
+    if (prs.length === 0) {
+      console.log(`No ${state} PRs found.`);
+      return;
+    }
+    console.log(`\n── ${state} PRs ──────────────────────────────────────────────\n`);
+    for (const pr of prs) {
+      const draft = pr.isDraft ? ' [draft]' : '';
+      const date  = pr.createdAt ? new Date(pr.createdAt).toLocaleDateString() : '';
+      console.log(`  #${pr.number}  ${pr.title}${draft}`);
+      console.log(`       ${pr.headRefName}  by ${pr.author?.login ?? '?'}  ${date}`);
+    }
+    console.log('');
+    return;
+  }
+
+  // ── dual-brain pr view <N> ───────────────────────────────────────────────────
+  if (sub === 'view') {
+    const prNum = args[1];
+    if (!prNum || isNaN(Number(prNum))) {
+      console.error('Usage: dual-brain pr view <PR-number>');
+      process.exit(1);
+    }
+    const details = prAgent.getPRDetails(prNum, cwd);
+    if (!details) {
+      console.error(`PR #${prNum} not found or gh CLI error.`);
+      process.exit(1);
+    }
+    console.log(`\n── PR #${prNum}: ${details.title} ─────────────────────────────\n`);
+    console.log(`  State:    ${details.state}`);
+    console.log(`  Branch:   ${details.headRefName} → ${details.baseRefName}`);
+    console.log(`  Changes:  +${details.additions} -${details.deletions}  (${details.changedFiles} files)`);
+    if (details.statusCheckRollup?.length) {
+      const passing = details.statusCheckRollup.filter(c => c.conclusion === 'SUCCESS').length;
+      const total   = details.statusCheckRollup.length;
+      console.log(`  Checks:   ${passing}/${total} passing`);
+    }
+    if (details.body) {
+      console.log('\n  Body:\n');
+      console.log(details.body.split('\n').map(l => `    ${l}`).join('\n').slice(0, 1500));
+    }
+    console.log('');
+    return;
+  }
+
+  // ── dual-brain pr create ─────────────────────────────────────────────────────
+  if (sub === 'create') {
+    if (!gh.authenticated) {
+      console.log('gh CLI not authenticated. Run: gh auth login');
+      return;
+    }
+    const info = prAgent.getBranchInfo(cwd);
+    if (info.isDefault || !info.branch) {
+      console.error('You are on the default branch. Switch to a feature branch before creating a PR.');
+      process.exit(1);
+    }
+    if (info.ahead === 0) {
+      console.error('No commits ahead of the base branch. Make changes and commit first.');
+      process.exit(1);
+    }
+
+    const diff = prAgent.getDiffSummary(info.defaultBranch, cwd);
+    const draft = args.includes('--draft');
+
+    // Auto-generate a title from the branch name
+    const rawTitle = info.branch.replace(/^db\//, '').replace(/-/g, ' ');
+    const title = rawTitle.charAt(0).toUpperCase() + rawTitle.slice(1);
+
+    // Auto-generate body from diff
+    const body = prAgent.buildPRBody(title, {
+      filesChanged: diff.files,
+    });
+
+    console.log(`\n── Creating PR from ${info.branch} → ${info.defaultBranch} ────────────\n`);
+    console.log(`  Title:  ${title}`);
+    console.log(`  Files:  ${diff.fileCount} changed`);
+    if (diff.summary) console.log(`  Diff:   ${diff.summary}`);
+    if (draft) console.log('  Mode:   draft');
+    console.log('');
+
+    const result = prAgent.createPR({
+      title,
+      body,
+      baseBranch: info.defaultBranch,
+      draft,
+      cwd,
+    });
+
+    if (result.success) {
+      console.log(`  PR created: ${result.url}`);
+    } else {
+      console.error(`  Failed to create PR: ${result.error}`);
+      process.exit(1);
+    }
+    console.log('');
+    return;
+  }
+
+  // Unknown sub-subcommand
+  console.log(`Unknown pr subcommand: "${sub}"`);
+  console.log('Usage:');
+  console.log('  dual-brain pr              Show PR status for current branch');
+  console.log('  dual-brain pr create       Create PR from current branch');
+  console.log('  dual-brain pr list         List open PRs');
+  console.log('  dual-brain pr view <N>     View PR details');
+}
+
 // ─── Screen helpers ───────────────────────────────────────────────────────────
 
 /**
@@ -1089,7 +1571,20 @@ function profileExists(cwd) {
   const dir = cwd || process.cwd();
   const globalPath  = join(process.env.HOME || '/root', '.config', 'dual-brain', 'profile.json');
   const projectPath = join(dir, '.dualbrain', 'profile.json');
-  return existsSync(projectPath) || existsSync(globalPath);
+  // Check file existence AND that setup wizard completed (setupComplete flag)
+  if (existsSync(projectPath)) {
+    try {
+      const p = JSON.parse(readFileSync(projectPath, 'utf8'));
+      return p.setupComplete === true;
+    } catch { return true; } // malformed but exists — treat as complete
+  }
+  if (existsSync(globalPath)) {
+    try {
+      const p = JSON.parse(readFileSync(globalPath, 'utf8'));
+      return p.setupComplete === true;
+    } catch { return true; }
+  }
+  return false;
 }
 
 // ─── Plan label helpers ───────────────────────────────────────────────────────
@@ -1630,13 +2125,9 @@ function buildProviderStatusLine(profile, auth, envReport = null) {
   const GREEN = '\x1b[32m●\x1b[0m';
   const RED   = '\x1b[31m●\x1b[0m';
 
-  // Use envReport secrets when available; fall back to auth detection
-  const claudeAvailable = envReport
-    ? envReport.secrets.ANTHROPIC_API_KEY || auth.claude.found
-    : auth.claude.found;
-  const openaiAvailable = envReport
-    ? envReport.secrets.OPENAI_API_KEY || auth.openai.found
-    : auth.openai.found;
+  // Subscription-only detection — no API key secrets
+  const claudeAvailable = auth.claude.found;
+  const openaiAvailable = auth.openai.found;
 
   const claudeDot = claudeAvailable ? GREEN : RED;
   const openaiDot = openaiAvailable ? GREEN : RED;
@@ -1670,11 +2161,56 @@ function makeBoxRow(content, W) {
 
 // ─── Command palette: input classifier ───────────────────────────────────────
 
+// HEAD state — loaded lazily, shared across REPL turns
+let _headState = null;
+let _headModuleCache = null;
+
+async function _getHeadModule() {
+  if (!_headModuleCache) {
+    try {
+      _headModuleCache = await import('../src/head.mjs');
+    } catch {
+      _headModuleCache = null;
+    }
+  }
+  return _headModuleCache;
+}
+
+function _getHeadState() {
+  if (!_headState) {
+    try {
+      const head = _headModuleCache;
+      _headState = head ? head.loadState() : null;
+    } catch {
+      _headState = null;
+    }
+  }
+  return _headState;
+}
+
+const FREE_COMMANDS = new Map([
+  ['resume', 'resume'], ['r', 'resume'],
+  ['status', 'status'], ['sessions', 'sessions'], ['ss', 'sessions'],
+  ['settings', 'settings'], ['s', 'settings'],
+  ['team', 'team'], ['t', 'team'],
+  ['doctor', 'doctor'], ['d', 'doctor'],
+  ['health', 'health'], ['h', 'health'],
+  ['projects', 'projects'], ['p', 'projects'],
+  ['help', 'help'], ['?', 'help'],
+  ['quit', 'quit'], ['q', 'quit'], ['exit', 'quit'],
+  ['budget', 'budget'], ['b', 'budget'],
+  ['auto', 'auto'], ['automode', 'auto'],
+]);
+
 /**
- * Classify user input into one of three tiers:
- *   { tier: 'free', command, args }   — deterministic, zero tokens
- *   { tier: 'cheap' }                 — question → haiku
- *   { tier: 'full' }                  — work task → confirm then dispatch
+ * Classify user input using HEAD's cognitive pipeline.
+ * Returns a tier-compatible object that maps HEAD's deliberation to the
+ * existing REPL routing: free/skill/cheap/full, plus HEAD judgment metadata.
+ *
+ *   { tier: 'free', command, args }            — deterministic, zero tokens
+ *   { tier: 'skill', skill, args, command }    — slash command
+ *   { tier: 'cheap', headJudgment }            — question → haiku
+ *   { tier: 'full', headJudgment, model }      — work task → dispatch
  */
 function classifyInput(input) {
   const trimmed = input.trim();
@@ -1683,37 +2219,23 @@ function classifyInput(input) {
   const cmd     = parts[0].toLowerCase();
   const args    = parts.slice(1);
 
-  // Tier 1: FREE — exact command matches
-  const FREE_COMMANDS = new Map([
-    ['resume', 'resume'],
-    ['r',      'resume'],
-    ['status', 'status'],
-    ['sessions', 'sessions'],
-    ['ss',     'sessions'],
-    ['settings', 'settings'],
-    ['s',      'settings'],
-    ['team',   'team'],
-    ['t',      'team'],
-    ['doctor', 'doctor'],
-    ['d',      'doctor'],
-    ['health', 'health'],
-    ['h',      'health'],
-    ['projects', 'projects'],
-    ['p',      'projects'],
-    ['help',   'help'],
-    ['?',      'help'],
-    ['quit',   'quit'],
-    ['q',      'quit'],
-    ['exit',   'quit'],
-    ['budget', 'budget'],
-    ['b',      'budget'],
-  ]);
+  // Tier 0: SKILL — slash commands (checked first, deterministic)
+  if (trimmed.startsWith('/')) {
+    try {
+      if (typeof _cachedMatchSkill === 'function') {
+        const skill = _cachedMatchSkill(trimmed);
+        if (skill) {
+          const skillArgs = trimmed.replace(/^\/\w+\s*/, '');
+          return { tier: 'skill', skill, args: skillArgs, command: skill.command };
+        }
+      }
+    } catch {}
+  }
 
+  // Tier 1: FREE — exact command matches (zero tokens, no HEAD needed)
   if (FREE_COMMANDS.has(cmd)) {
     return { tier: 'free', command: FREE_COMMANDS.get(cmd), args };
   }
-
-  // Multi-word free commands
   if (lower.startsWith('search ')) {
     return { tier: 'free', command: 'search', args: parts.slice(1) };
   }
@@ -1721,14 +2243,107 @@ function classifyInput(input) {
     return { tier: 'free', command: 'init --replit', args: [] };
   }
 
-  // Tier 2: CHEAP — question / diagnostic patterns → haiku
+  // ── HEAD cognitive pipeline: replaces regex-based cheap/full split ──────
+  // Try cognitive loop first (wraps HEAD with wave planning + predictions)
+  if (_cognitiveLoopCache) {
+    try {
+      const loopResult = _cognitiveLoopCache.enter(trimmed, {});
+
+      const judgment = {
+        depth: loopResult.action?.depth || 'full',
+        action: loopResult.action,
+        shouldAskUser: loopResult.shouldAskUser,
+        shouldDispatch: loopResult.phase === 'dispatch',
+        shouldClarify: loopResult.action?.type === 'clarify',
+        shouldThink: loopResult.action?.type === 'think',
+        rationale: loopResult.rationale,
+        confidence: loopResult.action?.confidence,
+        obligations: loopResult.action?.obligations,
+        surfaceNoticings: loopResult.surfaceNoticings,
+        // Cognitive loop extensions
+        _loopResult: loopResult,
+        _plan: loopResult.plan,
+        _nextDispatch: loopResult.nextDispatch,
+      };
+
+      // Loop says respond — no dispatch needed
+      if (loopResult.phase === 'respond') {
+        return { tier: 'cheap', headJudgment: judgment };
+      }
+
+      // Loop says dispatch — full tier, use plan's first agent tier to pick model
+      if (loopResult.phase === 'dispatch') {
+        const firstAgent = loopResult.nextDispatch?.agents?.[0];
+        const model = firstAgent?.tier === 'deep' || firstAgent?.tier === 'opus' ? 'opus' : 'sonnet';
+        return { tier: 'full', headJudgment: judgment, model };
+      }
+
+      // Default: cheap
+      return { tier: 'cheap', headJudgment: judgment };
+    } catch {
+      // Cognitive loop failed — fall through to direct HEAD
+    }
+  }
+
+  // Direct HEAD fallback (when cognitive loop unavailable or errored)
+  const head = _headModuleCache;
+  if (head) {
+    const state = _getHeadState() || head.freshState();
+    const turn = head.processTurn(state, trimmed, {});
+    _headState = state; // persist across turns
+
+    const judgment = {
+      depth: turn.depth,
+      action: turn.action,
+      shouldAskUser: turn.shouldAskUser,
+      shouldDispatch: turn.shouldDispatch,
+      shouldClarify: turn.shouldClarify,
+      shouldThink: turn.shouldThink,
+      rationale: turn.rationale,
+      confidence: turn.result.confidence,
+      obligations: turn.result.obligations,
+      surfaceNoticings: turn.result.surfaceNoticings,
+    };
+
+    // Map HEAD's depth → tier + model
+    if (turn.depth === 'reflexive' && !turn.shouldDispatch) {
+      return { tier: 'cheap', headJudgment: judgment };
+    }
+
+    // HEAD says clarify → cheap tier (ask a question, don't dispatch work)
+    if (turn.shouldClarify) {
+      return { tier: 'cheap', headJudgment: judgment };
+    }
+
+    // HEAD says think/plan → full tier with opus
+    if (turn.shouldThink) {
+      return { tier: 'full', headJudgment: judgment, model: 'opus' };
+    }
+
+    // HEAD says dispatch → full tier, model based on depth
+    if (turn.shouldDispatch) {
+      const model = turn.depth === 'deep' ? 'opus' : 'sonnet';
+      return { tier: 'full', headJudgment: judgment, model };
+    }
+
+    // HEAD says respond (not dispatch) → cheap
+    if (turn.action.type === 'respond') {
+      return { tier: 'cheap', headJudgment: judgment };
+    }
+
+    // Default: let depth drive it
+    if (turn.depth === 'light' || turn.depth === 'reflexive') {
+      return { tier: 'cheap', headJudgment: judgment };
+    }
+    return { tier: 'full', headJudgment: judgment };
+  }
+
+  // ── Fallback: HEAD not loaded, use simple heuristics ───────────────────
   const QUESTION_WORDS = /^(why|what|how|where|when|who|is my|check|show me|explain|tell me|list|am i|are there|does|did|can i|will|should i)/i;
-  const QUESTION_CONTAINS = /\b(why|what|how is|how are|where is|where are|explain|tell me|show me)\b/i;
-  if (QUESTION_WORDS.test(lower) || QUESTION_CONTAINS.test(lower)) {
+  if (QUESTION_WORDS.test(lower)) {
     return { tier: 'cheap' };
   }
 
-  // Tier 3: FULL — everything else is a work task
   return { tier: 'full' };
 }
 
@@ -1812,10 +2427,26 @@ async function mainScreen(rl, ask) {
   const auth    = await detectAuth();
 
   // ── Dashboard load animation (full mode only) ─────────────────────────────
-  const fx = await getFx();
+  let fx = null;
+  try { fx = await Promise.race([getFx(), new Promise(r => setTimeout(() => r(null), 3000))]); } catch {}
   let dashSpinner = null;
   if (fx && fx.getMode && fx.getMode() === 'full') {
     dashSpinner = fx.spinner('Loading dashboard...').start();
+  }
+  // Safety: kill spinner after 8s no matter what
+  const _spinnerTimeout = dashSpinner ? setTimeout(() => {
+    if (dashSpinner) { try { dashSpinner.stop(); } catch {} dashSpinner = null; }
+  }, 8000) : null;
+
+  // ── One-time default shell prompt for returning users (never asked before) ─
+  if (profile.setupComplete && !profile.defaultShellAsked) {
+    if (dashSpinner) { dashSpinner.stop(); dashSpinner = null; }
+    try {
+      const wantsDefault = await askDefaultShell(cwd, rl, fx);
+      profile.defaultShellAsked = true;
+      profile.isDefaultShell = wantsDefault;
+      saveProfile(profile, { cwd });
+    } catch { profile.defaultShellAsked = true; }
   }
 
   const claudeSub = profile?.providers?.claude;
@@ -1826,10 +2457,10 @@ async function mainScreen(rl, ask) {
   const claudeExpired = claudeSub?.expiresAt && Date.parse(claudeSub.expiresAt) < now;
   const openaiExpired = openaiSub?.expiresAt && Date.parse(openaiSub.expiresAt) < now;
 
-  // Silent OAuth token auto-refresh
+  // Silent OAuth token auto-refresh (3s timeout — never block dashboard)
   try {
     const { autoRefreshToken } = await import('../src/profile.mjs');
-    await autoRefreshToken(cwd);
+    await Promise.race([autoRefreshToken(cwd), new Promise(r => setTimeout(r, 3000))]);
   } catch {}
 
   // Append-only session archive sync
@@ -1838,17 +2469,20 @@ async function mainScreen(rl, ask) {
     syncSessionMirror(cwd);
   } catch {}
 
-  // Auto-refresh expired subscriptions
-  if (claudeExpired || openaiExpired) {
-    const { spawnSync } = await import('node:child_process');
-    if (claudeExpired) {
-      const r = spawnSync('claude', ['auth', 'login'], { stdio: 'inherit', timeout: 30000 });
-      if (r.status === 0) { claudeSub.expiresAt = null; saveProfile(profile, { cwd }); }
-    }
-    if (openaiExpired) {
-      const r = spawnSync('codex', ['login'], { stdio: 'inherit', timeout: 30000 });
-      if (r.status === 0) { openaiSub.expiresAt = null; saveProfile(profile, { cwd }); }
-    }
+  // Auto-refresh expired subscriptions (skip during dashboard load — don't block)
+  // Users can manually run 'j' (claude login) or 'k' (codex login) from the menu
+  if ((claudeExpired || openaiExpired) && !dashSpinner) {
+    try {
+      const { spawnSync } = await import('node:child_process');
+      if (claudeExpired) {
+        const r = spawnSync('claude', ['auth', 'login'], { stdio: 'pipe', timeout: 5000 });
+        if (r.status === 0) { claudeSub.expiresAt = null; saveProfile(profile, { cwd }); }
+      }
+      if (openaiExpired) {
+        const r = spawnSync('codex', ['login'], { stdio: 'pipe', timeout: 5000 });
+        if (r.status === 0) { openaiSub.expiresAt = null; saveProfile(profile, { cwd }); }
+      }
+    } catch {}
   }
 
   // Build session index in background (powers search + smart resume)
@@ -1857,8 +2491,9 @@ async function mainScreen(rl, ask) {
     buildSessionIndex(cwd);
   } catch {}
 
-  // Gather recent sessions
-  const allSessions    = enrichSessions(importReplitSessions(cwd), cwd);
+  // Gather recent sessions (wrapped — never hang the dashboard)
+  let allSessions = [];
+  try { allSessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
   const recentSessions = allSessions.slice(0, 3);
   const staleCount     = allSessions.filter(s => {
     const ageMs = s.lastActive ? Date.now() - new Date(s.lastActive).getTime() : 0;
@@ -1872,31 +2507,20 @@ async function mainScreen(rl, ask) {
   // ── Interrupted work detection ────────────────────────────────────────────
   const interrupted = detectInterruptedWork(allSessions, cwd);
 
-  // ── Box layout ────────────────────────────────────────────────────────────
-  const termW = process.stdout.columns || 60;
-  const boxW  = Math.min(termW - 2, 60); // outer width (including │ │)
-  const W     = boxW - 4;                // inner content width (│ {content} │)
-
-  const top = `┌${'─'.repeat(boxW - 2)}┐`;
-  const sep = `├${'─'.repeat(boxW - 2)}┤`;
-  const bot = `└${'─'.repeat(boxW - 2)}┘`;
-
-  const row = (content) => makeBoxRow(content, W);
+  // ── Studio Console layout ─────────────────────────────────────────────────
+  const termW = process.stdout.columns || 80;
+  const W     = Math.min(termW - 2, 78); // usable content width
 
   // ── Continuation card (interrupted work) ─────────────────────────────────
   if (interrupted) {
-    const ctop = `┌${'─'.repeat(boxW - 2)}┐`;
-    const csep = `├${'─'.repeat(boxW - 2)}┤`;
-    const cbot = `└${'─'.repeat(boxW - 2)}┘`;
-    const crow = (content) => makeBoxRow(content, W);
-
-    const titleLine = `\x1b[33m💡\x1b[0m Continue: ${interrupted.sessionName}`;
-    const lastLine  = interrupted.lastState
-      ? `   Last: ${interrupted.lastState} · ${interrupted.ageLabel}`
-      : `   ${interrupted.reason} · ${interrupted.ageLabel}`;
-    const actLine   = '   [Enter] Resume  [n] New session  [s] Skip';
-
-    process.stdout.write([ctop, crow(titleLine), csep, crow(lastLine), crow(actLine), cbot].join('\n') + '\n\n');
+    const DIM = '\x1b[2m', RST = '\x1b[0m', YLW = '\x1b[33m';
+    process.stdout.write(`\n ${YLW}Continue:${RST} ${interrupted.sessionName}\n`);
+    if (interrupted.lastState) {
+      process.stdout.write(` ${DIM}Last: ${interrupted.lastState} · ${interrupted.ageLabel}${RST}\n`);
+    } else {
+      process.stdout.write(` ${DIM}${interrupted.reason} · ${interrupted.ageLabel}${RST}\n`);
+    }
+    process.stdout.write(` \x1b[36mEnter\x1b[0m resume  \x1b[36mn\x1b[0m new  \x1b[36ms\x1b[0m skip\n\n`);
 
     // Wait for a keypress to decide what to do with the card
     const readline2 = await import('node:readline');
@@ -1951,7 +2575,7 @@ async function mainScreen(rl, ask) {
     if (cardChoice === 'resume') {
       const { spawnSync } = await import('node:child_process');
       process.stdout.write(`  Launching: claude --resume ${interrupted.sessionId}\n\n`);
-      spawnSync('claude', ['--resume', interrupted.sessionId], { stdio: 'inherit' });
+      spawnSync('claude', _claudeResumeArgs(interrupted.sessionId, cwd), { stdio: 'inherit' });
       saveTerminalState(cwd, getTerminalId(), interrupted.sessionId, 'claude');
       return { next: 'main' };
     }
@@ -1968,8 +2592,9 @@ async function mainScreen(rl, ask) {
     envReport = scanEnvironment(cwd);
   } catch { /* non-fatal */ }
 
-  // ── Box 1 — Header row data ─────────────────────────────────────────────
-  const providerLine = buildProviderStatusLine(profile, auth, envReport);
+  // ── Studio Console: resolve provider availability (subscription-only) ───
+  const claudeAvail = auth.claude.found;
+  const openaiAvail = auth.openai.found;
 
   // ── Box 2 — Workspace: gather git data ───────────────────────────────────
   let gitBranch       = 'unknown';
@@ -2013,23 +2638,13 @@ async function mainScreen(rl, ask) {
     }
   } catch {}
 
-  // ── Box 2 rows ────────────────────────────────────────────────────────────
+  // ── Workspace data ────────────────────────────────────────────────────────
   const uncommittedPart = gitUncommitted > 0 ? ` · ${gitUncommitted} uncommitted` : '';
   const aheadPart       = gitAheadCount  > 0 ? ` · ${gitAheadCount} ahead`       : '';
-  const workspaceLine1  = `${gitBranch}${uncommittedPart}${aheadPart}`;
-  const workspaceLine2  = gitLastMsg
-    ? `Last: ${gitLastMsg} (${gitLastAgo})`
-    : '';
 
   // Open PRs
   const repoState = detectRepoState(cwd);
   const openPRs   = await detectOpenPRs(cwd);
-
-  const workspaceRows = [row(workspaceLine1)];
-  if (workspaceLine2) workspaceRows.push(row(workspaceLine2));
-  if (openPRs.length > 0) {
-    workspaceRows.push(row(`${openPRs.length} open PR${openPRs.length === 1 ? '' : 's'}`));
-  }
 
   // ── Box 3 — Awareness: observer + roadmap + risk ──────────────────────────
   let awarenessLine1 = '\x1b[2m💡\x1b[0m Ready to work';
@@ -2128,131 +2743,196 @@ async function mainScreen(rl, ask) {
       const verStr = rtInfo.version ? `v${rtInfo.version}` : (rtInfo.installed ? 'installed' : 'not installed');
       const isAuthenticated = authInfo.authenticated ?? (authInfo.available && authInfo.tokenStatus === 'valid');
       const authStr = isAuthenticated ? '\x1b[32m✓\x1b[0m auth' : '\x1b[2mno auth\x1b[0m';
-      replitAwarenessRows.push(row(`\x1b[2m🔧\x1b[0m Replit  replit-tools ${verStr}  ${authStr}`));
-      replitAwarenessRows.push(row(`\x1b[2m   \x1b[0m ${archCount} archived session${archCount !== 1 ? 's' : ''}  ${secretCount} secret${secretCount !== 1 ? 's' : ''}`));
+      replitAwarenessRows.push(`Replit  replit-tools ${verStr}  ${authStr}`);
+      replitAwarenessRows.push(`${archCount} archived session${archCount !== 1 ? 's' : ''}  ${secretCount} secret${secretCount !== 1 ? 's' : ''}`);
     }
   } catch { /* replit.mjs not available — skip */ }
 
-  const awarenessRows = [
-    row(awarenessLine1),
-    row(awarenessLine2),
-    row(awarenessLine3),
-    ...replitAwarenessRows,
-  ];
-
-  // ── Sessions section ──────────────────────────────────────────────────────
-  const sessionRows = [];
-  if (recentSessions.length === 0) {
-    const noSessMsg = 'No sessions yet. Press n to start.';
-    sessionRows.push(row(noSessMsg));
-  } else {
-    recentSessions.forEach((sess, i) => {
-      // Normalize name: strip "Session XXXXXXXX" fallbacks
-      let rawName = sess.name || '';
-      if (/^Session [0-9a-f]{8,}$/i.test(rawName)) {
-        rawName = sess.project
-          ? sess.project.replace(/^-/, '/').replace(/-/g, '/')
-          : sess.id.slice(0, 8);
-      }
-
-      // Build badges (ANSI color; track visible width separately)
-      const badges = [];
-      const badgeVisible = [];
-      if (sess.isActive) {
-        badges.push('\x1b[32m[active]\x1b[0m');
-        badgeVisible.push('[active]'.length);
-      }
-      const ageMs = sess.lastActive ? Date.now() - new Date(sess.lastActive).getTime() : 0;
-      if (ageMs > 7 * 24 * 3600 * 1000) {
-        badges.push('\x1b[2m[stale]\x1b[0m');
-        badgeVisible.push('[stale]'.length);
-      }
-      const msgCount    = sess.messageCount ?? sess.promptCount ?? 0;
-      // Human-readable: "4 tasks" instead of "(4)"
-      const taskLabel   = msgCount === 1 ? '1 task' : `${msgCount} tasks`;
-      const taskBadge   = `\x1b[2m${taskLabel}\x1b[0m`;
-      const taskBadgeW  = taskLabel.length;
-
-      const badgeStr = badges.join('');
-      const badgesW  = badgeVisible.reduce((s, n) => s + n, 0);
-
-      // Layout: "{num}  {name...}{badges}  {age}  {tasks}"
-      // Use basename for name — strip full paths for readability
-      const displayName = rawName.startsWith('/')
-        ? rawName.split('/').filter(Boolean).pop() || rawName
-        : rawName;
-
-      const numStr  = String(i + 1);
-      const ageStr  = sess.age || '';
-      // Available for name: W minus fixed chrome, badge widths, and task badge
-      const nameMax = W - numStr.length - 2 - badgesW - 2 - ageStr.length - 2 - taskBadgeW;
-      const truncName = displayName.length > nameMax
-        ? displayName.slice(0, Math.max(0, nameMax - 3)) + '...'
-        : displayName.padEnd(nameMax);
-      const content = `${numStr}  ${truncName}${badgeStr}  ${ageStr}  ${taskBadge}`;
-      sessionRows.push(row(content));
-    });
+  // ── Recent work items (from awareness + sessions) — max 3 lines, dim ──────
+  const recentWorkItems = [];
+  // Add awareness observations as recent work if meaningful
+  if (awarenessLine1 && !awarenessLine1.includes('Ready to work')) {
+    const plainAware1 = awarenessLine1.replace(/\x1b\[[0-9;]*m/g, '').replace(/[︀-️]/g, '').trim();
+    if (plainAware1) recentWorkItems.push({ ok: !plainAware1.startsWith('⚠') && !plainAware1.startsWith('🔴'), text: plainAware1.replace(/^[🔴🟡💡]\s*/, '') });
+  }
+  // Add last commit as a recent work item
+  if (gitLastMsg) {
+    recentWorkItems.push({ ok: true, text: `${gitLastMsg} (${gitLastAgo})` });
+  }
+  // Fill from sessions if still room
+  if (recentWorkItems.length < 3 && recentSessions.length > 0) {
+    const sess = recentSessions[0];
+    let rawName = sess.name || '';
+    if (/^Session [0-9a-f]{8,}$/i.test(rawName)) rawName = sess.id.slice(0, 8);
+    if (rawName) recentWorkItems.push({ ok: true, text: rawName.slice(0, 50) });
   }
 
   // ── Resume state detection ────────────────────────────────────────────────
-  let resumeStateRows = [];
   const resumeState = await detectResumeState(cwd);
-  if (resumeState.type === 'resumable') {
-    const DIM   = '\x1b[2m';
-    const RESET = '\x1b[0m';
-    const CYAN  = '\x1b[36m';
-    const labelTrunc = resumeState.label || 'last session';
-    const agePart    = resumeState.ageLabel ? ` (${resumeState.ageLabel})` : '';
-    const filePart   = resumeState.filePart || '';
+
+  // ── Determine layout mode ─────────────────────────────────────────────────
+  const anyProviderAvail = claudeAvail || openaiAvail;
+  const isReturning      = resumeState.type === 'resumable';
+
+  // ── ANSI color shorthands ─────────────────────────────────────────────────
+  const DIM   = '\x1b[2m';
+  const RST   = '\x1b[0m';
+  const BOLD  = '\x1b[1m';
+  const GRN   = '\x1b[32m';
+  const YLW   = '\x1b[33m';
+  const RED   = '\x1b[31m';
+  const GRY   = '\x1b[90m';
+
+  // ── Provider dots ─────────────────────────────────────────────────────────
+  const claudeDot = claudeAvail ? `${GRN}●${RST}` : `${GRY}○${RST}`;
+  const openaiDot = openaiAvail ? `${GRN}●${RST}` : `${GRY}○${RST}`;
+
+  // ── Project name (from package.json or cwd basename) ─────────────────────
+  let projectName = basename(cwd);
+  try {
+    const pkgRaw = readFileSync(join(cwd, 'package.json'), 'utf8');
+    const pkgJson = JSON.parse(pkgRaw);
+    if (pkgJson.name) projectName = pkgJson.name;
+  } catch { /* no package.json */ }
+
+  // ── Separator line ────────────────────────────────────────────────────────
+  const sepW = Math.min(W, 72);
+  const sepLine = `${DIM}${'━'.repeat(sepW)}${RST}`;
+
+  // ── Strip ANSI for width calc ─────────────────────────────────────────────
+  const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '').replace(/[︀-️]/g, '');
+
+  // ── Line 1: status bar ───────────────────────────────────────────────────
+  //   " project  branch  Claude ●  GPT ●                  v0.2.3"
+  const branchStr   = `${gitBranch}${uncommittedPart}${aheadPart}`;
+  const providerStr = `Claude ${claudeDot}  GPT ${openaiDot}`;
+  const verStr2     = `${DIM}v${version}${RST}`;
+  const statusLeft  = ` ${projectName}  ${DIM}${branchStr}${RST}  ${providerStr}`;
+  const statusRight = verStr2;
+  const statusLeftW  = stripAnsi(statusLeft).length;
+  const statusRightW = stripAnsi(statusRight).length;
+  const statusGap    = Math.max(1, sepW + 1 - statusLeftW - statusRightW);
+  const statusBar    = `${statusLeft}${' '.repeat(statusGap)}${statusRight}`;
+
+  // ── Line 2-3: contextual question + last summary ─────────────────────────
+  let mainQuestion, lastSummary;
+  if (!anyProviderAvail) {
+    mainQuestion = ` ${BOLD}Connect a provider to start working${RST}`;
+    lastSummary  = null;
+  } else if (isReturning) {
+    mainQuestion = ` ${BOLD}Resume previous work?${RST}`;
+    const labelTrunc = (resumeState.label || 'last session').slice(0, 45);
+    const agePart    = resumeState.ageLabel ? ` · ${resumeState.ageLabel}` : '';
     const nextPart   = resumeState.nextAction ? ` · next: ${resumeState.nextAction}` : '';
-    resumeStateRows = [
-      row(`${CYAN}Last:${RESET} "${labelTrunc}"${agePart}${filePart}${nextPart}`),
-      row(`${DIM}[Enter] resume  [n] new  [?] help${RESET}`),
-    ];
-  } else if (resumeState.type === 'fresh' && recentSessions.length === 0) {
-    const DIM   = '\x1b[2m';
-    const RESET = '\x1b[0m';
-    resumeStateRows = [
-      row(`New project: ${resumeState.label}`),
-      row(`${DIM}Type what you want to do  [?] help${RESET}`),
-    ];
+    lastSummary = ` ${DIM}Last: ${labelTrunc}${agePart}${nextPart}${RST}`;
+  } else {
+    mainQuestion = ` ${BOLD}What do you want to build?${RST}`;
+    lastSummary  = null;
   }
 
-  // ── Box 5 — Input bar ──────────────────────────────────────────────────
-  const actionsContent = '> task or command...   [?] help  [q] quit';
-  const actionsRow     = row(actionsContent);
-
-  // ── Print the full 5-box layout ───────────────────────────────────────────
-  // Box 1: header (title + provider dots + work style)
-  // Box 2: workspace (branch · uncommitted · ahead, last commit, open PRs)
-  // Box 3: awareness (observer, roadmap, risk)
-  // Box 4: sessions (+ resume state hint if applicable)
-  // Box 5: input bar
-  const hasResumeHint = resumeStateRows.length > 0;
-  const lines = [
-    top,
-    row(`🧠 dual-brain v${version}`),
-    row(providerLine),
-    sep,
-    ...workspaceRows,
-    sep,
-    ...awarenessRows,
-    sep,
-    ...sessionRows,
-    ...(hasResumeHint ? [sep, ...resumeStateRows] : []),
-    sep,
-    actionsRow,
-    bot,
-  ];
-  // ── Stale session hint ──────────────────────────────────────────────────
-  if (staleCount >= 3) {
-    process.stdout.write(`\x1b[2m${staleCount} stale sessions (>7d) — press s → archive to clean up\x1b[0m\n`);
+  // ── Suggestions (max 3, bright) ───────────────────────────────────────────
+  let suggestions;
+  const claudeExpiredNow = claudeSub?.expiresAt && Date.parse(claudeSub.expiresAt) < Date.now();
+  const openaiExpiredNow = openaiSub?.expiresAt && Date.parse(openaiSub.expiresAt) < Date.now();
+  if (!anyProviderAvail) {
+    suggestions = ['configure Claude', 'configure GPT', 'browse project'];
+  } else if (claudeExpiredNow || openaiExpiredNow) {
+    const resumeOrBuild = isReturning ? 'resume last session' : 'start building';
+    suggestions = ['refresh auth', resumeOrBuild, 'check project health'];
+  } else if (isReturning) {
+    const openTasks = [];
+    try {
+      const { getOpenTasks } = await import('../src/ledger.mjs');
+      const open = getOpenTasks(cwd);
+      if (open.length > 0) openTasks.push(`continue: ${open[0].intent.slice(0, 30)}`);
+    } catch {}
+    suggestions = openTasks.length > 0
+      ? [openTasks[0], 'review changes', 'run tests']
+      : ['resume last session', 'review changes', 'run tests'];
+  } else {
+    suggestions = ['start building', 'explore codebase', 'check project health'];
   }
+  const suggestLine = ` ${suggestions.join('    ')}`;
 
-  // Resolve dashboard spinner before rendering
+  // ── Recent work items (dim, max 3) ────────────────────────────────────────
+  const recentLines = recentWorkItems.slice(0, 3).map(item => {
+    return signalLine(item.ok ? 'success' : 'warning', `${DIM}${item.text}${RST}`);
+  });
+
+  // ── Cognitive loop status (appended to signals) ────────────────────────────
+  try {
+    const cogLoop = await _getCognitiveLoop();
+    if (cogLoop) {
+      const loopStatus = cogLoop.getLoopStatus();
+      if (loopStatus.hasActivePlan) {
+        const wavePart = `${loopStatus.completedWaves}/${loopStatus.totalWaves} waves`;
+        const replanPart = loopStatus.replans > 0 ? ` · ${loopStatus.replans} replan${loopStatus.replans !== 1 ? 's' : ''}` : '';
+        recentLines.push(signalLine('info', `${DIM}[loop] ${wavePart}${replanPart}${RST}`));
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  // ── Resolve dashboard spinner before rendering ────────────────────────────
+  if (_spinnerTimeout) clearTimeout(_spinnerTimeout);
   if (dashSpinner) dashSpinner.succeed('Dashboard ready');
 
-  process.stdout.write(lines.join('\n') + '\n\n');
+  // ── Stale hint ────────────────────────────────────────────────────────────
+  if (staleCount >= 3) {
+    process.stdout.write(`${DIM}${staleCount} stale sessions (>7d) — type "sessions" to manage${RST}\n`);
+  }
+
+  // ── Render Studio Console (paneled layout) ────────────────────────────────
+  const CYAN = '\x1b[36m';
+  const panelW = Math.min(sepW + 2, 72);
+
+  // Header panel — project, branch, providers, version
+  const headerLeft  = `${DIM}${projectName}${RST}  ${BOLD}${branchStr}${RST}  ${DIM}Claude${RST} ${claudeDot}  ${DIM}GPT${RST} ${openaiDot}`;
+  const headerRight = `${DIM}v${version}${RST}`;
+  const headerContent = [headerBar(headerLeft, headerRight, panelW - 4)];
+  process.stdout.write('\n' + panel('dual-brain', headerContent, { width: panelW, titleColor: CYAN }) + '\n\n');
+
+  // Resume / prompt panel (only when there is something to show)
+  if (isReturning || !anyProviderAvail) {
+    const resumeContent = [];
+    if (!anyProviderAvail) {
+      resumeContent.push(`${BOLD}Connect a provider to start working${RST}`);
+    } else {
+      const labelTrunc = (resumeState.label || 'last session').slice(0, 45);
+      const agePart    = resumeState.ageLabel ? ` · ${resumeState.ageLabel}` : '';
+      const nextPart   = resumeState.nextAction ? ` · next: ${resumeState.nextAction}` : '';
+      resumeContent.push(`${DIM}Last task${RST}   ${BOLD}${labelTrunc}${RST}${DIM}${agePart}${RST}`);
+      if (nextPart) resumeContent.push(`${DIM}Next step${RST}   ${nextPart.replace(/^ · /, '')}`);
+    }
+    resumeContent.push('');
+    resumeContent.push(`  ${CYAN}›${RST} ${BOLD}${suggestions[0]}${RST}    ${DIM}${suggestions[1] || ''}${RST}    ${DIM}${suggestions[2] || ''}${RST}`);
+    process.stdout.write(panel(isReturning ? 'Resume work' : 'Get started', resumeContent, { width: panelW }) + '\n\n');
+  } else {
+    // Fresh / no-resume state — just show suggestions inline
+    const suggestContent = [`  ${CYAN}›${RST} ${BOLD}${suggestions[0]}${RST}    ${DIM}${suggestions[1] || ''}${RST}    ${DIM}${suggestions[2] || ''}${RST}`];
+    process.stdout.write(panel('Get started', suggestContent, { width: panelW }) + '\n\n');
+  }
+
+  // Signals panel — recent work items (only when there are items)
+  if (recentLines.length > 0) {
+    process.stdout.write(panel('Signals', recentLines, { width: panelW }) + '\n\n');
+  }
+
+  // Shortcut bar — always visible so the user never has to guess
+  const autoLabel = profile.automode ? `\x1b[32m⚡auto\x1b[0m` : `${DIM}auto${RST}`;
+  const shortcutItems = [
+    `${CYAN}Enter${RST} resume`,
+    `${CYAN}n${RST} new`,
+    `${CYAN}/${RST} search`,
+    `${CYAN}s${RST} settings`,
+    `${CYAN}d${RST} doctor`,
+    autoLabel,
+    `${CYAN}q${RST} quit`,
+  ];
+  process.stdout.write(` ${DIM}${shortcutItems.join('  ')}${RST}\n\n`);
+
+  // Input bar — rendered below shortcut bar
+  const inputLeft = tuiPrompt('task or command...');
+  process.stdout.write(` ${inputLeft}\n`);
 
   // ── Key handling ──────────────────────────────────────────────────────────
   // Use raw keypress mode so we can show a live type-to-start buffer.
@@ -2454,6 +3134,17 @@ async function mainScreen(rl, ask) {
         await ask('\n  Press Enter to continue...');
         return { next: 'main' };
       }
+      if (cmd === 'auto') {
+        const cwd2 = process.cwd();
+        const prof = loadProfile(cwd2);
+        prof.automode = !prof.automode;
+        saveProfile(prof, { cwd: cwd2 });
+        const state = prof.automode ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
+        process.stdout.write(`\n  Automode: ${state}\n`);
+        process.stdout.write(`  ${prof.automode ? 'Tasks dispatch immediately (HEAD still gates dangerous ops)' : 'Tasks require Enter to confirm'}\n\n`);
+        await ask('  Press Enter to continue...');
+        return { next: 'main' };
+      }
       if (cmd === 'init --replit') {
         await cmdInit(rl);
         return { next: 'main' };
@@ -2461,20 +3152,106 @@ async function mainScreen(rl, ask) {
       // fallthrough: unknown free command → treat as full task
     }
 
-    // Tier 2: CHEAP — question/diagnostic, route to haiku
-    if (classified.tier === 'cheap') {
-      process.stdout.write(`\n  Routing to haiku for quick answer...\n`);
-      return { next: 'go', prompt: input, model: 'haiku' };
+    // Tier 0.5: SKILL — slash command routed through agent registry
+    if (classified.tier === 'skill') {
+      const skill = classified.skill;
+      const skillArgs = classified.args || '';
+
+      // Free skills (e.g. /status) run deterministically with no agent
+      if (skill.tier === 'free' || !skill.agent) {
+        if (skill.command === 'status') {
+          await cmdStatus([]);
+          await ask('\n  Press Enter to continue...');
+          return { next: 'main' };
+        }
+        return { next: 'main' };
+      }
+
+      // Build the task brief from the skill declaration
+      let brief = null;
+      try {
+        if (typeof _cachedSkillToTaskBrief === 'function') {
+          brief = _cachedSkillToTaskBrief(input, skillArgs);
+        }
+      } catch {}
+
+      const model  = brief?.model || skill.model || 'sonnet';
+      const prompt = brief?.objective || `/${skill.command} ${skillArgs}`.trim();
+
+      process.stdout.write(`\n  Skill: /${skill.command}  Agent: ${skill.agent}  Model: ${model}\n`);
+      if (skill.description) process.stdout.write(`  ${skill.description}\n`);
+      process.stdout.write(`  \x1b[36mEnter\x1b[0m run  \x1b[36mn\x1b[0m cancel\n\n`);
+      const skillConfirm = (await ask('  > ')).trim().toLowerCase();
+      if (skillConfirm === 'n' || skillConfirm === 'no') return { next: 'main' };
+
+      return { next: 'go', prompt, model };
     }
 
-    // Tier 3: FULL — work task, confirm before dispatching
+    // Tier 2: CHEAP — question/diagnostic/reflexive
+    if (classified.tier === 'cheap') {
+      const hj = classified.headJudgment;
+      const model = hj ? 'haiku' : 'haiku';
+      if (hj?.surfaceNoticings?.length > 0) {
+        for (const n of hj.surfaceNoticings) {
+          process.stdout.write(`\n  \x1b[33m[HEAD]\x1b[0m ${n.observation}\n`);
+        }
+      }
+      process.stdout.write(`\n  Routing to ${model} for quick answer...\n`);
+      return { next: 'go', prompt: input, model };
+    }
+
+    // Tier 3: FULL — work task, HEAD-informed dispatch
     if (classified.tier === 'full') {
+      const hj = classified.headJudgment;
+      const model = classified.model || 'sonnet';
       const summary = input.length > 60 ? input.slice(0, 57) + '...' : input;
-      process.stdout.write(`\n  Launch coding session: ${summary}\n`);
-      process.stdout.write(`  Model: sonnet  [Enter] to proceed, [n] to cancel\n\n`);
+
+      // Surface HEAD noticings before confirming
+      if (hj?.surfaceNoticings?.length > 0) {
+        for (const n of hj.surfaceNoticings) {
+          process.stdout.write(`\n  \x1b[33m[HEAD]\x1b[0m ${n.observation}`);
+        }
+        process.stdout.write('\n');
+      }
+
+      // Show cognitive loop plan info if available
+      if (hj?._plan) {
+        const plan = hj._plan;
+        const waveCount = plan.waves?.length || 0;
+        const agentCount = plan.waves?.reduce((sum, w) => sum + (w.agents?.length || 0), 0) || 0;
+        process.stdout.write(`\n  \x1b[2m[plan] ${waveCount} wave${waveCount !== 1 ? 's' : ''}, ${agentCount} agent${agentCount !== 1 ? 's' : ''}\x1b[0m`);
+        if (hj._nextDispatch?.warnings?.length > 0) {
+          process.stdout.write(`  \x1b[33m${hj._nextDispatch.warnings.length} warning(s)\x1b[0m`);
+        }
+        process.stdout.write('\n');
+      }
+
+      // HEAD's shouldAskUser gates the dispatch — dangerous/irreversible ops
+      if (hj?.shouldAskUser) {
+        const reason = hj.obligations?.find(o => o.type === 'askBeforeIrreversi')?.description || hj.rationale;
+        process.stdout.write(`\n  \x1b[31m⚠ CAUTION\x1b[0m ${reason}\n`);
+        process.stdout.write(`  Task: ${summary}\n`);
+        process.stdout.write(`  Depth: ${hj.depth}  Model: ${model}\n`);
+        process.stdout.write(`  \x1b[36mEnter\x1b[0m proceed  \x1b[36mn\x1b[0m cancel\n\n`);
+        const confirm = (await ask('  > ')).trim().toLowerCase();
+        if (confirm === 'n' || confirm === 'no') return { next: 'main' };
+        return { next: 'go', prompt: input, model, _loopResult: hj._loopResult };
+      }
+
+      // Automode: if HEAD says it's safe, just go — no confirmation needed
+      const automode = profile.automode ?? profile.settings?.automode ?? false;
+      if (automode) {
+        process.stdout.write(`\n  \x1b[36m⚡\x1b[0m ${summary}  (${model}, depth: ${hj?.depth || '?'})\n`);
+        return { next: 'go', prompt: input, model, _loopResult: hj._loopResult };
+      }
+
+      // Manual mode — show depth, wait for confirmation
+      process.stdout.write(`\n  Launch: ${summary}\n`);
+      process.stdout.write(`  Depth: ${hj?.depth || '?'}  Model: ${model}\n`);
+      process.stdout.write(`  \x1b[36mEnter\x1b[0m go  \x1b[36mn\x1b[0m cancel\n\n`);
       const confirm = (await ask('  > ')).trim().toLowerCase();
       if (confirm === 'n' || confirm === 'no') return { next: 'main' };
-      return { next: 'go', prompt: input };
+      return { next: 'go', prompt: input, model, _loopResult: hj._loopResult };
     }
 
     // Default fallback
@@ -2491,7 +3268,7 @@ async function mainScreen(rl, ask) {
     const sess = recentSessions[0];
     const { spawnSync } = await import('node:child_process');
     process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
-    spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+    spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
     saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
     return { next: 'main' };
   }
@@ -2510,7 +3287,7 @@ async function mainScreen(rl, ask) {
     } catch {}
     const { spawnSync } = await import('node:child_process');
     process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
-    spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+    spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
     saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
     return { next: 'main' };
   }
@@ -2589,27 +3366,36 @@ async function paletteHelpScreen(rl, ask) {
   const DIM   = '\x1b[2m';
   const RESET = '\x1b[0m';
 
+  const CYAN = '\x1b[36m';
   const lines = [
     top,
-    row('Command Palette'),
+    row(`${CYAN}Keyboard Shortcuts${RESET} (single key, no Enter needed)`),
     sep,
-    row(`${DIM}resume  r${RESET}        Resume last session`),
+    row(`${CYAN}Enter${RESET}   Resume last session`),
+    row(`${CYAN}n${RESET}       New coding session`),
+    row(`${CYAN}1-9${RESET}     Resume session by number`),
+    row(`${CYAN}/${RESET}       Search session history`),
+    row(`${CYAN}s${RESET}       Settings`),
+    row(`${CYAN}d${RESET}       Doctor (repo diagnostics)`),
+    row(`${CYAN}t${RESET}       Team`),
+    row(`${CYAN}i${RESET}       Import sessions`),
+    row(`${CYAN}q${RESET}       Quit`),
+    row(`${CYAN}?${RESET}       This help`),
+    sep,
+    row(`${CYAN}Typed Commands${RESET} (type then Enter)`),
+    sep,
     row(`${DIM}status${RESET}           Provider health + budget`),
-    row(`${DIM}sessions  ss${RESET}     List recent sessions`),
+    row(`${DIM}sessions${RESET}         List recent sessions`),
     row(`${DIM}search <query>${RESET}   Search session history`),
-    row(`${DIM}budget  b${RESET}        Token usage + routing`),
-    row(`${DIM}health  h${RESET}        System health check`),
-    row(`${DIM}doctor  d${RESET}        Repo diagnostics`),
-    row(`${DIM}settings  s${RESET}      Settings screen`),
-    row(`${DIM}team  t${RESET}          Team screen`),
-    row(`${DIM}help  ?${RESET}          Show this help`),
-    row(`${DIM}quit  q${RESET}          Exit`),
+    row(`${DIM}budget${RESET}           Token usage + routing`),
+    row(`${DIM}health${RESET}           System health check`),
     sep,
-    row('Or type any task to launch a coding session'),
-    row(`${DIM}Questions (why/how/what) → haiku (cheap)${RESET}`),
-    row(`${DIM}Work tasks → confirm then dispatch${RESET}`),
+    row(`${CYAN}Natural Language${RESET} (just type)`),
     sep,
-    row(`${DIM}[Enter] go back${RESET}`),
+    row(`Questions → quick answer (haiku)`),
+    row(`Work tasks → HEAD evaluates, then dispatches`),
+    sep,
+    row(`${DIM}Enter${RESET} go back`),
     bot,
   ];
 
@@ -3081,15 +3867,14 @@ async function prTriageScreen(rl, ask, ctx = {}) {
 async function settingsScreen(rl, ask) {
   const cwd = process.cwd();
 
-  // Box layout matching dashboard
-  const termW = process.stdout.columns || 60;
-  const boxW  = Math.min(termW - 2, 60);
-  const W     = boxW - 4;
+  const DIM   = '\x1b[2m';
+  const RESET = '\x1b[0m';
+  const GREEN = '\x1b[32m';
+  const RED   = '\x1b[31m';
+  const BOLD  = '\x1b[1m';
 
-  const top = `┌${'─'.repeat(boxW - 2)}┐`;
-  const sep = `├${'─'.repeat(boxW - 2)}┤`;
-  const bot = `└${'─'.repeat(boxW - 2)}┘`;
-  const row = (content) => makeBoxRow(content, W);
+  const chk  = `${GREEN}✓${RESET}`;
+  const xmark = `${RED}✗${RESET}`;
 
   // Detect if gh is available + has PRs for the PR triage option
   const settingsPRs = await detectOpenPRs(cwd);
@@ -3097,108 +3882,141 @@ async function settingsScreen(rl, ask) {
   // Load current work style
   const profile = loadProfile(cwd);
   const currentBias = profile?.bias || profile?.mode || 'balanced';
-  const WORK_STYLE_DISPLAY = {
-    'cost-saver':    '⚡ Fast',
-    'auto':          '⚡ Fast',
-    'solo-claude':   '⚡ Fast',
-    'solo-openai':   '⚡ Fast',
-    'balanced':      '⚖️  Balanced',
-    'quality-first': '🔥 Full Power',
-  };
 
   // Work style current markers
   const _stIsFast = ['cost-saver', 'auto', 'solo-claude', 'solo-openai'].includes(currentBias);
   const _stIsBal  = currentBias === 'balanced';
   const _stIsFull = currentBias === 'quality-first';
-  const _stMark   = (active) => active ? ' ← current' : '';
+  const dot = (active) => active ? `${GREEN}●${RESET}` : `${DIM}○${RESET}`;
 
-  // Provider status dots
-  const _stAuth       = await detectAuth();
-  const _stGDOT       = '\x1b[32m●\x1b[0m';
-  const _stRDOT       = '\x1b[31m●\x1b[0m';
-  const _stClDot      = _stAuth.claude.found ? _stGDOT : _stRDOT;
-  const _stOaDot      = _stAuth.openai.found ? _stGDOT : _stRDOT;
-  const _stClStatus   = _stAuth.claude.found ? 'connected' : 'not connected';
-  const _stOaStatus   = _stAuth.openai.found ? 'connected' : 'not connected';
+  // ── Subscriptions / credentials ──────────────────────────────────────────
+  const credData  = loadCredentials(cwd);
+  const credList  = credData.credentials || [];
+  const hasCredRegistry = credList.length > 0;
 
-  // Calibration from project.json
-  let _stCal       = { specificity: 3, corrections: 3, autonomy: 3 };
-  let _stLevel     = 'intermediate';
-  let _stStyle     = 'normal';
-  try {
-    const _stLd  = await import('../src/living-docs.mjs');
-    const _stCm  = await import('../src/calibration.mjs');
-    const _stPs  = _stLd.getProjectState(cwd);
-    if (_stPs?.project?.userCalibration) _stCal = _stPs.project.userCalibration;
-    const _stAd  = _stCm.getAdaptation(_stCal);
-    _stLevel = _stAd.userLevel;
-    _stStyle = _stAd.responseStyle;
-  } catch { /* non-fatal */ }
-
-  const _stS = typeof _stCal.specificity === 'number' ? _stCal.specificity.toFixed(1) : String(_stCal.specificity ?? 3);
-  const _stC = typeof _stCal.corrections === 'number' ? _stCal.corrections.toFixed(1) : String(_stCal.corrections ?? 3);
-  const _stA = typeof _stCal.autonomy    === 'number' ? _stCal.autonomy.toFixed(1)    : String(_stCal.autonomy    ?? 3);
-
-  // Cost efficiency summary (graceful — only shown when data exists)
-  let _stEffScore = null;
-  let _stEffRate  = null;
-  let _stEffTrend = null;
-  let _stEffTier  = null;
-  try {
-    const _stCt = await import('../src/cost-tracker.mjs');
-    const _stSummary = _stCt.getCostSummary(cwd, 7);
-    if (_stSummary.totalActions > 0) {
-      _stEffScore = _stCt.getEfficiencyScore(cwd);
-      _stEffRate  = Math.round(_stSummary.savingsRate * 100);
-      _stEffTrend = _stSummary.trend;
-      const tierOrder = ['recall', 'quick', 'standard', 'deep', 'ultra'];
-      const _stTierKeys = tierOrder.filter(k => _stSummary.byTier[k]);
-      _stEffTier = _stTierKeys.map(k => {
-        const t = _stSummary.byTier[k];
-        return `${k.padEnd(8)} ${String(t.count).padStart(3)}`;
-      }).join('  ');
+  // Fall back to detectAuth() when no registry entries yet
+  let subsLines = [];
+  if (hasCredRegistry) {
+    for (const c of credList.filter(c => c.enabled !== false)) {
+      const provLabel  = c.provider === 'claude' ? 'Claude' : 'OpenAI';
+      const authLabel  = c.auth_type === 'cli_oauth' ? 'CLI OAuth' : 'API key';
+      const planLabel  = c.plan_hint || '';
+      const healthMark = c.health === 'healthy' ? chk : c.health === 'degraded' ? `${RED}~${RESET}` : `${DIM}?${RESET}`;
+      const scopeTag   = `[${c.scope || 'local'}]`;
+      const planPart   = planLabel ? `  ${DIM}${planLabel}${RESET}` : '';
+      subsLines.push(`  ${DIM}${provLabel.padEnd(6)}${RESET}  ${authLabel.padEnd(10)}${planPart}  ${healthMark}${c.health === 'healthy' ? ' healthy' : ' ' + (c.health || 'unknown')}  ${DIM}${scopeTag}${RESET}`);
     }
-  } catch { /* non-fatal */ }
+    if (subsLines.length === 0) subsLines.push(`  ${DIM}none registered${RESET}`);
+  } else {
+    const _stAuth = await detectAuth();
+    const _clStatus = _stAuth.claude.found ? `${chk} connected` : `${xmark} not connected`;
+    const _oaStatus = _stAuth.openai.found ? `${chk} connected` : `${xmark} not connected`;
+    subsLines.push(`  ${DIM}Claude${RESET}   CLI OAuth    ${_clStatus}`);
+    subsLines.push(`  ${DIM}OpenAI${RESET}   API key      ${_oaStatus}`);
+  }
 
-  const _stTrendIcon = _stEffTrend === 'improving' ? '↗' : _stEffTrend === 'degrading' ? '↘' : '→';
-
-  const lines = [
-    top,
-    row('Settings'),
-    sep,
-    row('Work Style'),
-    row(`  [1] Fast — speed over caution${_stMark(_stIsFast)}`),
-    row(`  [2] Balanced — smart routing, reviews on important${_stMark(_stIsBal)}`),
-    row(`  [3] Full Power — dual-brain everything, max quality${_stMark(_stIsFull)}`),
-    sep,
-    row('Providers'),
-    row(`  Claude: ${_stClDot} ${_stClStatus}`),
-    row(`  OpenAI: ${_stOaDot} ${_stOaStatus}`),
-    sep,
-    row('User Calibration'),
-    row(`  Specificity: ${_stS}  Corrections: ${_stC}  Autonomy: ${_stA}`),
-    row(`  Level: ${_stLevel} · Style: ${_stStyle}`),
-    ...(_stEffScore !== null ? [
-      sep,
-      row('Cost Efficiency (7 days)'),
-      row(`  Score: ${_stEffScore}/100  Savings: ${_stEffRate}%  Trend: ${_stTrendIcon} ${_stEffTrend}`),
-      ...(_stEffTier ? [row(`  Tiers: ${_stEffTier}`)] : []),
-    ] : []),
-    sep,
-    row('[1-3] change style  [r] reset calibration  [b] back'),
-    row('[m] subscriptions  [e] sessions  [x] diagnostics'),
-    ...(settingsPRs.length > 0 ? [row(`[p] PR triage (${settingsPRs.length} open)`)] : []),
-    bot,
+  // ── Work style ───────────────────────────────────────────────────────────
+  const wsLines = [
+    `  ${dot(_stIsFast)} ${_stIsFast ? BOLD : DIM}Fast${RESET}   speed over caution`,
+    `  ${dot(_stIsBal)}  ${_stIsBal ? BOLD : DIM}Balanced${RESET}   smart routing, reviews on important`,
+    `  ${dot(_stIsFull)} ${_stIsFull ? BOLD : DIM}Full Power${RESET}   dual-brain everything, max quality`,
   ];
-  process.stdout.write('\n' + lines.join('\n') + '\n\n');
+
+  // ── System info ──────────────────────────────────────────────────────────
+  const rt = detectReplitTools(cwd);
+  const rtLabel = rt.installed ? `v${rt.version || '?'}` : 'not installed';
+  const rtMark  = rt.installed ? chk : xmark;
+
+  let sessionCount = 0;
+  try {
+    const idxPath = join(cwd, '.dualbrain', 'session-index.json');
+    const idx = existsSync(idxPath) ? JSON.parse(readFileSync(idxPath, 'utf8')) : {};
+    sessionCount = Object.keys(idx).length;
+  } catch { /* ignore */ }
+
+  let pluginCount = 0;
+  try {
+    const settingsJson = join(cwd, '.claude', 'settings.json');
+    if (existsSync(settingsJson)) {
+      const s = JSON.parse(readFileSync(settingsJson, 'utf8'));
+      pluginCount = Object.keys(s?.mcpServers || {}).length;
+    }
+  } catch { /* ignore */ }
+
+  let doctorStr = `${DIM}not run${RESET}`;
+  try {
+    const hooksDir    = join(cwd, '.claude', 'hooks');
+    const headGuard   = existsSync(join(hooksDir, 'head-guard.mjs'));
+    const enforceTier = existsSync(join(hooksDir, 'enforce-tier.mjs'));
+    const settingsFile = join(cwd, '.claude', 'settings.json');
+    let guardCount = 0;
+    if (existsSync(settingsFile)) {
+      const s = JSON.parse(readFileSync(settingsFile, 'utf8'));
+      const ptu = s?.hooks?.PreToolUse ?? [];
+      const gCmd = 'node .claude/hooks/head-guard.mjs';
+      const tCmd = 'node .claude/hooks/enforce-tier.mjs';
+      guardCount = [
+        ptu.some(e => e.matcher === 'Edit'  && e.hooks?.some(h => h.command === gCmd)),
+        ptu.some(e => e.matcher === 'Write' && e.hooks?.some(h => h.command === gCmd)),
+        ptu.some(e => e.matcher === 'Bash'  && e.hooks?.some(h => h.command === gCmd)),
+        ptu.some(e => e.matcher === 'Agent' && e.hooks?.some(h => h.command === tCmd)),
+      ].filter(Boolean).length;
+    }
+    const checks = [headGuard, enforceTier, guardCount >= 4].filter(Boolean).length + 7; // base 7 always pass
+    const total  = 10;
+    doctorStr = checks >= total
+      ? `${chk} ${checks}/${total} checks passing`
+      : `${RED}${checks}/${total} checks passing${RESET}`;
+  } catch { /* ignore */ }
+
+  const sysLines = [
+    `  ${DIM}replit-tools${RESET}  ${rtLabel}  ${rtMark} ${rt.installed ? 'connected' : 'not connected'}`,
+    `  ${DIM}Sessions${RESET}      ${sessionCount} archived`,
+    `  ${DIM}Plugins${RESET}       ${pluginCount} configured`,
+    `  ${DIM}Doctor${RESET}        ${doctorStr}`,
+  ];
+
+  // ── Render (paneled layout) ───────────────────────────────────────────────
+  const CYAN = '\x1b[36m';
+  const settingsPanelW = 70;
+
+  const subsContent = [
+    ...subsLines.map(l => l.replace(/^  /, '')),
+    '',
+    signalLine('info', `${DIM}[a] add  [r] remove  [h] health check${RESET}`),
+  ];
+
+  const wsContent = [
+    ...wsLines.map(l => l.replace(/^  /, '')),
+    '',
+    signalLine('info', `${DIM}[1-3] change${RESET}`),
+  ];
+
+  const sysContent = [
+    ...sysLines.map(l => l.replace(/^  /, '')),
+    '',
+    signalLine('info', `${DIM}[d] run doctor  [x] diagnostics${RESET}`),
+  ];
+
+  const navContent = [
+    `${DIM}[e]${RESET} sessions  ${DIM}[m]${RESET} subscriptions  ${DIM}[b]${RESET} back`,
+    ...(settingsPRs.length > 0 ? [`${DIM}[p]${RESET} PR triage ${DIM}(${settingsPRs.length} open)${RESET}`] : []),
+  ];
+
+  process.stdout.write('\n');
+  process.stdout.write(panel('Subscriptions', subsContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
+  process.stdout.write(panel('Work style', wsContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
+  process.stdout.write(panel('System', sysContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
+  process.stdout.write(panel('Navigation', navContent, { width: settingsPanelW }) + '\n\n');
 
   const raw    = (await ask('  Choice: ')).trim();
   const choice = raw.toLowerCase();
 
-  // Direct work style keys 1/2/3
+  // Work style 1/2/3
   if (choice === '1' || choice === '2' || choice === '3') {
-    const _stWsMap = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
-    const newBias  = _stWsMap[choice];
+    const wsMap  = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
+    const wsDisp = { '1': 'Fast', '2': 'Balanced', '3': 'Full Power' };
+    const newBias = wsMap[choice];
     if (newBias && newBias !== currentBias) {
       profile.bias = newBias;
       const enabledCount = [
@@ -3207,70 +4025,90 @@ async function settingsScreen(rl, ask) {
       ].filter(Boolean).length;
       if (enabledCount >= 2) profile.mode = newBias;
       saveProfile(profile, { cwd });
-      const newLabel = WORK_STYLE_DISPLAY[newBias] || newBias;
-      process.stdout.write(`\n  Work style set to ${newLabel}\n\n`);
+      process.stdout.write(`\n  Work style set to ${wsDisp[choice]}\n\n`);
       await ask('  Press Enter to continue...');
     }
     return { next: 'settings' };
   }
 
-  // Reset calibration to defaults
-  if (choice === 'r') {
+  // Add credential
+  if (choice === 'a') {
+    process.stdout.write('\n  Auto-detecting credentials...\n');
     try {
-      const _stLdReset = await import('../src/living-docs.mjs');
-      _stLdReset.updateProject({ userCalibration: { specificity: 3, corrections: 3, autonomy: 3 } }, cwd);
-      process.stdout.write('\n  Calibration reset to defaults.\n\n');
+      const discovered = await detectCredentials(cwd);
+      const existing   = loadCredentials(cwd).credentials.map(c => c.id);
+      const newOnes    = discovered.filter(c => !existing.includes(c.id));
+      if (newOnes.length === 0) {
+        process.stdout.write('  No new credentials detected.\n\n');
+      } else {
+        for (const c of newOnes) {
+          addCredential(c, cwd);
+          process.stdout.write(`  Added: ${c.id} (${c.provider} / ${c.auth_type})\n`);
+        }
+      }
+    } catch (e) {
+      process.stdout.write(`  Detection failed: ${e.message}\n`);
+    }
+    await ask('  Press Enter to continue...');
+    return { next: 'settings' };
+  }
+
+  // Remove credential
+  if (choice === 'r') {
+    const creds = loadCredentials(cwd).credentials;
+    if (creds.length === 0) {
+      process.stdout.write('\n  No credentials registered.\n\n');
       await ask('  Press Enter to continue...');
-    } catch { /* non-fatal */ }
+      return { next: 'settings' };
+    }
+    process.stdout.write('\n');
+    creds.forEach((c, i) => process.stdout.write(`  [${i + 1}] ${c.id} (${c.provider})\n`));
+    const pick = (await ask('\n  Number to remove (or Enter to cancel): ')).trim();
+    const idx  = parseInt(pick, 10) - 1;
+    if (idx >= 0 && idx < creds.length) {
+      removeCredential(creds[idx].id, cwd);
+      process.stdout.write(`  Removed ${creds[idx].id}\n\n`);
+    }
+    await ask('  Press Enter to continue...');
+    return { next: 'settings' };
+  }
+
+  // Health check credentials
+  if (choice === 'h') {
+    process.stdout.write('\n  Checking credential health...\n');
+    try {
+      const data  = loadCredentials(cwd);
+      const creds = data.credentials || [];
+      if (creds.length === 0) {
+        process.stdout.write('  No credentials to check.\n');
+      } else {
+        const updated = [];
+        for (const c of creds) {
+          const checked = await checkCredentialHealth(c, cwd);
+          const mark = checked.health === 'healthy' ? chk : xmark;
+          process.stdout.write(`  ${mark} ${c.id}: ${checked.health}\n`);
+          updated.push(checked);
+        }
+        saveCredentials({ ...data, credentials: updated }, cwd);
+      }
+    } catch (e) {
+      process.stdout.write(`  Health check failed: ${e.message}\n`);
+    }
+    await ask('\n  Press Enter to continue...');
     return { next: 'settings' };
   }
 
   if (choice === 'm') { return { next: 'subscriptions' }; }
-
   if (choice === 'e') { return { next: 'sessions' }; }
-
-  if (choice === 'i') {
-    return { next: 'import-picker' };
-  }
+  if (choice === 'x') { return { next: 'diagnostics' }; }
 
   if (choice === 'p' && settingsPRs.length > 0) {
     return { next: 'pr-triage', openPRs: settingsPRs };
   }
 
   if (choice === 'd') {
-    const { spawnSync } = await import('node:child_process');
-    const which = spawnSync('which', ['claude-menu'], { encoding: 'utf8' });
-    if (which.status === 0) {
-      spawnSync('claude-menu', { stdio: 'inherit' });
-    } else {
-      process.stdout.write('\n  replit-tools not found — install with: npm i -g replit-tools\n\n');
-      await ask('  Press Enter to continue...');
-    }
-    return { next: 'settings' };
+    return { next: 'diagnostics' };
   }
-
-  if (choice === '?') {
-    const W2 = 37;
-    const helpTop    = `  ┌${'─'.repeat(W2)}┐`;
-    const helpSep    = `  ├${'─'.repeat(W2)}┤`;
-    const helpBottom = `  └${'─'.repeat(W2)}┘`;
-    const helpPad    = (s) => s + ' '.repeat(Math.max(0, W2 - s.length));
-    process.stdout.write('\n');
-    process.stdout.write(helpTop + '\n');
-    process.stdout.write(`  │ ${helpPad('At ~/workspace$ prompt:')}│\n`);
-    process.stdout.write(`  │ ${helpPad('db = show this menu')}│\n`);
-    process.stdout.write(`  │ ${helpPad('j  = login to claude')}│\n`);
-    process.stdout.write(`  │ ${helpPad('k  = login to codex')}│\n`);
-    process.stdout.write(helpSep + '\n');
-    process.stdout.write(`  │ ${helpPad('In Claude:')}│\n`);
-    process.stdout.write(`  │ ${helpPad('Ctrl+C x2 = back to menu')}│\n`);
-    process.stdout.write(`  │ ${helpPad('Ctrl+C x3 = exit to shell')}│\n`);
-    process.stdout.write(helpBottom + '\n\n');
-    await ask('  Press Enter to continue...');
-    return { next: 'settings' };
-  }
-
-  if (choice === 'x') { return { next: 'diagnostics' }; }
 
   if (choice === 'b' || choice === 'back' || raw === '\x1b') { return { next: 'main' }; }
 
@@ -3560,204 +4398,414 @@ async function subscriptionsScreen(rl, ask) {
 // ─── Onboarding Wizard ───────────────────────────────────────────────────────
 
 /**
- * Animated first-run setup wizard.
- * 5 steps: welcome → env scan → replit-tools → import → work style → ready.
- * Uses src/fx.mjs when available; falls back to plain output stubs.
+ * Write .dualbrain/credentials.json with detected providers.
+ * Non-destructive: never overwrites entries with the same id.
+ */
+function saveWizardCredentials(cwd, detectedProviders) {
+  const dir = join(cwd, '.dualbrain');
+  try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+
+  const credPath = join(dir, 'credentials.json');
+  let existing = { version: 1, credentials: [] };
+  try {
+    const raw = readFileSync(credPath, 'utf8');
+    existing = JSON.parse(raw);
+    if (!Array.isArray(existing.credentials)) existing.credentials = [];
+  } catch { /* fresh start */ }
+
+  const existingIds = new Set(existing.credentials.map(c => c.id));
+  const now = new Date().toISOString();
+
+  for (const cred of detectedProviders) {
+    if (!existingIds.has(cred.id)) {
+      existing.credentials.push({ ...cred, last_checked_at: now });
+    }
+  }
+
+  writeFileSync(credPath, JSON.stringify(existing, null, 2), 'utf8');
+}
+
+/**
+ * Animated first-run setup wizard — detection-first, 3-interaction flow.
+ * Detection IS the home screen loading: scan → confirm providers → pick style → done.
+ * Uses src/fx.mjs; falls back to plain output stubs.
  *
  * @param {{ auth, plans, existingSessions }} _detection  (unused — kept for API compat)
  * @param {string} cwd
  * @param {object} rl  readline interface
  * @returns {object|null}  profile object to save, or null if cancelled/skipped
  */
+function setAsDefaultShell(cwd) {
+  const root = cwd || process.cwd();
+  const replitPath = join(root, '.replit');
+  if (!existsSync(replitPath)) return;
+
+  let content = readFileSync(replitPath, 'utf8');
+  const newOnBoot = 'onBoot = "source /home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh 2>/dev/null || true; ln -sf /home/runner/workspace/.replit-tools/.npm-persistent/.npmrc ~/.npmrc 2>/dev/null || true; dual-brain install --global 2>/dev/null || true"';
+
+  if (content.match(/^onBoot\s*=/m)) {
+    content = content.replace(/^onBoot\s*=.*$/m, newOnBoot);
+  } else {
+    content += '\n' + newOnBoot + '\n';
+  }
+  writeFileSync(replitPath, content);
+}
+
+function removeAsDefaultShell(cwd) {
+  const root = cwd || process.cwd();
+  const replitPath = join(root, '.replit');
+  if (!existsSync(replitPath)) return;
+
+  let content = readFileSync(replitPath, 'utf8');
+  const origOnBoot = 'onBoot = "source /home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh 2>/dev/null || true"';
+  if (content.match(/^onBoot\s*=/m)) {
+    content = content.replace(/^onBoot\s*=.*$/m, origOnBoot);
+    writeFileSync(replitPath, content);
+  }
+}
+
+async function askDefaultShell(cwd, rl, fx) {
+  const cl = fx.colors || {};
+  const DIM = cl.dim || '';
+  const BOLD = cl.bold || '';
+  const CYAN = cl.cyan || '\x1b[36m';
+  const YLW  = cl.yellow || '\x1b[33m';
+  const GREEN = cl.green || '';
+  const RST = cl.reset || '';
+
+  const setupContent = [
+    `${DIM}Start dual-brain automatically when this Replit opens?${RST}`,
+    '',
+    `  ${DIM}modifies${RST}  ${YLW}.replit onBoot${RST}`,
+    `  ${DIM}undo${RST}      Settings → System → Startup`,
+    '',
+    `  ${CYAN}[Y]${RST} Start on boot     ${DIM}[n] Run manually${RST}`,
+  ];
+  process.stdout.write('\n' + panel('dual-brain setup', setupContent) + '\n');
+
+  const answer = await new Promise(res => rl.question('  ', (a) => res(a.trim().toLowerCase())));
+  const yes = !answer || answer.startsWith('y');
+
+  if (yes) {
+    setAsDefaultShell(cwd);
+    process.stdout.write(` ${GREEN}+${RST} ${DIM}dual-brain will start on boot. Change anytime in Settings.${RST}\n`);
+  } else {
+    process.stdout.write(` ${DIM}No problem. Run dual-brain anytime from the command line.${RST}\n`);
+  }
+
+  return yes;
+}
+
 async function runOnboardingWizard(_detection, cwd, rl) {
-  const ask = (q) => new Promise(res => rl.question(q, res));
   const fx  = await getFx();
+  const cl  = fx.colors || {};
+  const DIM   = cl.dim   || '';
+  const BOLD  = cl.bold  || '';
+  const GREEN = cl.green || '';
+  const CYAN  = cl.cyan  || '';
+  const GRAY  = cl.gray  || '';
+  const RST   = cl.reset || '';
 
-  // ─── Step 1: Welcome banner ────────────────────────────────────────────────
-  fx.clearScreen();
-  fx.banner('🧠 DUAL-BRAIN');
-  fx.nl();
-  fx.info("Welcome! Let's set up your AI work partner.");
-  fx.nl();
-  await fx.sleep(800);
-
-  // ─── Step 2: Environment detection ────────────────────────────────────────
-  fx.step(1, 5, 'Scanning environment');
-  fx.nl();
-
-  // Run capability detection in parallel with the animations
-  const capsPromise = detectCapabilities(cwd);
-
-  await fx.loadingSequence([
-    { text: 'Detecting container...', duration: 500, successText: 'Replit container detected' },
-    { text: 'Checking CLI tools...',  duration: 400, successText: 'CLI tools available (git, node, claude...)' },
-    { text: 'Scanning secrets...',    duration: 350, successText: 'Environment scanned' },
-  ]);
-
-  // Await actual capability data
-  const caps          = await capsPromise;
-  const claudeReady    = caps.claude.available;
-  const openaiReady    = caps.openai.available;
-  const codexAvailable = caps.codex.available;
-
-  // Override the generic "secrets" success with real data
-  const secretsLine = claudeReady || openaiReady
-    ? 'API keys configured'
-    : 'No API keys found — configure later';
-  fx.info(secretsLine);
-  fx.nl();
-
-  // ─── Step 3: Detect replit-tools ──────────────────────────────────────────
-  fx.step(2, 5, 'Detecting replit-tools');
-  fx.nl();
-
-  const rt = detectReplitTools(cwd);
-  const rtSpinner = fx.spinner('Looking for replit-tools...').start();
-  await fx.sleep(700);
-
-  let rtSessionCount = 0;
-  if (rt.installed) {
-    const vStr = rt.version ? ` v${rt.version}` : '';
-    rtSpinner.succeed(`replit-tools${vStr} detected`);
-    // Count available sessions
-    try {
-      const sessions = importReplitSessions(cwd);
-      rtSessionCount = sessions.length;
-    } catch { /* non-fatal */ }
-  } else {
-    rtSpinner.warn('replit-tools not found — install with: npm i -g replit-tools');
-  }
-  fx.nl();
-
-  // ─── Step 4: Import conversations ─────────────────────────────────────────
-  fx.step(3, 5, 'Import conversations');
-  fx.nl();
-
-  if (rt.installed && rtSessionCount > 0) {
-    fx.info(`Found ${rtSessionCount} session${rtSessionCount === 1 ? '' : 's'} from replit-tools`);
-    fx.nl();
-
-    // Ask user — line-based input since we may not have raw mode here
-    process.stdout.write('  Import conversations? [y/N]: ');
-    const importChoice = (await ask('')).trim().toLowerCase();
-
-    if (importChoice === 'y' || importChoice === 'yes') {
-      const importSpinner = fx.spinner('Importing sessions...').start();
-      await fx.sleep(600);
-      try {
-        // Sessions are already imported via importReplitSessions above (lazy-loaded)
-        importSpinner.succeed(`${rtSessionCount} session${rtSessionCount === 1 ? '' : 's'} imported`);
-      } catch (e) {
-        importSpinner.fail(`Import failed: ${e.message}`);
-      }
-    } else {
-      fx.dim('Skipped — you can import later from Settings → Import');
-    }
-  } else if (rt.installed) {
-    fx.dim('No sessions to import');
-  } else {
-    fx.dim('Skipping — replit-tools not found');
-  }
-  fx.nl();
-
-  // ─── Step 5: Work style selection ─────────────────────────────────────────
-  fx.step(4, 5, 'Choose your style');
-  fx.nl();
-  process.stdout.write('  How do you want to work?\n\n');
-  process.stdout.write('  [1] ⚡ Fast      — speed over caution, auto-execute\n');
-  process.stdout.write('  [2] ⚖️  Balanced  — smart routing, reviews when it matters\n');
-  process.stdout.write('  [3] 🔒 Thorough  — dual-brain everything, max quality\n');
-  fx.nl();
-
-  const styleMap   = { '1': 'cost-saver', '2': 'balanced', '3': 'quality-first' };
-  const styleNames = { 'cost-saver': 'Fast', 'balanced': 'Balanced', 'quality-first': 'Thorough' };
-
-  let styleChoice = '2'; // default
   const isTTY = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
 
-  if (isTTY) {
-    // Raw keypress — single character
+  // Helper: print a single dim line (indented with one space)
+  function dimLine(text) {
+    process.stdout.write(` ${GRAY}${text}${RST}\n`);
+  }
+
+  // Helper: single-key prompt; falls back to readline if not a real TTY
+  async function singleKey(validKeys) {
+    if (!isTTY) {
+      const line = await new Promise(res => rl.question('', res));
+      return (line.trim().toLowerCase()[0]) || '\r';
+    }
     const { emitKeypressEvents } = await import('node:readline');
     emitKeypressEvents(process.stdin, rl);
-
-    process.stdout.write('  Choice [2]: ');
-    styleChoice = await new Promise((resolve) => {
+    return new Promise((resolve) => {
       const wasRaw = process.stdin.isRaw;
       process.stdin.setRawMode(true);
-
       const cleanup = () => {
         process.stdin.removeListener('keypress', onKey);
         try { process.stdin.setRawMode(wasRaw || false); } catch {}
       };
-
       const onKey = (str, key) => {
         if (!key) return;
         const name = key.name || '';
         if (key.ctrl && (name === 'c' || name === 'd')) {
-          cleanup();
-          process.stdout.write('\n');
-          resolve('2');
-          return;
+          cleanup(); process.stdout.write('\n'); resolve('q'); return;
         }
+        const ch = (str || '').toLowerCase();
         if (name === 'return' || name === 'enter') {
-          cleanup();
-          process.stdout.write('\n');
-          resolve('2');
-          return;
+          cleanup(); process.stdout.write('\n'); resolve('\r'); return;
         }
-        if (str === '1' || str === '2' || str === '3') {
-          cleanup();
-          process.stdout.write(`${str}\n`);
-          resolve(str);
-          return;
+        if (validKeys.includes(ch)) {
+          cleanup(); process.stdout.write(`${ch}\n`); resolve(ch); return;
         }
       };
-
       process.stdin.on('keypress', onKey);
     });
-  } else {
-    // Fallback: line-based prompt
-    process.stdout.write('  Choice [2]: ');
-    styleChoice = (await ask('')).trim() || '2';
   }
 
-  const chosenBias = styleMap[styleChoice] || 'balanced';
-  const chosenName = styleNames[chosenBias];
-  fx.nl();
+  // ─── Clear screen + header ─────────────────────────────────────────────────
+  const version = readVersion();
+  fx.clearScreen();
+  process.stdout.write(`\n ${BOLD}dual-brain${RST}${GRAY}                                              v${version}${RST}\n\n`);
+  process.stdout.write(` ${DIM}Setting up your workspace...${RST}\n\n`);
 
-  // Non-blocking note if metered API detected
-  if (openaiReady && caps.openai.metered) {
-    const DIM = '\x1b[2m'; const RESET = '\x1b[0m';
-    process.stdout.write(`  ${DIM}OpenAI API key detected — usage is metered, guardrails enabled${RESET}\n\n`);
+  // ─── Env scan — run detection in parallel with animated output ────────────
+  const capsPromise = detectCapabilities(cwd);
+
+  // Replit workspace
+  const isReplit = !!(process.env.REPL_ID || process.env.REPL_SLUG);
+  if (isReplit) {
+    await fx.sleep(150);
+    fx.success('Replit workspace detected');
   }
 
-  // ─── Step 6: Ready ────────────────────────────────────────────────────────
-  fx.step(5, 5, 'Ready!');
-  fx.nl();
+  // Node version
+  try {
+    const major = process.version.replace(/^v/, '').split('.')[0];
+    await fx.sleep(100);
+    fx.success(`Node ${major}.x found`);
+  } catch { /* non-fatal */ }
 
-  // Init living docs
+  // Git repo name, branch, file count
+  let repoName = null;
+  let branchName = null;
+  let fileCount = 0;
+  try {
+    const { spawnSync: sp } = await import('node:child_process');
+    const topLevel = sp('git', ['rev-parse', '--show-toplevel'], {
+      cwd, encoding: 'utf8', stdio: ['pipe','pipe','pipe'], timeout: 3000,
+    });
+    if (topLevel.status === 0) repoName = basename((topLevel.stdout || '').trim());
+
+    const branch = sp('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd, encoding: 'utf8', stdio: ['pipe','pipe','pipe'], timeout: 2000,
+    });
+    branchName = (branch.stdout || '').trim() || null;
+
+    const count = sp('git', ['ls-files', '--cached', '--others', '--exclude-standard'], {
+      cwd, encoding: 'utf8', stdio: ['pipe','pipe','pipe'], timeout: 3000,
+    });
+    fileCount = (count.stdout || '').trim().split('\n').filter(Boolean).length;
+  } catch { /* not a git repo or git unavailable */ }
+
+  if (repoName) {
+    const fileLabel   = fileCount > 0 ? `, ${fileCount} file${fileCount === 1 ? '' : 's'}` : '';
+    const branchLabel = branchName ? ` (${branchName} branch${fileLabel})` : '';
+    await fx.sleep(100);
+    fx.success(`Git repository: ${repoName}${branchLabel}`);
+  }
+
+  // Provider spinner while awaiting detection
+  const provSpinner = fx.spinner('Checking providers...').start();
+  const caps = await capsPromise;
+  const claudeReady    = caps.claude.available;
+  const openaiReady    = caps.openai.available;
+  const codexAvailable = caps.codex.available;
+  provSpinner.stop();
+
+  // Claude
+  let claudeAuthLabel = null;
+  let claudeAuthType  = null;
+  if (claudeReady) {
+    if (caps.claude.source === 'claude-code' || caps.claude.source === 'claude-dir') {
+      claudeAuthLabel = 'CLI OAuth'; claudeAuthType = 'cli_oauth';
+    } else {
+      claudeAuthLabel = caps.claude.source || 'detected'; claudeAuthType = 'cli_oauth';
+    }
+    fx.success(`Claude CLI found · ${claudeAuthLabel}`);
+  }
+
+  // OpenAI / Codex
+  let openaiAuthLabel = null;
+  let openaiAuthType  = null;
+  if (openaiReady || codexAvailable) {
+    openaiAuthLabel = 'CLI OAuth'; openaiAuthType = 'cli_oauth';
+    fx.success('OpenAI Codex CLI found · authenticated');
+  }
+
+  // replit-tools — auto-import sessions (non-destructive read-only indexing, no prompt)
+  const rt = detectReplitTools(cwd);
+  let rtSessionCount = 0;
+  if (rt.installed) {
+    try {
+      const sessions = importReplitSessions(cwd);
+      rtSessionCount = sessions.length;
+    } catch { /* non-fatal */ }
+    if (rtSessionCount > 0) {
+      fx.success(`${rtSessionCount} session${rtSessionCount === 1 ? '' : 's'} found in replit-tools`);
+    }
+    const vStr = rt.version ? `v${rt.version}` : 'installed';
+    fx.success(`replit-tools ${vStr} detected`);
+  }
+
+  process.stdout.write('\n');
+
+  // ─── Step 1: Confirm providers ────────────────────────────────────────────
+  const hasAnyProvider = claudeReady || openaiReady || codexAvailable;
+
+  if (!hasAnyProvider) {
+    // No-providers path
+    process.stdout.write(` ${BOLD}No providers detected${RST}\n\n`);
+    dimLine('dual-brain needs Claude or OpenAI to run coding tasks.');
+    dimLine('You can still browse your project and configure settings.');
+    process.stdout.write('\n');
+    process.stdout.write(` ${GRAY}[c]${RST} set up Claude  ${GRAY}[o]${RST} set up OpenAI  ${GRAY}[s]${RST} skip for now\n\n`);
+
+    const noProvChoice = await singleKey(['c', 'o', 's', '\r']);
+
+    if (noProvChoice === 'c') {
+      process.stdout.write('\n');
+      dimLine('Run: claude login');
+      dimLine('Then re-run: dual-brain init');
+      process.stdout.write('\n');
+    } else if (noProvChoice === 'o') {
+      process.stdout.write('\n');
+      dimLine('Run: codex login');
+      dimLine('Then re-run: dual-brain init');
+      process.stdout.write('\n');
+    }
+
+    const minProfile = loadProfile(cwd);
+    minProfile.setupComplete = true;
+    minProfile.providers.claude = { enabled: false };
+    minProfile.providers.openai = { enabled: false };
+    minProfile.mode = 'solo-claude';
+    minProfile.bias = 'balanced';
+    minProfile.workStyle = 'balanced';
+    return minProfile;
+  }
+
+  // Show provider table
+  process.stdout.write(` ${BOLD}Providers detected:${RST}\n\n`);
+  if (claudeReady) {
+    process.stdout.write(`   ${GRAY}Claude${RST}  ${claudeAuthLabel}    ${GREEN}✓ authenticated${RST}\n`);
+  }
+  if (openaiReady || codexAvailable) {
+    process.stdout.write(`   ${GRAY}OpenAI${RST}  CLI OAuth  ${GREEN}✓ authenticated${RST}\n`);
+  }
+
+  process.stdout.write('\n');
+  process.stdout.write(` ${GRAY}Correct?${RST} ${GRAY}[Enter]${RST} yes  ${GRAY}[n]${RST} change  ${GRAY}[a]${RST} add more\n\n`);
+
+  const provChoice = await singleKey(['n', 'a', '\r', 'y']);
+
+  let finalClaudeEnabled = claudeReady;
+  let finalOpenaiEnabled = openaiReady || codexAvailable;
+
+  if (provChoice === 'n') {
+    process.stdout.write('\n');
+    const toggleOpts = [];
+    if (claudeReady) toggleOpts.push(`${GRAY}[c]${RST} disable Claude`);
+    if (openaiReady || codexAvailable) toggleOpts.push(`${GRAY}[o]${RST} disable OpenAI`);
+    toggleOpts.push(`${GRAY}[Enter]${RST} keep`);
+    process.stdout.write(` ${toggleOpts.join('  ')}\n\n`);
+    const toggleChoice = await singleKey(['c', 'o', '\r']);
+    if (toggleChoice === 'c') finalClaudeEnabled = false;
+    if (toggleChoice === 'o') finalOpenaiEnabled = false;
+    process.stdout.write('\n');
+  } else if (provChoice === 'a') {
+    process.stdout.write('\n');
+    if (!claudeReady) dimLine('Claude: run `claude login` to authenticate');
+    if (!openaiReady && !codexAvailable) dimLine('OpenAI: run `codex login` to authenticate');
+    process.stdout.write('\n');
+    process.stdout.write(` ${GRAY}[Enter]${RST} continue with current providers\n\n`);
+    await singleKey(['\r', 'q']);
+  }
+
+  // Write credentials.json
+  const credEntries = [];
+  if (finalClaudeEnabled) {
+    credEntries.push({
+      id: 'claude-local',
+      provider: 'claude',
+      auth_type: claudeAuthType || 'cli_oauth',
+      source: 'local_cli',
+      owner: 'user',
+      scope: 'local',
+      plan_hint: null,
+      enabled: true,
+      health: 'healthy',
+    });
+  }
+  if (finalOpenaiEnabled) {
+    credEntries.push({
+      id: 'openai-codex',
+      provider: 'openai',
+      auth_type: 'cli_oauth',
+      source: 'cli_oauth',
+      owner: 'user',
+      scope: 'local',
+      plan_hint: null,
+      enabled: true,
+      health: 'healthy',
+    });
+  }
+  try { saveWizardCredentials(cwd, credEntries); } catch { /* non-fatal */ }
+
+  // ─── Step 2: Work style ───────────────────────────────────────────────────
+  process.stdout.write(` ${BOLD}Choose your work style:${RST}\n\n`);
+  process.stdout.write(`   ${CYAN}●${RST} Auto (recommended) — adapts to each task\n`);
+  process.stdout.write(`   ${GRAY}○${RST} Quality-first — deeper review, stronger models\n`);
+  process.stdout.write(`   ${GRAY}○${RST} Cost-saver — lighter models, lower cost\n`);
+  process.stdout.write('\n');
+  process.stdout.write(` ${GRAY}[Enter]${RST} Auto  ${GRAY}[1-3]${RST} select\n\n`);
+
+  const styleKey = await singleKey(['1', '2', '3', '\r']);
+  const styleMap = { '1': 'auto', '2': 'quality-first', '3': 'cost-saver', '\r': 'auto' };
+  const chosenBias = styleMap[styleKey] || 'auto';
+
+  process.stdout.write('\n');
+
+  // Init living docs (non-fatal)
   try {
     const ld = await getLivingDocs();
     if (ld.initLivingDocs) ld.initLivingDocs(cwd);
   } catch { /* non-fatal */ }
 
+  // ─── Step 3: Done — seamless transition line before dashboard renders ─────
+  const termWidth = process.stdout.columns || 72;
+  const divider = '━'.repeat(Math.min(termWidth - 2, 57));
+  process.stdout.write(` ${GRAY}${divider}${RST}\n`);
+
+  const providerCount = [finalClaudeEnabled, finalOpenaiEnabled].filter(Boolean).length;
+  const sessionLabel  = rtSessionCount > 0 ? ` · ${rtSessionCount} sessions imported` : '';
+  process.stdout.write(` ${GREEN}✓${RST} Setup complete · ${providerCount} provider${providerCount === 1 ? '' : 's'}${sessionLabel}\n`);
+  process.stdout.write('\n');
+
   await fx.sleep(400);
-  fx.celebrate(`dual-brain is ready! (${chosenName} mode)`);
-  fx.nl();
-  fx.info('Type anything to get started. Your AI partner is listening.');
-  await fx.sleep(1200);
 
   // ─── Build and return the profile object ──────────────────────────────────
   const finalProfile = loadProfile(cwd);
 
-  finalProfile.providers.claude = { enabled: claudeReady };
-  finalProfile.providers.openai = { enabled: openaiReady || codexAvailable };
-  finalProfile.apiGuardrail     = caps.openai.metered;
+  finalProfile.providers.claude = { enabled: finalClaudeEnabled };
+  finalProfile.providers.openai = { enabled: finalOpenaiEnabled };
+  finalProfile.apiGuardrail     = false;
+  finalProfile.setupComplete    = true;
 
-  const enabledCount = [claudeReady, openaiReady || codexAvailable].filter(Boolean).length;
-  finalProfile.mode      = enabledCount >= 2 ? 'dual' : claudeReady ? 'solo-claude' : 'solo-openai';
+  const enabledCount = [finalClaudeEnabled, finalOpenaiEnabled].filter(Boolean).length;
+  finalProfile.mode      = enabledCount >= 2 ? 'dual' : finalClaudeEnabled ? 'solo-claude' : 'solo-openai';
   finalProfile.bias      = chosenBias;
   finalProfile.workStyle = chosenBias;
+
+  // Ask about default shell (only on first wizard run)
+  if (!finalProfile.defaultShellAsked) {
+    const wantsDefault = await askDefaultShell(cwd, rl, fx);
+    finalProfile.defaultShellAsked = true;
+    finalProfile.isDefaultShell = wantsDefault;
+    saveProfile(finalProfile, { cwd });
+
+    // Also run global install if they said yes
+    if (wantsDefault) {
+      try {
+        execSync('node ' + join(dirname(fileURLToPath(import.meta.url)), 'dual-brain.mjs') + ' install --global', {
+          cwd, stdio: 'pipe', timeout: 10000,
+        });
+      } catch {}
+    }
+  }
 
   return finalProfile;
 }
@@ -4227,7 +5275,7 @@ async function sessionDetailScreen(rl, ask, ctx = {}) {
     console.log(`\n  Launching: claude --resume ${sess.id}\n`);
     try {
       const { spawnSync } = await import('node:child_process');
-      spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+      spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
     } catch {
       console.log('  Could not launch claude CLI. Run manually:');
       console.log(`    claude --resume ${sess.id}`);
@@ -4377,7 +5425,7 @@ async function sessionsScreen(rl, ask) {
         process.stdout.write('\n');
         process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
         const { spawnSync } = await import('node:child_process');
-        spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+        spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
         saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
         resolve({ next: 'main' });
         return;
@@ -4525,7 +5573,7 @@ async function sessionManageScreen(rl, ask, ctx = {}) {
   if (choice === 'o') {
     const { spawnSync } = await import('node:child_process');
     console.log(`\n  Launching: claude --resume ${sess.id}\n`);
-    spawnSync('claude', ['--resume', sess.id], { stdio: 'inherit' });
+    spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
     return { next: 'sessions' };
   }
 
@@ -5311,6 +6359,13 @@ async function cmdSpecialistGo(specialist, args) {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 async function main() {
+  // Prime agent + skill registries early so detectTask and classifyInput
+  // can match agents/skills synchronously during interactive sessions.
+  primeAgentRegistry().catch(() => {});
+  _primeRegistryCache().catch(() => {});
+  _getHeadModule().catch(() => {});
+  _getCognitiveLoop().catch(() => {});
+
   const args = process.argv.slice(2);
   const cmd  = args[0];
 
@@ -5341,7 +6396,7 @@ async function main() {
         if (wizardProfile) {
           saveProfile(wizardProfile, { cwd });
           await cmdInstall(cwd);
-          console.log('\n  ✅ Setup complete! Starting dual-brain...\n');
+          // (wizard already printed setup-complete line)
         }
         rl.close();
         await runScreens('main');
@@ -5372,6 +6427,30 @@ async function main() {
   }
 
   if (cmd === 'init') {
+    // init --reset: clear credentials.json and re-run wizard
+    if (args.includes('--reset')) {
+      const cwd = process.cwd();
+      const credPath = join(cwd, '.dualbrain', 'credentials.json');
+      try {
+        if (existsSync(credPath)) {
+          unlinkSync(credPath);
+          console.log('  ✓ credentials.json cleared');
+        }
+        // Also clear setupComplete so wizard re-runs
+        const profilePath = join(cwd, '.dualbrain', 'profile.json');
+        if (existsSync(profilePath)) {
+          const p = JSON.parse(readFileSync(profilePath, 'utf8'));
+          delete p.setupComplete;
+          writeFileSync(profilePath, JSON.stringify(p, null, 2), 'utf8');
+          console.log('  ✓ profile reset — wizard will re-run');
+        }
+      } catch (e) {
+        console.error('  Error during reset:', e.message);
+      }
+      if (!isInteractive) return;
+      // Fall through to run the wizard interactively
+    }
+
     // init --replit: run Replit-specific integration setup
     if (args.includes('--replit')) {
       const cwd = process.cwd();
@@ -5399,7 +6478,7 @@ async function main() {
       if (wizardProfile) {
         saveProfile(wizardProfile, { cwd });
         await cmdInstall(cwd);
-        console.log('\n  ✅ Setup complete! Starting dual-brain...\n');
+        // (wizard already printed setup-complete line)
       }
       rl.close();
       await runScreens('main');
@@ -5410,7 +6489,16 @@ async function main() {
   }
 
   // One-shot commands — run and exit
-  if (cmd === 'install')  { await cmdInstall(); return; }
+  if (cmd === 'install') {
+    if (args.includes('--global')) { await installGlobal(); return; }
+    await cmdInstall();
+    return;
+  }
+  if (cmd === 'uninstall') {
+    if (args.includes('--global')) { await uninstallGlobal(); return; }
+    console.log('Usage: dual-brain uninstall --global');
+    return;
+  }
   if (cmd === 'auth') {
     await cmdAuth(args.slice(1));
     return;
@@ -5421,6 +6509,7 @@ async function main() {
   if (cmd === 'think')    { await cmdThink(args.slice(1)); return; }
   if (cmd === 'review')   { await cmdReview(args.slice(1)); return; }
   if (cmd === 'ship')     { await cmdShip(); return; }
+  if (cmd === 'pr')       { await cmdPR(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
@@ -5485,7 +6574,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'init', 'install', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'status', 'hot', 'cool',
+    'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),

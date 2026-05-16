@@ -15,7 +15,7 @@
  *   getHeadModel(profile)          → suggested head model string
  *   detectCapabilities(cwd)        → what we can actually verify
  *   getOnboardingMessage(caps, ws) → honest 2-3 line status message
- *   needsApiGuardrail(caps)        → true if metered API key detected
+ *   detectCapabilities(cwd)        → available providers (subscription-based only)
  *
  * CLI:
  *   node src/profile.mjs                  # show current profile
@@ -26,7 +26,7 @@
  */
 
 import { createInterface } from 'readline';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { execSync } from 'child_process';
@@ -136,7 +136,7 @@ function detectEnvironment() {
  * @param {string} [cwd]
  * @returns {Promise<{
  *   claude:       { available: boolean, source: string|null },
- *   openai:       { available: boolean, source: string|null, metered: boolean },
+ *   openai:       { available: boolean, source: string|null },
  *   codex:        { available: boolean, source: string|null },
  *   replitTools:  { available: boolean, checkpoints: boolean },
  * }>}
@@ -144,18 +144,15 @@ function detectEnvironment() {
 async function detectCapabilities(cwd) {
   const root = cwd || process.cwd();
 
-  // --- Claude: running inside Claude Code or has ANTHROPIC_API_KEY or ~/.claude dir ---
+  // --- Claude: running inside Claude Code session or CLI installed ---
   let claudeAvailable = false;
   let claudeSource = null;
 
   if (process.env.CLAUDE_CODE) {
     claudeAvailable = true;
     claudeSource = 'claude-code';
-  } else if (process.env.ANTHROPIC_API_KEY) {
-    claudeAvailable = true;
-    claudeSource = 'env-key';
   } else {
-    // Check for ~/.claude directory (Claude Code installation)
+    // Check for ~/.claude directory (Claude Code installation) or Replit Claude
     const claudeDir = join(homedir(), '.claude');
     const replitClaudeDir = join(root, '.replit-tools', '.claude-persistent');
     if (existsSync(claudeDir) || existsSync(replitClaudeDir)) {
@@ -163,10 +160,6 @@ async function detectCapabilities(cwd) {
       claudeSource = existsSync(replitClaudeDir) ? 'claude-code' : 'claude-dir';
     }
   }
-
-  // --- OpenAI: check for OPENAI_API_KEY (metered billing) ---
-  const openaiKey = process.env.OPENAI_API_KEY;
-  const openaiAvailable = !!(openaiKey && openaiKey.length > 0);
 
   // --- Codex: check if 'codex' is in PATH ---
   let codexAvailable = false;
@@ -195,15 +188,79 @@ async function detectCapabilities(cwd) {
   const checkpointsBin = existsSync(join(replitToolsDir, 'checkpoints'))
     || existsSync('/usr/local/bin/replit-checkpoint');
 
+  // --- MCP servers: check Claude settings files ---
+  let mcpServers = [];
+  try {
+    const claudeSettings = join(homedir(), '.claude', 'settings.json');
+    if (existsSync(claudeSettings)) {
+      const settings = JSON.parse(readFileSync(claudeSettings, 'utf8'));
+      if (settings.mcpServers) {
+        mcpServers = Object.keys(settings.mcpServers);
+      }
+    }
+    // Also check project-local
+    const localSettings = join(root, '.claude', 'settings.json');
+    if (existsSync(localSettings)) {
+      const local = JSON.parse(readFileSync(localSettings, 'utf8'));
+      if (local.mcpServers) {
+        mcpServers.push(...Object.keys(local.mcpServers));
+      }
+    }
+  } catch {}
+
+  // --- Claude plugins: check installed plugin marketplaces ---
+  let claudePlugins = [];
+  try {
+    const pluginDir = join(root, '.replit-tools', '.claude-persistent', 'plugins', 'marketplaces');
+    if (existsSync(pluginDir)) {
+      const marketplaces = readdirSync(pluginDir);
+      for (const m of marketplaces) {
+        const mDir = join(pluginDir, m, 'plugins');
+        if (existsSync(mDir)) {
+          claudePlugins.push(...readdirSync(mDir));
+        }
+      }
+    }
+  } catch {}
+
+  // --- Codex plugins: check available plugins ---
+  let codexPlugins = [];
+  try {
+    const pluginDir = join(root, '.replit-tools', '.codex-persistent', '.tmp', 'plugins', 'plugins');
+    if (existsSync(pluginDir)) {
+      codexPlugins = readdirSync(pluginDir).filter(f => !f.startsWith('.'));
+    }
+  } catch {}
+
+  // --- Shell snapshots: count .sh files ---
+  let shellSnapshots = 0;
+  try {
+    const snapDir = join(root, '.replit-tools', '.claude-persistent', 'shell-snapshots');
+    if (existsSync(snapDir)) {
+      shellSnapshots = readdirSync(snapDir).filter(f => f.endsWith('.sh')).length;
+    }
+  } catch {}
+
+  // --- Configured hooks: count by type from settings.local.json ---
+  let configuredHooks = { PreToolUse: 0, PostToolUse: 0, Stop: 0, Notification: 0 };
+  try {
+    const localSettings = join(root, '.claude', 'settings.local.json');
+    if (existsSync(localSettings)) {
+      const s = JSON.parse(readFileSync(localSettings, 'utf8'));
+      for (const hookType of Object.keys(configuredHooks)) {
+        configuredHooks[hookType] = s.hooks?.[hookType]?.length || 0;
+      }
+    }
+  } catch {}
+
   return {
     claude: {
       available: claudeAvailable,
       source: claudeSource,
     },
     openai: {
-      available: openaiAvailable,
-      source: openaiAvailable ? 'env-key' : null,
-      metered: openaiAvailable, // API key = metered billing
+      available: codexAvailable,
+      source: codexAvailable ? 'codex-cli' : null,
     },
     codex: {
       available: codexAvailable,
@@ -213,19 +270,12 @@ async function detectCapabilities(cwd) {
       available: replitToolsAvailable,
       checkpoints: checkpointsBin,
     },
+    mcpServers,
+    claudePlugins,
+    codexPlugins,
+    shellSnapshots,
+    configuredHooks,
   };
-}
-
-/**
- * Return true if any metered API key is detected.
- * When true, the system defaults to conservative API usage and should
- * confirm before expensive operations.
- *
- * @param {ReturnType<typeof detectCapabilities> extends Promise<infer T> ? T : never} capabilities
- * @returns {boolean}
- */
-function needsApiGuardrail(capabilities) {
-  return !!(capabilities?.openai?.metered);
 }
 
 /**
@@ -238,9 +288,8 @@ function needsApiGuardrail(capabilities) {
  */
 function getOnboardingMessage(capabilities, workStyle = 'balanced') {
   const found = [];
-  if (capabilities?.claude?.available)  found.push('Claude Code');
-  if (capabilities?.openai?.available)  found.push('OpenAI API');
-  if (capabilities?.codex?.available && !capabilities?.openai?.available) found.push('Codex CLI');
+  if (capabilities?.claude?.available)  found.push('Claude · subscription');
+  if (capabilities?.codex?.available)   found.push('OpenAI · Codex subscription');
 
   const styleLabels = {
     'balanced':      'Balanced — smart routing, reviews on important changes',
@@ -252,21 +301,16 @@ function getOnboardingMessage(capabilities, workStyle = 'balanced') {
   const lines = [];
   if (found.length === 0) {
     lines.push('No providers detected');
-    lines.push('  Set ANTHROPIC_API_KEY or install Claude Code to get started');
+    lines.push('  Run: claude login   or install Claude Code to get started');
     return lines.join('\n');
   }
 
   lines.push(`Found: ${found.join(', ')}`);
   lines.push(`  Mode: ${modeLabel}`);
 
-  // Tip: suggest OpenAI if only Claude is available
-  if (capabilities?.claude?.available && !capabilities?.openai?.available && !capabilities?.codex?.available) {
-    lines.push('  Tip: Add OPENAI_API_KEY for dual-brain collaboration');
-  }
-
-  // Warn about metered billing
-  if (capabilities?.openai?.metered) {
-    lines.push('  Note: OpenAI API key detected — usage is metered, guardrails enabled');
+  // Tip: suggest Codex if only Claude is available
+  if (capabilities?.claude?.available && !capabilities?.codex?.available) {
+    lines.push('  Tip: Run codex login for dual-brain collaboration');
   }
 
   return lines.join('\n');
@@ -394,9 +438,8 @@ async function runOnboarding(opts = {}) {
 
     // Show what we found honestly
     const foundProviders = [];
-    if (capabilities.claude.available)  foundProviders.push('Claude Code');
-    if (capabilities.openai.available)  foundProviders.push('OpenAI API (metered)');
-    if (capabilities.codex.available && !capabilities.openai.available) foundProviders.push('Codex CLI');
+    if (capabilities.claude.available)  foundProviders.push('Claude · subscription');
+    if (capabilities.codex.available)   foundProviders.push('OpenAI · Codex subscription');
 
     if (foundProviders.length > 0) {
       process.stdout.write(`Detected: ${foundProviders.join(', ')}\n\n`);
@@ -406,15 +449,14 @@ async function runOnboarding(opts = {}) {
 
     // Enable providers based on what's available
     profile.providers.claude.enabled = capabilities.claude.available;
-    profile.providers.openai.enabled = capabilities.openai.available || capabilities.codex.available;
-    profile.apiGuardrail = needsApiGuardrail(capabilities);
+    profile.providers.openai.enabled = capabilities.codex.available;
 
     // If detection missed something, ask
-    if (!capabilities.claude.available && !capabilities.openai.available && !capabilities.codex.available) {
-      const q1 = (await ask('Which AI providers do you have access to?\n  (1) Claude Code only  (2) OpenAI API only  (3) Both  (4) Neither\n> ')).trim();
+    if (!capabilities.claude.available && !capabilities.codex.available) {
+      const q1 = (await ask('Which AI providers do you have access to?\n  (1) Claude only  (2) OpenAI Codex only  (3) Both  (4) Neither\n> ')).trim();
       if (q1 === '1') { profile.providers.claude.enabled = true; }
-      else if (q1 === '2') { profile.providers.claude.enabled = false; profile.providers.openai.enabled = true; profile.apiGuardrail = true; }
-      else if (q1 === '3') { profile.providers.claude.enabled = true; profile.providers.openai.enabled = true; profile.apiGuardrail = true; }
+      else if (q1 === '2') { profile.providers.claude.enabled = false; profile.providers.openai.enabled = true; }
+      else if (q1 === '3') { profile.providers.claude.enabled = true; profile.providers.openai.enabled = true; }
     }
 
     const q3 = (await ask('\nDefault work style?\n  (1) Save usage  (2) Balanced  (3) Best quality\n> ')).trim();
@@ -547,19 +589,16 @@ async function autoSetup(cwd) {
     result.actions.push(`Claude: available (${capabilities.claude.source})`);
   } else {
     profile.providers.claude.enabled = false;
-    result.warnings.push('Claude not detected — install Claude Code or set ANTHROPIC_API_KEY');
+    result.warnings.push('Claude not detected — run: claude login');
   }
 
   // OpenAI / Codex
-  if (capabilities.openai.available) {
+  if (capabilities.codex.available) {
     profile.providers.openai.enabled = true;
-    result.actions.push('OpenAI: API key detected (metered billing — guardrails enabled)');
-  } else if (capabilities.codex.available) {
-    profile.providers.openai.enabled = true;
-    result.actions.push('Codex CLI: available');
+    result.actions.push('Codex CLI: available (subscription)');
   } else {
     profile.providers.openai.enabled = false;
-    result.warnings.push('OpenAI not detected — add OPENAI_API_KEY or install Codex CLI');
+    result.warnings.push('OpenAI not detected — run: codex login');
   }
 
   // Mode
@@ -569,7 +608,6 @@ async function autoSetup(cwd) {
     : 'solo-openai';
   profile.bias = 'balanced';
   profile.workStyle = 'balanced';
-  profile.apiGuardrail = needsApiGuardrail(capabilities);
   profile.capabilities = capabilities;
   profile.detectedAt = new Date().toISOString();
 
@@ -815,6 +853,172 @@ function listSubscriptions(cwd) {
 }
 
 // ---------------------------------------------------------------------------
+// Credential Registry
+// ---------------------------------------------------------------------------
+
+const credentialsPath = (cwd) => join(cwd || process.cwd(), '.dualbrain', 'credentials.json');
+
+function defaultCredentials() {
+  return { version: 1, credentials: [] };
+}
+
+export function loadCredentials(cwd = process.cwd()) {
+  try {
+    const p = credentialsPath(cwd);
+    if (!existsSync(p)) return defaultCredentials();
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return defaultCredentials();
+  }
+}
+
+export function saveCredentials(data, cwd = process.cwd()) {
+  try {
+    const p = credentialsPath(cwd);
+    const dir = p.slice(0, p.lastIndexOf('/'));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    // Ensure no raw secret values are stored
+    const safe = {
+      ...data,
+      credentials: (data.credentials || []).map(c => {
+        const clean = { ...c };
+        delete clean.secret;
+        delete clean.token;
+        delete clean.api_key;
+        delete clean.password;
+        return clean;
+      }),
+    };
+    const tmp = p + '.tmp.' + process.pid;
+    writeFileSync(tmp, JSON.stringify(safe, null, 2) + '\n');
+    renameSync(tmp, p);
+    return p;
+  } catch { /* non-fatal */ }
+}
+
+export function addCredential(cred, cwd = process.cwd()) {
+  const required = ['id', 'provider', 'auth_type', 'source'];
+  for (const f of required) {
+    if (!cred[f]) throw new Error(`addCredential: missing required field '${f}'`);
+  }
+  const data = loadCredentials(cwd);
+  const idx = data.credentials.findIndex(c => c.id === cred.id);
+  const entry = {
+    id: cred.id,
+    provider: cred.provider,
+    auth_type: cred.auth_type,
+    source: cred.source,
+    owner: cred.owner || 'user',
+    scope: cred.scope || 'local',
+    plan_hint: cred.plan_hint || null,
+    enabled: cred.enabled !== false,
+    health: cred.health || 'unknown',
+    last_checked_at: cred.last_checked_at || null,
+  };
+  if (idx >= 0) data.credentials[idx] = entry;
+  else data.credentials.push(entry);
+  saveCredentials(data, cwd);
+  return entry;
+}
+
+export function removeCredential(id, cwd = process.cwd()) {
+  const data = loadCredentials(cwd);
+  data.credentials = data.credentials.filter(c => c.id !== id);
+  saveCredentials(data, cwd);
+}
+
+export function getHealthyCredentials(provider = null, cwd = process.cwd()) {
+  const data = loadCredentials(cwd);
+  return data.credentials.filter(c =>
+    c.enabled !== false &&
+    c.health !== 'unhealthy' &&
+    (provider === null || c.provider === provider)
+  );
+}
+
+export async function checkCredentialHealth(cred, cwd = process.cwd()) {
+  let health = 'unknown';
+  try {
+    if (cred.auth_type === 'cli_oauth') {
+      try { execSync('claude --version', { stdio: 'pipe', timeout: 3000 }); } catch { return { ...cred, health: 'unhealthy', last_checked_at: new Date().toISOString() }; }
+      try {
+        const { getAuthStatus } = await import('./replit.mjs');
+        const status = getAuthStatus(cwd);
+        health = (status.available && status.tokenStatus !== 'expired') ? 'healthy' : 'degraded';
+      } catch {
+        health = 'healthy'; // cli works, auth check unavailable
+      }
+    }
+  } catch { health = 'unknown'; }
+  return { ...cred, health, last_checked_at: new Date().toISOString() };
+}
+
+export async function detectCredentials(cwd = process.cwd()) {
+  const found = [];
+
+  // Claude CLI / oauth
+  const claudeDir       = join(homedir(), '.claude');
+  const replitClaudeDir = join(cwd, '.replit-tools', '.claude-persistent');
+  const claudeAvail = process.env.CLAUDE_CODE || existsSync(claudeDir) || existsSync(replitClaudeDir);
+  if (claudeAvail) {
+    let health = 'unknown';
+    try { execSync('claude --version', { stdio: 'pipe', timeout: 3000 }); health = 'healthy'; } catch { health = 'degraded'; }
+    found.push({
+      id: 'claude-local-user',
+      provider: 'claude',
+      auth_type: 'cli_oauth',
+      source: 'local_cli',
+      owner: 'user',
+      scope: 'local',
+      plan_hint: null,
+      enabled: true,
+      health,
+      last_checked_at: new Date().toISOString(),
+    });
+  }
+
+  // Codex CLI (subscription-based OpenAI access)
+  try {
+    execSync('which codex', { stdio: 'pipe', timeout: 2000 });
+    let codexHealth = 'unknown';
+    try { execSync('codex --version', { stdio: 'pipe', timeout: 3000 }); codexHealth = 'healthy'; } catch { codexHealth = 'degraded'; }
+    found.push({
+      id: 'openai-codex-cli',
+      provider: 'openai',
+      auth_type: 'cli_oauth',
+      source: 'local_cli',
+      owner: 'user',
+      scope: 'local',
+      plan_hint: null,
+      enabled: true,
+      health: codexHealth,
+      last_checked_at: new Date().toISOString(),
+    });
+  } catch { /* codex not in PATH */ }
+
+  return found;
+}
+
+export function getCredentialSummary(cwd = process.cwd()) {
+  const data = loadCredentials(cwd);
+  const creds = data.credentials || [];
+  const byProvider = { claude: 0, openai: 0 };
+  let healthy = 0, degraded = 0;
+  for (const c of creds) {
+    if (c.enabled === false) continue;
+    if (byProvider[c.provider] !== undefined) byProvider[c.provider]++;
+    if (c.health === 'healthy') healthy++;
+    else if (c.health === 'degraded' || c.health === 'unknown') degraded++;
+  }
+  const total = creds.filter(c => c.enabled !== false).length;
+  let teamCapacity = 'none';
+  if (healthy >= 4) teamCapacity = 'high';
+  else if (healthy >= 2) teamCapacity = 'medium';
+  else if (healthy >= 1) teamCapacity = 'low';
+  return { total, byProvider, healthy, degraded, teamCapacity };
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -864,6 +1068,9 @@ export async function getCapabilityManifest(cwd = process.cwd()) {
     return 'unknown';
   }
 
+  // ── Environment capabilities (MCP, plugins, hooks, snapshots) ─────────
+  const envCaps = await detectCapabilities(cwd);
+
   // ── Health states ──────────────────────────────────────────────────────
   let healthStates = {};
   try {
@@ -894,18 +1101,22 @@ export async function getCapabilityManifest(cwd = process.cwd()) {
     return { pressure5h: pressure, pressure7d: pressure * 0.6 };
   }
 
+  // ── Credential registry (when available, overrides detection) ─────────
+  const _credData = loadCredentials(cwd);
+  const _hasCreds = _credData.credentials && _credData.credentials.length > 0;
+
   // ── Claude provider ────────────────────────────────────────────────────
   const claudeProvider = { available: false, authenticated: false, plan: 'unknown',
     models: ['opus', 'sonnet', 'haiku'], health: 'healthy',
     budget: { pressure5h: 0, pressure7d: 0 }, source: 'none' };
 
   try {
-    // available: claude CLI or CLAUDE_CODE env or replit-tools claude dir
+    // available: CLAUDE_CODE env, claude CLI, or replit-tools claude dir
     const claudeDir       = join(homedir(), '.claude');
     const replitClaudeDir = join(cwd, '.replit-tools', '.claude-persistent');
-    if (process.env.CLAUDE_CODE || process.env.ANTHROPIC_API_KEY) {
+    if (process.env.CLAUDE_CODE) {
       claudeProvider.available = true;
-      claudeProvider.source    = process.env.ANTHROPIC_API_KEY ? 'env' : 'credentials';
+      claudeProvider.source    = 'credentials';
     } else if (existsSync(claudeDir) || existsSync(replitClaudeDir)) {
       claudeProvider.available = true;
       claudeProvider.source    = existsSync(replitClaudeDir) ? 'replit-tools' : 'credentials';
@@ -924,26 +1135,51 @@ export async function getCapabilityManifest(cwd = process.cwd()) {
   claudeProvider.health = claudeProvider.authenticated ? deriveHealth('claude') : 'down';
   claudeProvider.budget = deriveBudget('claude');
 
+  // Override with registry data when credentials.json exists
+  if (_hasCreds) {
+    const claudeCreds = _credData.credentials.filter(c => c.provider === 'claude' && c.enabled !== false);
+    if (claudeCreds.length > 0) {
+      claudeProvider.available    = true;
+      claudeProvider.authenticated = claudeCreds.some(c => c.health === 'healthy');
+      claudeProvider.health = claudeCreds.some(c => c.health === 'healthy') ? deriveHealth('claude')
+        : claudeCreds.some(c => c.health === 'degraded') ? 'degraded' : 'down';
+      const planHint = claudeCreds.find(c => c.plan_hint)?.plan_hint;
+      if (planHint) claudeProvider.plan = normalizePlan(planHint);
+      claudeProvider.source = claudeCreds[0].source;
+    }
+  }
+
   // ── OpenAI provider ────────────────────────────────────────────────────
   const openaiProvider = { available: false, authenticated: false, plan: 'unknown',
     models: ['gpt-5.5', 'o3', 'gpt-4o', 'gpt-4o-mini'], health: 'healthy',
     budget: { pressure5h: 0, pressure7d: 0 }, source: 'none' };
 
   try {
-    let hasSecret = false;
-    try { const { hasSecret: hs } = await import('./replit.mjs'); hasSecret = hs('OPENAI_API_KEY'); } catch { hasSecret = !!(process.env.OPENAI_API_KEY); }
-
     let codexAvailable = false;
     try { execSync('which codex', { stdio: 'pipe', timeout: 2000 }); codexAvailable = true; } catch { /* not in PATH */ }
 
-    openaiProvider.available      = hasSecret || codexAvailable;
-    openaiProvider.authenticated  = hasSecret;
-    openaiProvider.source         = hasSecret ? 'env' : codexAvailable ? 'codex-config' : 'none';
+    openaiProvider.available      = codexAvailable;
+    openaiProvider.authenticated  = codexAvailable;
+    openaiProvider.source         = codexAvailable ? 'codex-cli' : 'none';
   } catch { /* detection failed */ }
 
   openaiProvider.plan   = normalizePlan(orchProv.openai?.subscription ?? orchSubs.openai?.plan);
   openaiProvider.health = openaiProvider.authenticated ? deriveHealth('openai') : 'down';
   openaiProvider.budget = deriveBudget('openai');
+
+  // Override with registry data when credentials.json exists
+  if (_hasCreds) {
+    const openaiCreds = _credData.credentials.filter(c => c.provider === 'openai' && c.enabled !== false);
+    if (openaiCreds.length > 0) {
+      openaiProvider.available    = true;
+      openaiProvider.authenticated = openaiCreds.some(c => c.health === 'healthy');
+      openaiProvider.health = openaiCreds.some(c => c.health === 'healthy') ? deriveHealth('openai')
+        : openaiCreds.some(c => c.health === 'degraded') ? 'degraded' : 'down';
+      const planHint = openaiCreds.find(c => c.plan_hint)?.plan_hint;
+      if (planHint) openaiProvider.plan = normalizePlan(planHint);
+      openaiProvider.source = openaiCreds[0].source;
+    }
+  }
 
   // ── Preferences ────────────────────────────────────────────────────────
   let preferences = { bias: 'auto', forbiddenModels: [], preferredModels: [],
@@ -994,6 +1230,14 @@ export async function getCapabilityManifest(cwd = process.cwd()) {
       hasAnyProvider,
       recommendedAction,
       zeroProviderMode: !hasAnyProvider,
+    },
+    environment: {
+      mcpServers:      envCaps.mcpServers,
+      claudePlugins:   envCaps.claudePlugins,
+      codexPlugins:    envCaps.codexPlugins,
+      shellSnapshots:  envCaps.shellSnapshots,
+      configuredHooks: envCaps.configuredHooks,
+      replitTools:     envCaps.replitTools,
     },
     timestamp: new Date().toISOString(),
   };
@@ -1139,7 +1383,7 @@ async function main() {
     `head model : ${getHeadModel(profile)}`,
     `providers  : ${providers.map(p => p.name).join(', ') || 'none'}`,
     `prefs      : ${profile.preferences?.filter(p => p.enabled).length || 0} active`,
-    `guardrail  : ${needsApiGuardrail(caps) ? 'enabled (metered API key detected)' : 'off'}`,
+    `guardrail  : off`,
     '',
     getOnboardingMessage(caps, profile.workStyle || profile.bias),
   ].forEach(l => process.stdout.write(l + '\n'));
@@ -1156,11 +1400,12 @@ export {
   loadProfile, saveProfile, ensureProfile, runOnboarding,
   rememberPreference, forgetPreference, getActivePreferences,
   getAvailableProviders, isSoloBrain, getHeadModel,
-  detectCapabilities, getOnboardingMessage, needsApiGuardrail,
+  detectCapabilities, getOnboardingMessage,
   syncPreferencesToMemory,
   detectAuth, detectEnvironment,
   autoSetup, autoRefreshToken,
   // backward-compat stubs (deprecated)
   detectExistingAuth, detectPlans, saveSubscription, listSubscriptions,
   defaultProfile,
+  // credential registry (functions already exported inline above)
 };

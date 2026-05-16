@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 import { markHot, markDegraded, markHealthy, recordDispatch } from './health.mjs';
 import { redact } from './redact.mjs';
 import { getFailoverOrder } from './decide.mjs';
+import { getTemplate, renderPrompt, quickRender } from './templates.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
@@ -345,7 +346,6 @@ async function detectRuntime() {
     claudeAvailable && codexAvailable ? 'claude-code'
     : claudeAvailable                 ? 'claude-code'
     : codexAvailable                  ? 'codex-cli'
-    : process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY ? 'standalone'
     : 'none';
 
   _runtimeCache = { claudeAvailable, codexAvailable, runtime };
@@ -528,6 +528,60 @@ function getRetryBudget() {
   };
 }
 
+// ─── Preflight auth check ─────────────────────────────────────────────────────
+
+/**
+ * Verify a provider CLI is present and (optionally) responds to --version.
+ * Uses `which` for the fast path and a 3s-capped --version call to confirm.
+ *
+ * @param {'claude'|'openai'} provider
+ * @param {string} [cwd]  Working directory (unused, kept for signature parity)
+ * @returns {Promise<{ ready: boolean, provider: string, error?: string, suggestion?: string }>}
+ */
+async function preflightAuth(provider, _cwd) {
+  const bin = provider === 'openai' ? 'codex' : 'claude';
+
+  // Fast path: check binary existence with `which`
+  const whichResult = await new Promise((resolve) => {
+    const p = spawn('which', [bin], { stdio: 'pipe' });
+    p.on('error', () => resolve(false));
+    p.on('close', (code) => resolve(code === 0));
+    setTimeout(() => { try { p.kill(); } catch {} resolve(false); }, 2000);
+  });
+
+  if (!whichResult) {
+    const installHint = provider === 'openai'
+      ? 'Install: npm install -g @openai/codex'
+      : 'Install: npm install -g @anthropic-ai/claude-code';
+    return {
+      ready:      false,
+      provider,
+      error:      `${bin} CLI not found in PATH`,
+      suggestion: installHint,
+    };
+  }
+
+  // Version check: confirms the binary actually runs (catches broken installs)
+  const versionOk = await new Promise((resolve) => {
+    const p = spawn(bin, ['--version'], { stdio: 'pipe' });
+    p.on('error', () => resolve(false));
+    p.on('close', (code) => resolve(code === 0));
+    setTimeout(() => { try { p.kill(); } catch {} resolve(false); }, 3000);
+  });
+
+  if (!versionOk) {
+    const loginHint = provider === 'openai' ? 'Run: codex login' : 'Run: claude login';
+    return {
+      ready:      false,
+      provider,
+      error:      `${bin} --version failed (auth may have expired)`,
+      suggestion: loginHint,
+    };
+  }
+
+  return { ready: true, provider };
+}
+
 // ─── Command builder ──────────────────────────────────────────────────────────
 
 function buildCommand(decision, prompt, files = [], _cwd) {
@@ -622,6 +676,30 @@ function runProcess(cmd, cwd, timeoutMs, env) {
   });
 }
 
+// ─── Template-based prompt rendering ─────────────────────────────────────────
+
+function _renderTemplatedPrompt(prompt, decision, context = {}) {
+  const tier = decision.tier ?? 'execute';
+  const template = getTemplate(tier);
+  if (!template) return prompt;
+
+  if (decision.contract) {
+    const rendered = renderPrompt(tier, decision.contract, context);
+    if (rendered.valid) return rendered.prompt;
+  }
+
+  const rendered = quickRender(tier, prompt, {
+    scope: decision.owns || decision.scope || [],
+    files: decision.files || [],
+    risk: decision.risk || 'medium',
+    criteria: decision.acceptanceCriteria || [],
+    nonGoals: decision.nonGoals || [],
+    context: decision.taskContext || '',
+  });
+
+  return rendered.valid ? rendered.prompt : prompt;
+}
+
 // ─── Dispatch marker ─────────────────────────────────────────────────────────
 // Prepend a marker to every prompt that goes through the official dispatch pipeline.
 // The enforce-tier hook checks for this marker to distinguish legitimate dispatches
@@ -671,6 +749,49 @@ async function dispatch(input = {}) {
 
   // Safety gate: redact secrets before anything reaches a subprocess or log
   prompt = redact(prompt);
+
+  // ── Template-based prompt rendering ─────────────────────────────────────────
+  // When a tier and/or contract are present, render through templates.mjs for
+  // structured, typed prompts. Falls back to raw prompt when no template matches.
+  prompt = _renderTemplatedPrompt(prompt, decision);
+
+  // ── Resume brief injection ───────────────────────────────────────────────────
+  // Inject the last session's receipt as context when no situationBrief is already set.
+  // This closes the receipt → brief → next session loop automatically.
+  // Falls back to continuity.mjs handoffs when receipt.mjs returns nothing.
+  if (!input.situationBrief) {
+    try {
+      const { buildResumeBrief } = await import('./receipt.mjs');
+      const brief = buildResumeBrief(cwd);
+      if (brief) {
+        input = { ...input, situationBrief: brief };
+      }
+    } catch { /* non-blocking */ }
+
+    // Provider-aware continuity fallback: adapts resume format for target provider
+    if (!input.situationBrief) {
+      try {
+        const { buildProviderResumeBrief } = await import('./provider-context.mjs');
+        const targetProvider = decision.provider || 'claude';
+        const providerBrief = buildProviderResumeBrief(cwd, targetProvider);
+        if (providerBrief) {
+          input = { ...input, situationBrief: providerBrief };
+        }
+      } catch { /* non-blocking */ }
+
+      // Legacy fallback: continuity.mjs handoff (provider-unaware)
+      if (!input.situationBrief) {
+        try {
+          const { buildResumeBrief: buildHandoffBrief } = await import('./continuity.mjs');
+          const handoffBrief = buildHandoffBrief(cwd);
+          if (handoffBrief) {
+            input = { ...input, situationBrief: handoffBrief };
+          }
+        } catch { /* non-blocking */ }
+      }
+    }
+  }
+  // ── End resume brief injection ───────────────────────────────────────────────
 
   // ── Related session context injection ────────────────────────────────────────
   // Find past sessions related to this task and prepend a context block.
@@ -815,6 +936,34 @@ async function dispatch(input = {}) {
     }
   }
 
+  // ── Preflight auth check ─────────────────────────────────────────────────
+  // Verify the target provider CLI is present and responsive before dispatching.
+  // Runs after model/provider resolution so we check the effective provider.
+  const preflight = await preflightAuth(effectiveProvider, cwd);
+  if (!preflight.ready) {
+    // Check if the other provider is available as a fallback
+    const otherProvider = effectiveProvider === 'claude' ? 'openai' : 'claude';
+    const otherPreflight = await preflightAuth(otherProvider, cwd);
+    const fallbackNote = otherPreflight.ready
+      ? ` Fallback available: ${otherProvider}.`
+      : '';
+    const errMsg = `${preflight.error}. ${preflight.suggestion}${fallbackNote}`;
+    return {
+      status:        'error',
+      provider:      effectiveProvider,
+      model:         effectiveModel,
+      command:       null,
+      exitCode:      null,
+      summary:       errMsg,
+      durationMs:    0,
+      usage:         null,
+      error:         errMsg,
+      authVerified:  false,
+      suggestion:    preflight.suggestion,
+    };
+  }
+  // ── End preflight auth check ─────────────────────────────────────────────
+
   // ── Feature 2: Dirty-worktree guard for execute-tier dispatches ──────────
   if (tier === 'execute' && decision.owns && !decision._force) {
     const wtCheck = await checkWorktreeClean(decision.owns, cwd);
@@ -834,6 +983,23 @@ async function dispatch(input = {}) {
     }
   }
 
+  // ── Worktree isolation decision ──────────────────────────────────────────────
+  // Compute whether this dispatch should run in an isolated worktree based on
+  // risk level, file-edit volume, and security/auth signals in the prompt.
+  const SECURITY_PATTERN = /\b(auth|secret|token|credential|password|key|oauth|jwt|session|permission|role|acl)\b/i;
+  const decisionRisk        = (decision.risk ?? 'low').toLowerCase();
+  const decisionFilesEst    = decision.filesEstimate ?? 0;
+  const riskIsElevated      = decisionRisk === 'medium' || decisionRisk === 'high' || decisionRisk === 'critical';
+  const manyFiles           = decisionFilesEst >= 3;
+  const hasSecurity         = SECURITY_PATTERN.test(prompt);
+  const useWorktree         = input.useWorktree ?? (riskIsElevated || manyFiles || hasSecurity);
+
+  // Propagate useWorktree onto effectiveDecision so callers can inspect it
+  if (useWorktree) {
+    effectiveDecision = { ...effectiveDecision, useWorktree: true };
+  }
+  // ── End worktree isolation decision ─────────────────────────────────────────
+
   // ── Native Claude Code dispatch ──────────────────────────────────────────────
   // When running inside Claude Code AND the provider is claude, execute via the
   // claude CLI directly (foreground subprocess) so results are captured and returned.
@@ -842,7 +1008,7 @@ async function dispatch(input = {}) {
     const nativeDescriptor = buildNativeDispatch(
       effectiveDecision,
       prompt,
-      { worktree: input.worktree, maxTurns: input.maxTurns },
+      { worktree: useWorktree, maxTurns: input.maxTurns },
     );
 
     const command = buildCommand(effectiveDecision, prompt, files, cwd);
@@ -860,6 +1026,7 @@ async function dispatch(input = {}) {
         durationMs:    0,
         usage:         null,
         error:         null,
+        authVerified:  true,
       };
     }
 
@@ -941,6 +1108,23 @@ async function dispatch(input = {}) {
       success,
     });
 
+    // ── Auto-review annotation ────────────────────────────────────────────────
+    // When execution changed files at medium+ risk, stamp result with a pending
+    // review note. The opposite provider from the one that did the work reviews
+    // it (true dual-brain). Non-blocking — does not delay the return value.
+    let autoReview;
+    if (success && (decision.risk === 'medium' || decision.risk === 'high' || decision.risk === 'critical')) {
+      try {
+        const reviewProvider = currentProvider === 'claude' ? 'openai' : 'claude';
+        autoReview = { triggered: true, provider: reviewProvider, status: 'pending' };
+      } catch {
+        autoReview = { triggered: false, reason: 'review-dispatch-failed' };
+      }
+    } else {
+      autoReview = { triggered: false, reason: success ? 'low-risk' : 'dispatch-failed' };
+    }
+    // ── End auto-review annotation ────────────────────────────────────────────
+
     return {
       status:        success ? 'completed' : 'failed',
       type:          'native-agent',
@@ -953,6 +1137,9 @@ async function dispatch(input = {}) {
       summary,
       durationMs,
       usage,
+      worktreeUsed:  useWorktree,
+      autoReview,
+      authVerified:  true,
       error: success ? null : errorText.slice(0, 200),
     };
   }
@@ -960,7 +1147,7 @@ async function dispatch(input = {}) {
   const command = buildCommand(effectiveDecision, prompt, files, cwd);
 
   if (dryRun) {
-    return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, specialist: specialist ?? 'generic', command, exitCode: null, summary: null, durationMs: 0, usage: null, error: null };
+    return { status: 'dry-run', provider: effectiveProvider, model: effectiveModel, specialist: specialist ?? 'generic', command, exitCode: null, summary: null, durationMs: 0, usage: null, error: null, authVerified: true };
   }
 
   // Record this dispatch against the budget
@@ -1040,16 +1227,36 @@ async function dispatch(input = {}) {
     success,
   });
 
+  // ── Auto-review annotation ──────────────────────────────────────────────────
+  // When execution changed files at medium+ risk, stamp result with a pending
+  // review note. The opposite provider from the one that did the work reviews
+  // it (true dual-brain). Non-blocking — does not delay the return value.
+  let autoReview;
+  if (success && (decision.risk === 'medium' || decision.risk === 'high' || decision.risk === 'critical')) {
+    try {
+      const reviewProvider = subProvider === 'claude' ? 'openai' : 'claude';
+      autoReview = { triggered: true, provider: reviewProvider, status: 'pending' };
+    } catch {
+      autoReview = { triggered: false, reason: 'review-dispatch-failed' };
+    }
+  } else {
+    autoReview = { triggered: false, reason: success ? 'low-risk' : 'dispatch-failed' };
+  }
+  // ── End auto-review annotation ──────────────────────────────────────────────
+
   return {
-    status:     success ? 'completed' : 'failed',
-    provider:   subProvider,
-    model:      subModel,
-    specialist: specialist ?? 'generic',
-    command:    subCommand,
+    status:      success ? 'completed' : 'failed',
+    provider:    subProvider,
+    model:       subModel,
+    specialist:  specialist ?? 'generic',
+    command:     subCommand,
     exitCode,
     summary,
     durationMs,
     usage,
+    worktreeUsed: useWorktree,
+    autoReview,
+    authVerified: true,
     error: success ? null : errorText.slice(0, 200),
   };
 }
@@ -1141,4 +1348,4 @@ if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
   }
 }
 
-export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget, isInsideClaude, buildNativeDispatch, normalizeResult, loadSpecialistPrompt };
+export { dispatch, buildCommand, detectRuntime, compressResult, dispatchDualBrain, validateDispatch, checkWorktreeClean, getRetryBudget, isInsideClaude, buildNativeDispatch, normalizeResult, loadSpecialistPrompt, preflightAuth };

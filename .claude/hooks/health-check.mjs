@@ -23,6 +23,7 @@ import { existsSync, accessSync, readFileSync, constants } from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
+import { checkHookHealth } from "../../src/health.mjs";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -315,36 +316,41 @@ function checkCodexCli() {
   return check("codex CLI", STATUS.warn, `found at ${codexPath} — auth status unknown`);
 }
 
-/** 7a. replit-tools status — version, auth script, session archive */
-async function checkReplitTools() {
+/** 7. Hook file health — verify hook files exist and have valid syntax */
+function checkHookFileHealth() {
+  let result;
   try {
-    const { inspectReplitTools, getAuthStatus } = await import('../../src/replit.mjs');
-    const tools = inspectReplitTools(WORKSPACE);
-    if (!tools.installed) {
-      return check('replit-tools', STATUS.warn, 'not installed');
-    }
-
-    const ver = tools.version ? `v${tools.version}` : 'installed';
-    const authAvail = tools.authRefresh?.available ? 'auth-refresh: yes' : 'auth-refresh: no';
-    const sessions = tools.sessionArchive?.sessionCount ?? 0;
-    const detail = `${ver} | ${authAvail} | sessions: ${sessions}`;
-
-    return check('replit-tools', STATUS.pass, detail);
-  } catch {
-    return check('replit-tools', STATUS.warn, 'unavailable (import failed)');
+    result = checkHookHealth(WORKSPACE);
+  } catch (err) {
+    return check("hook file health", STATUS.fail, `checkHookHealth threw: ${err.message}`);
   }
-}
 
-/** 7b. Claude auth status — delegates to replit-tools, falls back to direct */
-async function checkClaudeAuth() {
-  try {
-    const { getAuthHealthStatus } = await import('../../src/health.mjs');
-    const authStatus = await getAuthHealthStatus(WORKSPACE);
-    const status = authStatus.ok ? STATUS.pass : STATUS.warn;
-    return check('claude auth', status, authStatus.detail);
-  } catch {
-    return check('claude auth', STATUS.warn, 'check unavailable');
+  if (result.missing.length > 0) {
+    const first = result.missing[0];
+    const extra = result.missing.length > 1 ? ` (+${result.missing.length - 1} more)` : "";
+    return check("hook file health", STATUS.fail, `missing: ${first}${extra}`);
   }
+
+  if (result.conflicts.length > 0) {
+    return check(
+      "hook file health",
+      STATUS.warn,
+      `conflicts: ${result.conflicts.length} hook(s) defined in both local and global settings`
+    );
+  }
+
+  if (result.degraded.length > 0) {
+    const first = result.degraded[0];
+    const extra = result.degraded.length > 1 ? ` (+${result.degraded.length - 1} more)` : "";
+    return check("hook file health", STATUS.warn, `syntax errors: ${first}${extra}`);
+  }
+
+  const total = result.hooks.length;
+  if (total === 0) {
+    return check("hook file health", STATUS.warn, "no hooks registered in settings");
+  }
+
+  return check("hook file health", STATUS.pass, `${total} hook(s) verified`);
 }
 
 /** 8. Git repo — verify we're in a git repo */
@@ -432,23 +438,17 @@ function renderTable(checks) {
 // Main
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const [replitToolsCheck, claudeAuthCheck] = await Promise.all([
-    checkReplitTools(),
-    checkClaudeAuth(),
-  ]);
-
+function main() {
   const checks = [
     checkOrchestratorJson(),
     checkPricingVerified(),
     checkModelIntelligence(),
     checkHookScripts(),
     checkHookRegistration(),
+    checkHookFileHealth(),
     checkUsageJsonl(),
     checkCodexCli(),
     checkGitRepo(),
-    replitToolsCheck,
-    claudeAuthCheck,
   ];
 
   // Print formatted table

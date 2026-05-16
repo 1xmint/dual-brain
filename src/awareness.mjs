@@ -49,8 +49,6 @@ function detectContainerType() {
 
 function scanSecrets() {
   const keys = [
-    'OPENAI_API_KEY',
-    'ANTHROPIC_API_KEY',
     'NPM_TOKEN',
     'DATABASE_URL',
     'GITHUB_TOKEN',
@@ -110,6 +108,23 @@ function scanReplitTools() {
   return { installed: true, version, sessionArchivePath, capabilities };
 }
 
+/**
+ * Basic Replit environment scan used for the awareness report.
+ *
+ * NOTE: Detailed Replit integration (auth status, replit-tools capabilities,
+ * session archive, secrets listing, config planning, init flow) lives in
+ * src/replit.mjs. When that module is available, prefer its
+ * detectReplitEnvironment() over duplicating detection logic here.
+ *
+ * Usage (fail-safe):
+ *   try {
+ *     const { detectReplitEnvironment } = await import('./replit.mjs');
+ *     const rich = detectReplitEnvironment(cwd);
+ *     // rich has .isReplit, .replId, .version, .authStatus, .capabilities …
+ *   } catch {
+ *     // fall back to this scanReplit() result from scanEnvironment()
+ *   }
+ */
 function scanReplit(cwd) {
   const env = process.env;
   const isReplit = Boolean(env.REPL_ID || env.REPL_SLUG);
@@ -265,8 +280,6 @@ export function formatEnvironment(report) {
   if (toolEntries.length) lines.push(`Tools: ${toolEntries.join('  ')}`);
 
   const secretMap = {
-    OPENAI_API_KEY: 'OpenAI',
-    ANTHROPIC_API_KEY: 'Anthropic',
     NPM_TOKEN: 'npm',
     GITHUB_TOKEN: 'GitHub',
     DATABASE_URL: 'PostgreSQL',
@@ -318,8 +331,6 @@ export function getCapabilitySummary(report) {
   if (report.tools.gh?.available) caps.push('github-cli');
   if (report.tools.rg?.available) caps.push('ripgrep');
 
-  if (report.secrets.OPENAI_API_KEY) caps.push('openai-key');
-  if (report.secrets.ANTHROPIC_API_KEY) caps.push('anthropic-key');
 
   if (report.replitTools.installed) {
     for (const c of report.replitTools.capabilities) {
@@ -340,4 +351,75 @@ export function getCapabilitySummary(report) {
 export function invalidateCache() {
   _cache = null;
   _cacheTime = 0;
+}
+
+// ─── Ambiguity Detection ──────────────────────────────────────────────────────
+
+const TECHNICAL_TERMS = /\b(fix|bug|error|test|deploy|refactor|import|export|function|class|module|api|endpoint|auth|token|database|query|schema|migration|build|lint|type|interface|component|route|handler|middleware|config|env|secret|key|file|path|directory|repo|branch|commit|merge|pull|push|install|upgrade|package|dependency|version|release|publish|log|trace|debug|stack|exception|undefined|null|async|await|promise|fetch|request|response|status|server|client|socket|cache|session)\b/i;
+
+/**
+ * Detect whether a prompt is ambiguous and needs clarification before dispatch.
+ *
+ * A prompt is considered ambiguous when ALL of the following are true:
+ *   1. It is very short (under 4 words)
+ *   2. No file context is provided
+ *   3. It lacks specific technical terms that narrow the intent
+ *
+ * @param {string} prompt — the user's raw prompt
+ * @param {{ files?: string[] }} [context] — optional context (e.g. file paths)
+ * @returns {{ isAmbiguous: boolean, reason: string|null }}
+ */
+export function detectAmbiguity(prompt, context = {}) {
+  if (!prompt || typeof prompt !== 'string') {
+    return { isAmbiguous: true, reason: 'missing context: empty prompt' };
+  }
+
+  const words = prompt.trim().split(/\s+/).filter(Boolean);
+  const isTooShort = words.length < 4;
+  const hasFileContext = Array.isArray(context?.files) && context.files.length > 0;
+  const hasTechnicalTerms = TECHNICAL_TERMS.test(prompt);
+
+  if (isTooShort && !hasFileContext && !hasTechnicalTerms) {
+    return {
+      isAmbiguous: true,
+      reason: `unclear: prompt is vague ("${prompt.trim()}") — missing context about what to change and where`,
+    };
+  }
+
+  return { isAmbiguous: false, reason: null };
+}
+
+/**
+ * Detect whether a user prompt is too vague to act on confidently.
+ *
+ * Checks for:
+ *   - Very short prompts (under 10 chars)
+ *   - No file paths, function names, or specific identifiers
+ *   - Pronoun-only references without antecedents ("fix that thing", "change it")
+ *
+ * @param {string} prompt — the user's raw prompt
+ * @returns {{ ambiguous: boolean, reason: string|null, confidence: number }}
+ */
+export function isAmbiguous(prompt) {
+  if (!prompt || typeof prompt !== 'string') return { ambiguous: true, reason: 'empty-prompt', confidence: 1.0 };
+
+  const trimmed = prompt.trim();
+  if (trimmed.length < 10) return { ambiguous: true, reason: 'too-short', confidence: 0.9 };
+
+  // Check for file paths, function names, specific identifiers
+  const hasSpecifics = /[a-zA-Z_]\w*\.(mjs|js|ts|tsx|jsx|py|go|rs|java|rb|css|html|json|yaml|yml|md|sh)/.test(trimmed)
+    || /[a-zA-Z_]\w*\(\)/.test(trimmed)  // function calls
+    || /`[^`]+`/.test(trimmed)            // backtick-quoted identifiers
+    || /"[^"]{3,}"/.test(trimmed)         // quoted strings
+    || /\b(line|function|class|method|variable|module|component|endpoint|route|table|column)\s+\w+/i.test(trimmed);
+
+  // Vague pronoun patterns
+  const vaguePatterns = /^(fix|change|update|do|make|help|look at|check)\s+(this|that|it|the thing|stuff|things?)$/i;
+  if (vaguePatterns.test(trimmed)) return { ambiguous: true, reason: 'vague-reference', confidence: 0.85 };
+
+  if (!hasSpecifics && trimmed.split(/\s+/).length < 5) {
+    return { ambiguous: true, reason: 'lacks-specifics', confidence: 0.7 };
+  }
+
+  return { ambiguous: false, reason: null, confidence: 0.1 };
 }

@@ -5,6 +5,7 @@
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -365,9 +366,42 @@ function detectSuggestedPlugins(prompt) {
   return [...matched];
 }
 
+// ─── CI risk check ────────────────────────────────────────────────────────────
+
+/**
+ * Lightweight CI risk check: returns true if the current branch has a recent
+ * CI failure, indicating the task may touch already-broken code.
+ * Intentionally best-effort — any error returns false (never blocks detection).
+ * @param {string} [cwd]
+ * @returns {{ hasCIFailure: boolean, failedBranch: string|null }}
+ */
+function checkCIRisk(cwd) {
+  try {
+    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd, encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+
+    const json = execSync(
+      'gh run list --limit 5 --json conclusion,headBranch 2>/dev/null',
+      { cwd, encoding: 'utf8', timeout: 8000 }
+    );
+    const runs = JSON.parse(json);
+    const branchFailure = runs.find(
+      r => r.conclusion === 'failure' && r.headBranch === currentBranch
+    );
+
+    return {
+      hasCIFailure: Boolean(branchFailure),
+      failedBranch: branchFailure ? currentBranch : null,
+    };
+  } catch {
+    return { hasCIFailure: false, failedBranch: null };
+  }
+}
+
 /** Main detection function. Input: { prompt, files?, priorFailures?, sessionContext? } */
 function detectTask(input) {
-  const { prompt = '', files = [], sessionContext = null } = input;
+  const { prompt = '', files = [], sessionContext = null, headJudgment = null } = input;
   let { priorFailures = 0 } = input;
 
   // Session context: bump priorFailures if session history shows failures on similar tasks
@@ -455,6 +489,44 @@ function detectTask(input) {
   // 10. Suggested Codex plugins (keyword-based, static map — no I/O)
   const suggestedPlugins = detectSuggestedPlugins(prompt);
 
+  // 11. CI risk — check if current branch has failing CI runs (best-effort, never throws)
+  const ciRiskResult = checkCIRisk(input.cwd || process.cwd());
+
+  // 12. Match specialized agent from registry (synchronous, best-effort)
+  const suggestedAgent = _matchAgentSync(intent, risk, specialistResult.specialist || '');
+
+  // HEAD judgment override: when HEAD's cognitive pipeline has already assessed
+  // the situation, use its risk/depth as authoritative and reconcile differences.
+  let headOverrides = {};
+  if (headJudgment?.situation) {
+    const hj = headJudgment.situation;
+    const headRisk = hj.taskShape?.risk;
+    const headAmbiguity = hj.taskShape?.ambiguity;
+
+    // HEAD's risk takes precedence when it's higher (HEAD sees more signals)
+    if (headRisk && LEVEL_ORDER[headRisk] > LEVEL_ORDER[risk]) {
+      risk = headRisk;
+      headOverrides.riskElevatedBy = 'head-judgment';
+    }
+
+    // HEAD's depth maps to reasoning depth
+    const headDepthMap = { reflexive: 'low', light: 'medium', full: 'high', deep: 'ultra' };
+    const headDepth = headDepthMap[headJudgment.depth];
+    if (headDepth) {
+      const depthOrder = { low: 0, medium: 1, high: 2, ultra: 3 };
+      if (depthOrder[headDepth] > depthOrder[reasoningDepth]) {
+        reasoningDepth = headDepth;
+        reasoningSignals.push(`HEAD assessed depth as ${headJudgment.depth}`);
+        headOverrides.depthElevatedBy = 'head-judgment';
+      }
+    }
+
+    // HEAD's ambiguity signals complexity
+    if (headAmbiguity === 'high' && complexity !== 'complex') {
+      headOverrides.ambiguityWarning = 'HEAD detected high ambiguity';
+    }
+  }
+
   return {
     intent,
     risk,
@@ -470,8 +542,46 @@ function detectTask(input) {
     reasoningDepth,
     reasoningSignals,
     suggestedPlugins,
+    ciRisk: ciRiskResult,
+    suggestedAgent,
     ...(repeatedFailure && { repeatedFailure: true }),
+    ...(Object.keys(headOverrides).length > 0 && { headOverrides }),
   };
+}
+
+// ─── Agent registry bridge (synchronous, injected) ───────────────────────────
+//
+// detect.mjs is synchronous by design. The ESM agent registry is loaded
+// asynchronously by callers (pipeline, CLI) via primeAgentRegistry(), which
+// caches the matchAgent function here so detectTask can call it synchronously.
+
+let _matchAgentFn = null;
+
+/**
+ * Prime the agent registry so detectTask can match agents synchronously.
+ * Call this once at startup: await primeAgentRegistry()
+ */
+export async function primeAgentRegistry() {
+  try {
+    const { matchAgent } = await import('./agents/registry.mjs');
+    _matchAgentFn = matchAgent;
+  } catch {
+    // Registry unavailable — detectTask continues without agent matching
+  }
+}
+
+/**
+ * Synchronously match a specialized agent from the primed registry.
+ * Returns the best match or null if not yet primed.
+ */
+function _matchAgentSync(intent, risk, taskType) {
+  try {
+    if (typeof _matchAgentFn !== 'function') return null;
+    const matches = _matchAgentFn(intent, risk, taskType);
+    return matches.length > 0 ? matches[0] : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Specialist registry ──────────────────────────────────────────────────────

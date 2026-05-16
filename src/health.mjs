@@ -11,6 +11,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 // ─── Auth status (delegates to replit-tools when available) ──────────────────
 
@@ -93,6 +94,8 @@ export async function getAuthHealthStatus(cwd) {
 
   return { ok: false, detail: 'Auth: no credentials found (direct check)', source: 'unknown' };
 }
+
+const HEALTH_CHECK_TIMEOUT_MS = 5000;
 
 const HEALTH_FILE = '.dualbrain/health.json';
 
@@ -314,6 +317,41 @@ export function resetHealth(cwd) {
   saveRaw({ states: {}, session: null }, cwd);
 }
 
+// ─── Network timeout guard ────────────────────────────────────────────────────
+
+/**
+ * Ping a provider URL with a bounded timeout so slow networks don't hang the CLI.
+ *
+ * Uses AbortController to enforce the deadline.  On timeout or network error the
+ * caller receives { ok: false, status: 'timeout' } rather than hanging forever.
+ *
+ * @param {string} url
+ * @param {{ timeoutMs?: number, headers?: Record<string,string> }} [opts]
+ * @returns {Promise<{ ok: boolean, status: 'ok'|'timeout'|'error', detail?: string }>}
+ */
+export async function pingProvider(url, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? HEALTH_CHECK_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'HEAD',
+      signal: controller.signal,
+      headers: opts.headers ?? {},
+    });
+    clearTimeout(timer);
+    return { ok: res.ok, status: 'ok', detail: String(res.status) };
+  } catch (err) {
+    clearTimeout(timer);
+    const isTimeout = err?.name === 'AbortError';
+    return {
+      ok: false,
+      status: isTimeout ? 'timeout' : 'error',
+      detail: isTimeout ? `Provider health: unknown (timeout after ${timeoutMs}ms)` : String(err?.message),
+    };
+  }
+}
+
 // ─── Remaining cooldown helper (used by status display) ──────────────────────
 
 /**
@@ -332,4 +370,159 @@ export function remainingCooldownMinutes(provider, modelClass, cwd) {
   const cooldownMs = (state.cooldownMinutes ?? 5) * 60 * 1000;
   const remaining = cooldownMs - elapsedMs;
   return remaining > 0 ? Math.ceil(remaining / 60_000) : 0;
+}
+
+// ─── Hook health check ────────────────────────────────────────────────────────
+
+/**
+ * Extract the file path from a hook command string.
+ * Handles patterns like `node /path/to/hook.mjs` or `node /path/to/hook.mjs --flag`.
+ * Returns null if the pattern doesn't match.
+ * @param {string} command
+ * @returns {string|null}
+ */
+function extractHookPath(command) {
+  if (typeof command !== 'string') return null;
+  const match = command.match(/node\s+([^\s]+\.mjs)/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Collect all hook entries from a settings object, returning
+ * [{ command, eventType }] pairs.
+ * @param {object} settings
+ * @returns {{ command: string, eventType: string }[]}
+ */
+function collectHookCommands(settings) {
+  const entries = [];
+  const hooks = settings?.hooks ?? {};
+  for (const [eventType, matchers] of Object.entries(hooks)) {
+    if (!Array.isArray(matchers)) continue;
+    for (const matcher of matchers) {
+      for (const hook of (matcher?.hooks ?? [])) {
+        if (hook?.type === 'command' && typeof hook.command === 'string') {
+          entries.push({ command: hook.command, eventType });
+        }
+      }
+    }
+  }
+  return entries;
+}
+
+/**
+ * Load and parse a JSON settings file.  Returns {} on any error.
+ * @param {string} filePath
+ * @returns {object}
+ */
+function loadSettings(filePath) {
+  if (!existsSync(filePath)) return {};
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Check the health of all hook files referenced in project-local and global
+ * Claude Code settings.
+ *
+ * @param {string} [cwd] — project root (defaults to process.cwd())
+ * @returns {{
+ *   healthy: boolean,
+ *   hooks: Array<{ path: string, exists: boolean, syntaxValid: boolean, source: 'local'|'global', duplicate: boolean }>,
+ *   conflicts: string[],
+ *   degraded: string[],
+ *   missing: string[],
+ * }}
+ */
+export function checkHookHealth(cwd) {
+  const root = cwd ?? process.cwd();
+  const home = process.env.HOME || '/root';
+
+  const localSettingsPath  = join(root, '.claude', 'settings.local.json');
+  const globalSettingsPath = join(home, '.claude', 'settings.json');
+
+  const localSettings  = loadSettings(localSettingsPath);
+  const globalSettings = loadSettings(globalSettingsPath);
+
+  const localCommands  = collectHookCommands(localSettings);
+  const globalCommands = collectHookCommands(globalSettings);
+
+  // Build a set of hook paths from local settings for duplicate detection
+  const localPaths  = new Set(localCommands.map(e => extractHookPath(e.command)).filter(Boolean));
+  const globalPaths = new Set(globalCommands.map(e => extractHookPath(e.command)).filter(Boolean));
+
+  // Paths that appear in both local and global are conflicts
+  const conflictPaths = new Set([...localPaths].filter(p => globalPaths.has(p)));
+
+  const hookResults = [];
+  const conflicts = [];
+  const degraded  = [];
+  const missing   = [];
+
+  function processEntry(entry, source) {
+    const path = extractHookPath(entry.command);
+    if (!path) return; // non-node hook — skip
+
+    const fileExists = existsSync(path);
+    const isDuplicate = conflictPaths.has(path);
+
+    let syntaxValid = false;
+    if (fileExists) {
+      try {
+        const check = spawnSync('node', ['--check', path], {
+          timeout: 3000,
+          encoding: 'utf8',
+        });
+        syntaxValid = check.status === 0;
+      } catch {
+        syntaxValid = false;
+      }
+    }
+
+    const record = { path, exists: fileExists, syntaxValid, source, duplicate: isDuplicate };
+    hookResults.push(record);
+
+    if (!fileExists) {
+      missing.push(`${source}: ${path} (file not found)`);
+    } else if (!syntaxValid) {
+      degraded.push(`${source}: ${path} (syntax error)`);
+    }
+
+    if (isDuplicate && source === 'global') {
+      // Only report the conflict once (when we encounter it from the global side)
+      conflicts.push(`Hook defined in both local and global settings: ${path}`);
+    }
+  }
+
+  for (const entry of localCommands)  processEntry(entry, 'local');
+  for (const entry of globalCommands) processEntry(entry, 'global');
+
+  const healthy = missing.length === 0 && degraded.length === 0 && conflicts.length === 0;
+
+  return { healthy, hooks: hookResults, conflicts, degraded, missing };
+}
+
+// ─── Hook smoke test ──────────────────────────────────────────────────────────
+
+/**
+ * Run a hook with deliberately malformed input to verify it fails open
+ * (exits 0 even on bad input, so it never blocks the Claude Code flow).
+ *
+ * @param {string} hookPath
+ * @returns {{ path: string, failsOpen: boolean, stderr?: string, error?: string }}
+ */
+export function runHookSmoke(hookPath) {
+  try {
+    const result = spawnSync('node', [hookPath], {
+      input: 'not valid json',
+      timeout: 5000,
+      encoding: 'utf8',
+    });
+    // Exit 0 = fails open (good), Exit non-0 = fails closed (bad)
+    return { path: hookPath, failsOpen: result.status === 0, stderr: (result.stderr || '').slice(0, 200) };
+  } catch {
+    return { path: hookPath, failsOpen: false, error: 'smoke test crashed' };
+  }
 }

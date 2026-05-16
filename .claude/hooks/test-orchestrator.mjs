@@ -321,7 +321,7 @@ test('profiles: consistent across modules', () => {
     if (!profilesSrc.includes(`${name}:`) && !profilesSrc.includes(`'${name}':`)) return `profiles.mjs missing: ${name}`;
   }
 
-  const installSrc = readFileSync(resolve(__dirname, '..', '..', 'install.mjs'), 'utf8');
+  const installSrc = readFileSync(resolve(__dirname, '..', 'install.mjs'), 'utf8');
   for (const name of profileNames) {
     if (!installSrc.includes(`${name}:`) && !installSrc.includes(`'${name}':`)) return `install.mjs missing profile: ${name}`;
   }
@@ -443,11 +443,9 @@ test('enforce-tier: cost-saver demotes think', () => {
     writeFileSync(profileFile, JSON.stringify({ active: 'cost-saver' }));
     // "edit the README file" — execute-like text, no think words
     // cost-saver's demote_think=true demotes think→execute when text lacks think words
-    // agent_id makes inSubagent=true so the dispatch-gate is skipped (we're testing tier routing)
     const payload = JSON.stringify({
       tool_name: 'Agent',
-      agent_id: 'test-subagent',
-      tool_input: { prompt: 'edit the README file', model: 'opus' },
+      tool_input: { prompt: '<!-- dual-brain-dispatch: test23 -->edit the README file', model: 'opus' },
     });
     const { parsed, status } = run(ENFORCE_TIER, payload);
     if (status !== 0) return `non-zero exit: ${status}`;
@@ -494,11 +492,9 @@ test('enforce-tier: auto profile with high-risk file', () => {
   try {
     writeFileSync(profileFile, JSON.stringify({ active: 'auto' }));
     // Description with auth/credentials path → risk classifier detects critical risk → promote to think
-    // agent_id makes inSubagent=true so the dispatch-gate is skipped (we're testing risk/tier routing)
     const payload = JSON.stringify({
       tool_name: 'Agent',
-      agent_id: 'test-subagent',
-      tool_input: { description: 'update src/auth/credentials.mjs', prompt: 'change the token logic', model: 'sonnet' },
+      tool_input: { description: 'update src/auth/credentials.mjs', prompt: '<!-- dual-brain-dispatch: test25 -->change the token logic', model: 'sonnet' },
     });
     const { parsed, status } = run(ENFORCE_TIER, payload);
     if (status !== 0) return `non-zero exit: ${status}`;
@@ -734,7 +730,7 @@ test('enforce-tier: non-burst mode still warns on duplicates', () => {
 
 // ─── Test 33: install preserves existing hooks ─────────────────────────────
 test('install: preserves existing hooks', () => {
-  const installSrc = readFileSync(resolve(__dirname, '..', '..', 'install.mjs'), 'utf8');
+  const installSrc = readFileSync(resolve(__dirname, '..', 'install.mjs'), 'utf8');
 
   // install.mjs must define DUAL_BRAIN_CMDS to identify its own hooks
   if (!installSrc.includes('DUAL_BRAIN_CMDS'))
@@ -744,9 +740,9 @@ test('install: preserves existing hooks', () => {
   if (!installSrc.includes('.filter'))
     return 'install.mjs missing .filter() call — may clobber non-dual-brain hooks';
 
-  // The merge logic should spread existing entries first, then add dual-brain hooks
+  // The merge logic should filter existing hooks before merging dual-brain hooks
   if (!installSrc.includes('existingPre') && !installSrc.includes('existingEntries'))
-    return 'install.mjs missing existingEntries/existingPre variable — may not preserve other hooks';
+    return 'install.mjs missing existing hook preservation — may not preserve other hooks';
 
   // Verify it reads existing settings before overwriting
   if (!installSrc.includes('existing') || !installSrc.includes('settings.json'))
@@ -757,7 +753,7 @@ test('install: preserves existing hooks', () => {
 
 // ─── Test 34: gitignore entries don't conflict with data-tools ─────────────
 test('install: gitignore entries scoped to dual-brain', () => {
-  const installSrc = readFileSync(resolve(__dirname, '..', '..', 'install.mjs'), 'utf8');
+  const installSrc = readFileSync(resolve(__dirname, '..', 'install.mjs'), 'utf8');
 
   // Extract the generateGitignoreEntries function body
   const fnMatch = installSrc.match(/generateGitignoreEntries[\s\S]*?const entries\s*=\s*\[([\s\S]*?)\]/);
@@ -1021,9 +1017,8 @@ test('adaptive loop: end-to-end hash match', () => {
     writeFileSync(LEDGER, '', 'utf8');
 
     // Step 1: Define a specific Agent payload used consistently across all steps
-    // agent_id makes inSubagent=true so the dispatch-gate is skipped (we're testing failure-loop detection)
-    const toolInput = { prompt: 'fix the auth bug', description: 'patch auth module' };
-    const agentPayload = JSON.stringify({ tool_name: 'Agent', agent_id: 'test-subagent', tool_input: toolInput });
+    const toolInput = { prompt: '<!-- dual-brain-dispatch: test40 -->fix the auth bug', description: 'patch auth module' };
+    const agentPayload = JSON.stringify({ tool_name: 'Agent', tool_input: toolInput });
 
     // Step 2: Run enforce-tier with this payload (computes and may log a promptHash)
     const firstRun = run(ENFORCE_TIER, agentPayload);

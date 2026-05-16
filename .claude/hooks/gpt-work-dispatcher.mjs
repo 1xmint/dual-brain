@@ -21,7 +21,6 @@ import { spawnSync } from 'child_process';
 import { appendFileSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { redact } from '../../src/redact.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = join(__dirname, '..', 'orchestrator.json');
@@ -403,7 +402,7 @@ export async function dispatchGptTask(task) {
     classifiedTier,
     modelOverride,
   };
-  const prompt = redact(buildPrompt(preparedTask));
+  const prompt = buildPrompt(preparedTask);
   const sandbox = GPT_TIER_SANDBOX[tier] || GPT_TIER_SANDBOX.execute;
   const effort = task.effort || null;
   const result = executeCodex(codexBin, model, prompt, task.cwd, task.timeoutMs, sandbox, effort);
