@@ -100,6 +100,9 @@ export function perceive(message, context = {}) {
   // Relationship signals — should HEAD ask, act, or advise?
   const relationship = _assessRelationship(message, context, taskShape);
 
+  // Mode sensing — what energy is the user bringing?
+  const mode = detectMode(message, context);
+
   return {
     raw: message,
     explicitAsk: message.trim(),
@@ -111,6 +114,7 @@ export function perceive(message, context = {}) {
     taskShape,
     material,
     relationship,
+    mode,
 
     // Depth signals for adaptive processing
     ambiguity: taskShape.ambiguity,
@@ -123,6 +127,109 @@ export function perceive(message, context = {}) {
     contextVolatility: context.volatility || 'low',
     priorFailures: context.priorFailures || 0,
   };
+}
+
+// ── Mode Sensing ────────────────────────────────────────────────────────────
+// Detects user energy/intent mode. Re-evaluated every turn. Never announced.
+// Shapes HEAD's response style, not its decisions.
+
+const MODE_EXECUTE_WORDS = /^(go|do it|ship it|fix it|run it|push|merge|deploy|yes|ok do it|lets go|make it|just do it|ship|publish)$/i;
+const MODE_IDEATE_WORDS = /\b(what if|imagine|wouldn't it be|picture this|feels like|i feel like|sort of like|wild idea|crazy thought|could we maybe|vibe)\b/i;
+const MODE_EXPLORE_WORDS = /\b(how does|what is|where is|why does|explain|walk me through|show me|tell me about|i don't understand|new to)\b/i;
+const MODE_DISCUSS_WORDS = /\b(what do you think|should we|tradeoffs?|pros and cons|is it better|alternatively|option|or should|concerns?|worry|weigh)\b/i;
+const MODE_WORK_SIGNALS = /(`[^`]+`|\.mjs|\.ts|\.js|\.py|src\/|hooks\/|bin\/|\bfunction\b|\bclass\b|\bimport\b)/;
+
+/**
+ * Detect user's conversational mode from message signals.
+ * Returns a probability distribution with the dominant mode.
+ *
+ * @param {string} message
+ * @param {object} context
+ * @returns {{primary: string, confidence: number, scores: object, signals: string[]}}
+ */
+export function detectMode(message, context = {}) {
+  const scores = { execute: 0, ideate: 0, work: 0, explore: 0, discuss: 0 };
+  const signals = [];
+  const words = message.trim().split(/\s+/);
+  const len = words.length;
+
+  // ── Length signal (most predictive single feature) ──
+  if (len <= 4) { scores.execute += 3; signals.push('very-short'); }
+  else if (len <= 10) { scores.execute += 1; scores.work += 1; }
+  else if (len >= 80) { scores.ideate += 2; signals.push('long-message'); }
+  else if (len >= 40) { scores.ideate += 1; scores.discuss += 1; }
+
+  // ── Lexical signals ──
+  if (MODE_EXECUTE_WORDS.test(message.trim())) { scores.execute += 4; signals.push('execute-word'); }
+  if (MODE_IDEATE_WORDS.test(message)) { scores.ideate += 3; signals.push('ideate-word'); }
+  if (MODE_EXPLORE_WORDS.test(message)) { scores.explore += 3; signals.push('explore-word'); }
+  if (MODE_DISCUSS_WORDS.test(message)) { scores.discuss += 4; signals.push('discuss-word'); }
+
+  // ── Specificity signal (file paths, code references) ──
+  const specificityMatches = message.match(MODE_WORK_SIGNALS);
+  if (specificityMatches) {
+    scores.work += 2;
+    signals.push('has-specifics');
+    // Specifics + imperative = work, not ideate
+    if (/\b(add|change|update|refactor|fix|remove|rename|move)\b/i.test(message)) {
+      scores.work += 2;
+      signals.push('specific-action');
+    }
+  }
+
+  // ── Punctuation signal (only meaningful in longer messages) ──
+  const questionMarks = (message.match(/\?/g) || []).length;
+  if (questionMarks >= 2) { scores.discuss += 2; scores.explore += 1; signals.push('multi-question'); }
+  else if (questionMarks === 1 && len > 5) { scores.explore += 1; scores.discuss += 1; }
+
+  if (/\.{3}|—|–/.test(message)) { scores.ideate += 1; signals.push('ellipsis-dash'); }
+  if (/\b(maybe|might|could|perhaps|wonder)\b/i.test(message)) { scores.ideate += 1; scores.discuss += 1; signals.push('hedging'); }
+
+  // ── Contextual signals ──
+  // If prior turn was a plan/proposal and this is short, likely execute
+  if (context._priorWasProposal && len <= 15) { scores.execute += 2; signals.push('post-proposal-short'); }
+
+  // First message in session tends to be higher-level
+  if (context._isFirstTurn) { scores.explore += 1; scores.discuss += 1; }
+
+  // ── Anti-signals (prevent false positives) ──
+  // "go on" = continue explaining, not execute. But bare "continue?" = proceed
+  if (/^go on\b|^keep going/i.test(message.trim())) {
+    scores.execute -= 3;
+    scores.discuss += 2;
+  }
+  // "actually wait" / "hold on" = pumping the brakes, shifting to discuss
+  if (/^(actually|wait|hold on|hang on)/i.test(message.trim()) && questionMarks > 0) {
+    scores.execute -= 2;
+    scores.discuss += 3;
+    signals.push('pumping-brakes');
+  }
+  // "what if X breaks" = work concern, not ideation
+  if (/what if.*(break|fail|crash|error)/i.test(message)) {
+    scores.ideate -= 2;
+    scores.work += 2;
+  }
+  // "could we refactor" with file = work, not ideate
+  if (/could we.*(refactor|change|update)/i.test(message) && specificityMatches) {
+    scores.ideate -= 2;
+    scores.work += 2;
+  }
+
+  // ── Resolve: pick dominant mode, bias toward action when uncertain ──
+  // Floor all scores at 0
+  for (const k of Object.keys(scores)) { if (scores[k] < 0) scores[k] = 0; }
+
+  const total = Object.values(scores).reduce((a, b) => a + b, 0) || 1;
+  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const [primary, primaryScore] = sorted[0];
+  const confidence = primaryScore / total;
+
+  // If confidence is low (< 0.35), bias toward action — BUT only if discuss/ideate aren't strong
+  if (confidence < 0.35 && scores.execute > 0 && scores.discuss <= 1 && scores.ideate <= 1) {
+    return { primary: 'execute', confidence: 0.4, scores, signals: [...signals, 'low-confidence-action-bias'] };
+  }
+
+  return { primary, confidence, scores, signals };
 }
 
 function _inferTaskShape(message, context) {

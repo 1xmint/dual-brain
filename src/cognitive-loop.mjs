@@ -114,12 +114,14 @@ export function enter(userMessage, context = {}) {
   // Phase 1: Full cognitive pipeline
   const turn = processTurn(headState, userMessage, context);
 
-  // Save situation for history
+  // Save situation for history (includes mode for turn-over-turn tracking)
+  const mode = turn.situation?.mode || { primary: 'work', confidence: 0.5 };
   loopState.situationHistory.push({
     ts: Date.now(),
     depth: turn.depth,
     action: turn.action.type,
     confidence: turn.result.confidence.score,
+    mode: mode.primary,
   });
 
   // Surface update notice as a noticing
@@ -145,6 +147,7 @@ export function enter(userMessage, context = {}) {
       surfaceNoticings: turn.result.surfaceNoticings,
       plan: null,
       nextDispatch: null,
+      mode,
     };
   }
 
