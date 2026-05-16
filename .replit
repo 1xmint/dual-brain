@@ -6,5 +6,16 @@ expertMode = true
 channel = "stable-25_05"
 
 
-# DATA Tools + Dual-Brain persistence and auto-launch
-onBoot = "source /home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh 2>/dev/null || true; npx -y dual-brain@latest 2>/dev/null || true"
+# Persistence + Dual-Brain auto-launch
+[env]
+GH_CONFIG_DIR = "/home/runner/workspace/.replit-tools/.gh-persistent"
+
+# Persistence + Dual-Brain auto-launch
+onBoot = """
+source /home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh 2>/dev/null || true
+ln -sf /home/runner/workspace/.replit-tools/.npm-persistent/.npmrc ~/.npmrc 2>/dev/null || true
+export GH_CONFIG_DIR=/home/runner/workspace/.replit-tools/.gh-persistent
+gh auth setup-git 2>/dev/null || true
+git config --global credential.\"https://github.com\".helper '!GH_CONFIG_DIR=/home/runner/workspace/.replit-tools/.gh-persistent gh auth git-credential' 2>/dev/null || true
+dual-brain install --global 2>/dev/null || true
+"""
