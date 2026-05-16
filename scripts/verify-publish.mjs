@@ -41,8 +41,14 @@ async function commitAndPush() {
     execSync(`git commit -m "${version}: publish"`, { encoding: 'utf8' });
     console.log(`✓ committed ${version}`);
 
-    // Push (non-fatal if auth fails)
-    execSync('git push', { encoding: 'utf8', timeout: 15000 });
+    // Push with explicit credential helper (Replit persistence)
+    const ghDir = '/home/runner/workspace/.replit-tools/.gh-persistent';
+    const credHelper = `!GH_CONFIG_DIR=${ghDir} gh auth git-credential`;
+    execSync(`git -c 'credential.https://github.com.helper=${credHelper}' push`, {
+      encoding: 'utf8',
+      timeout: 15000,
+      env: { ...process.env, GH_CONFIG_DIR: ghDir },
+    });
     console.log(`✓ pushed to origin`);
   } catch (e) {
     // Non-fatal — publish succeeded even if commit/push fails
