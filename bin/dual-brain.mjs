@@ -2755,18 +2755,23 @@ async function mainScreen(rl, ask) {
   const recentWorkItems = [];
   // Add awareness observations as recent work if meaningful
   if (awarenessLine1 && !awarenessLine1.includes('Ready to work')) {
-    const plainAware1 = awarenessLine1.replace(/\x1b\[[0-9;]*m/g, '').replace(/[︀-️]/g, '').trim();
-    if (plainAware1) recentWorkItems.push({ ok: !plainAware1.startsWith('⚠') && !plainAware1.startsWith('🔴'), text: plainAware1.replace(/^[🔴🟡💡]\s*/, '') });
+    const plainAware1 = awarenessLine1.replace(/\x1b\[[0-9;]*m/g, '').replace(/[︀-️‍]/g, '').trim();
+    if (plainAware1) {
+      const isWarning = /uncommitted|stale|failure|expired|old|⚠/.test(plainAware1);
+      recentWorkItems.push({ ok: !isWarning, text: plainAware1.replace(/^[🔴🟡💡⚠]\s*/, '') });
+    }
   }
   // Add last commit as a recent work item
   if (gitLastMsg) {
-    recentWorkItems.push({ ok: true, text: `${gitLastMsg} (${gitLastAgo})` });
+    const isStale = /\d+d ago|\d{2,}h ago/.test(gitLastAgo);
+    recentWorkItems.push({ ok: !isStale, text: `${gitLastMsg} (${gitLastAgo})` });
   }
   // Fill from sessions if still room
   if (recentWorkItems.length < 3 && recentSessions.length > 0) {
     const sess = recentSessions[0];
     let rawName = sess.name || '';
-    if (/^Session [0-9a-f]{8,}$/i.test(rawName)) rawName = sess.id.slice(0, 8);
+    if (/^Session [0-9a-f]{8,}$/i.test(rawName)) rawName = '';
+    if (/^[0-9a-f]{6,}$/i.test(rawName)) rawName = '';
     if (rawName) recentWorkItems.push({ ok: true, text: rawName.slice(0, 50) });
   }
 
@@ -2921,17 +2926,22 @@ async function mainScreen(rl, ask) {
   }
 
   // Shortcut bar — always visible so the user never has to guess
-  const autoLabel = profile.automode ? `\x1b[32m⚡auto\x1b[0m` : `${DIM}auto${RST}`;
-  const shortcutItems = [
-    `${CYAN}Enter${RST} resume`,
-    `${CYAN}n${RST} new`,
-    `${CYAN}/${RST} search`,
-    `${CYAN}s${RST} settings`,
-    `${CYAN}d${RST} doctor`,
-    autoLabel,
-    `${CYAN}q${RST} quit`,
+  const shortcuts = [
+    [`Enter`, isReturning ? 'resume last session' : 'start working'],
+    [`n`, 'new session'],
+    [`/`, 'search sessions'],
+    [`s`, 'settings & profiles'],
+    [`d`, 'doctor (diagnose issues)'],
+    [`a`, profile.automode ? 'auto mode ⚡ on' : 'auto mode'],
+    [`q`, 'quit'],
   ];
-  process.stdout.write(` ${DIM}${shortcutItems.join('  ')}${RST}\n\n`);
+  process.stdout.write('\n');
+  for (const [key, label] of shortcuts) {
+    const keyStr = key === 'Enter' ? `${CYAN}Enter${RST}` : `  ${CYAN}${key}${RST}  `;
+    const padded = key === 'Enter' ? ' ' : '  ';
+    process.stdout.write(`   ${keyStr}${padded}${DIM}${label}${RST}\n`);
+  }
+  process.stdout.write('\n');
 
   // Input bar — rendered below shortcut bar
   const inputLeft = tuiPrompt('task or command...');
