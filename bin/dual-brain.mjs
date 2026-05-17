@@ -1151,7 +1151,10 @@ async function installGlobal() {
 
   // Resolve absolute path to hooks directory via import.meta.url
   const pkgRoot = join(__dirname, '..');
-  const hooksDir = join(pkgRoot, '.claude', 'hooks');
+  // Hooks live at hooks/ in the published package, .claude/hooks/ in dev
+  const hooksDir = existsSync(join(pkgRoot, 'hooks', 'head-guard.mjs'))
+    ? join(pkgRoot, 'hooks')
+    : join(pkgRoot, '.claude', 'hooks');
 
   // Warn if running from npx (ephemeral path)
   if (pkgRoot.includes('.npm/_npx') || pkgRoot.includes('npx-')) {
@@ -1178,9 +1181,9 @@ async function installGlobal() {
   })();
 
   if (hasProjectLocalHooks) {
-    console.log('  hooks already configured project-locally, skipping global hooks');
-    console.log('  (project .claude/settings.local.json already contains dual-brain hooks)');
-  } else {
+    console.log('  project-local hooks detected (will take precedence in this workspace)');
+  }
+  {
     // Load existing settings (merge, never clobber)
     let existing = {};
     if (existsSync(globalSettingsPath)) {
@@ -4479,7 +4482,7 @@ async function askDefaultShell(cwd, rl, fx) {
     `  ${DIM}modifies${RST}  ${YLW}.replit onBoot${RST}`,
     `  ${DIM}undo${RST}      Settings → System → Startup`,
     '',
-    `  ${CYAN}[Y]${RST} Start on boot     ${DIM}[n] Run manually${RST}`,
+    `  ${CYAN}[Enter]${RST} Start on boot  ${DIM}[n] Run manually${RST}`,
   ];
   process.stdout.write('\n' + panel('dual-brain setup', setupContent) + '\n');
 

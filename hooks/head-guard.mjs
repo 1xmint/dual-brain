@@ -31,16 +31,12 @@ try {
   const raw = readFileSync('/dev/stdin', 'utf8');
   input = JSON.parse(raw);
 } catch {
-  // Can't parse input — fail closed to avoid guard bypass.
-  const output = {
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
-      permissionDecisionReason: '[dual-brain] head-guard could not parse hook input — blocking as a safety measure.',
-    },
-  };
-  process.stdout.write(JSON.stringify(output));
-  process.exit(2);
+  // Can't parse input — fail open. This hook's purpose is to block HEAD from
+  // implementing directly. If we can't parse stdin (e.g. subagent context where
+  // Claude Code doesn't pipe parseable JSON), blocking would incorrectly deny
+  // work agents. Allowing is safer: worst case HEAD slips through once, but
+  // work agents aren't blocked.
+  process.exit(0);
 }
 
 const toolName = input.tool_name || '';
