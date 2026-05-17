@@ -371,7 +371,7 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
       // non-TTY fallback uses Codex's no-sandbox mode and relies on Replit's
       // outer workspace isolation.
       spawnArgs = codexNonTty
-        ? ['exec', '--sandbox', 'danger-full-access', '--ask-for-approval', 'never', prompt.slice(0, 4000)]
+        ? ['exec', '--sandbox', 'danger-full-access', prompt.slice(0, 4000)]
         : [prompt.slice(0, 4000)];
     } else {
       // Claude: use -p flag with prompt
