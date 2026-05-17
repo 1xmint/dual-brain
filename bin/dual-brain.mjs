@@ -2986,7 +2986,10 @@ async function mainScreen(rl, ask) {
     try {
       const { getOpenTasks } = await import('../dist/src/ledger.js');
       const open = getOpenTasks(cwd);
-      if (open.length > 0) openTasks.push(`continue: ${open[0].intent.slice(0, 30)}`);
+      if (open.length > 0) {
+        const intent = String(open[0].intent || '').replace(/\s+/g, ' ').trim();
+        if (intent.length >= 5) openTasks.push(`continue: ${intent.slice(0, 30)}`);
+      }
     } catch {}
     suggestions = openTasks.length > 0
       ? [openTasks[0], 'review changes', 'run tests']
