@@ -4227,6 +4227,30 @@ async function settingsScreen(rl, ask) {
     return { next: 'diagnostics' };
   }
 
+  // Intelligence settings (routing, think, strategies)
+  if (choice === 'i') {
+    try {
+      const { runSettings } = await import('../src/settings-tui.mjs');
+      await runSettings(cwd);
+    } catch (e) {
+      process.stdout.write(`  Intelligence settings unavailable: ${e.message}\n`);
+      await ask('  Press Enter to continue...');
+    }
+    return { next: 'settings' };
+  }
+
+  // Revert recent changes
+  if (choice === 'u') {
+    try {
+      const { runRevert } = await import('../src/revert.mjs');
+      await runRevert(cwd);
+    } catch (e) {
+      process.stdout.write(`  Revert unavailable: ${e.message}\n`);
+      await ask('  Press Enter to continue...');
+    }
+    return { next: 'settings' };
+  }
+
   if (choice === 'b' || choice === 'back' || raw === '\x1b') { return { next: 'main' }; }
 
   return { next: 'main' };
@@ -6631,6 +6655,23 @@ async function main() {
     } else {
       console.log(formatRecommendations(recs));
     }
+    return;
+  }
+
+  if (cmd === 'revert' || cmd === 'undo') {
+    const { runRevert } = await import('../src/revert.mjs');
+    await runRevert(process.cwd());
+    return;
+  }
+
+  if (cmd === 'strategies') {
+    const { listStrategies } = await import('../src/strategy.mjs');
+    const strats = listStrategies();
+    console.log('\n  Available dispatch strategies:\n');
+    for (const s of strats) {
+      console.log(`  ${s.id.padEnd(18)} ${s.description} (${s.cost}x cost)`);
+    }
+    console.log('');
     return;
   }
 

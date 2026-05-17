@@ -2,6 +2,7 @@
 // Learns which model works best for which task type from outcome signals.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { checkFileSurvival } from './outcome.mjs';
 import { join } from 'node:path';
 
 const ALPHA = 0.3;
@@ -42,6 +43,19 @@ function saveState(state, cwd) {
   } catch { /* non-throwing */ }
 }
 
+/** Cross-cell bias: average EMA from same-tier cells that have >= 8 observations. */
+function getCrossCellBias(state, cellKey, model) {
+  const [tier] = cellKey.split(':');
+  let biasSum = 0, biasCount = 0;
+  for (const [key, models] of Object.entries(state)) {
+    if (key.startsWith(tier + ':') && key !== cellKey && models[model]) {
+      const entry = models[model];
+      if ((entry.observations ?? 0) >= 8) { biasSum += entry.ema; biasCount++; }
+    }
+  }
+  return biasCount > 0 ? biasSum / biasCount : null;
+}
+
 const staticPrior = (tier, model) => STATIC_PRIORS[`${tier}:${model}`] ?? 0.5;
 const cellObs = (state, key) => Object.values(state[key] ?? {}).reduce((s, m) => s + (m.observations ?? 0), 0);
 const blended = (ema, n, tier, model) =>
@@ -58,9 +72,21 @@ export function adviseModel(taskProfile, cwd) {
 
     const state = loadState(cwd);
     const totalObs = cellObs(state, cellKey);
+    const grandTotal = Object.values(state).reduce((s, cell) =>
+      s + Object.values(cell).reduce((t, e) => t + (e.observations ?? 0), 0), 0);
 
     if (totalObs < MIN_OBSERVATIONS) {
-      // Heuristic: pick highest static prior
+      // When enough global data exists, blend cross-cell bias with static prior
+      if (grandTotal > 100) {
+        let bestModel = models[0], bestScore = -Infinity;
+        for (const m of models) {
+          const xbias = getCrossCellBias(state, cellKey, m);
+          const prior = staticPrior(validTier, m);
+          const score = xbias != null ? (xbias + prior) / 2 : prior;
+          if (score > bestScore) { bestScore = score; bestModel = m; }
+        }
+        return { model: bestModel, reason: 'cross-cell bias', confidence: 0.4, explored: false };
+      }
       const best = models.reduce((a, b) => staticPrior(validTier, a) >= staticPrior(validTier, b) ? a : b);
       return { model: best, reason: 'insufficient data, using heuristic', confidence: 0.3, explored: false };
     }
@@ -127,6 +153,42 @@ export function getRoutingStats(cwd) {
   } catch {
     return { cells: {}, totalObservations: 0, topPerformers: [], worstPerformers: [] };
   }
+}
+
+/**
+ * Loads cross-session routing state. If the state was last updated in a prior session,
+ * applies a mild decay (×0.95) to all EMA scores to account for staleness.
+ */
+export function loadCrossSessionPriors(cwd) {
+  try {
+    const state = loadState(cwd);
+    const sessionStart = state._sessionStart;
+    if (!sessionStart) return state; // no prior session marker
+    const lastMs = new Date(sessionStart).getTime();
+    if (isNaN(lastMs)) return state;
+    const stale = (Date.now() - lastMs) > 60_000; // more than 1 min old = different session
+    if (!stale) return state;
+    for (const [cellKey, models] of Object.entries(state)) {
+      if (cellKey.startsWith('_')) continue;
+      for (const entry of Object.values(models)) {
+        if (typeof entry.ema === 'number') entry.ema = entry.ema * 0.95;
+      }
+    }
+    return state;
+  } catch { return {}; }
+}
+
+/**
+ * Records session start timestamp and triggers file survival checks.
+ * Call once at CLI session start.
+ */
+export async function markSessionStart(cwd) {
+  try {
+    const state = loadState(cwd);
+    state._sessionStart = new Date().toISOString();
+    saveState(state, cwd);
+    await checkFileSurvival(cwd).catch(() => {});
+  } catch { /* non-throwing */ }
 }
 
 export function resetAdvisor(cwd) {
