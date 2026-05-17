@@ -1047,8 +1047,22 @@ function installDefaultShellLauncher(workspace, actions) {
   const suppressBlock = [
     suppressStart,
     '# Added by dual-brain install when dual-brain is the default shell menu.',
+    'export DUAL_BRAIN_DEFAULT_SHELL=true',
     'export CLAUDE_NO_PROMPT=true',
     suppressEnd,
+  ].join('\n');
+  const quietSetupStart = '# >>> dual-brain quiet data-tools setup >>>';
+  const quietSetupEnd = '# <<< dual-brain quiet data-tools setup <<<';
+  const quietSetupBlock = [
+    quietSetupStart,
+    'if [ -f "${SETUP_SCRIPT}" ]; then',
+    '  if [ "${DUAL_BRAIN_DEFAULT_SHELL}" = "true" ]; then',
+    '    source "${SETUP_SCRIPT}" >/dev/null 2>&1',
+    '  else',
+    '    source "${SETUP_SCRIPT}"',
+    '  fi',
+    'fi',
+    quietSetupEnd,
   ].join('\n');
   const block = [
     start,
@@ -1065,13 +1079,18 @@ function installDefaultShellLauncher(workspace, actions) {
     const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const existing = new RegExp(`${esc(start)}[\\s\\S]*?${esc(end)}\\n?`, 'm');
     const existingSuppress = new RegExp(`${esc(suppressStart)}[\\s\\S]*?${esc(suppressEnd)}\\n?`, 'm');
+    const existingQuietSetup = new RegExp(`${esc(quietSetupStart)}[\\s\\S]*?${esc(quietSetupEnd)}\\n?`, 'm');
     src = src.replace(existing, '');
     src = src.replace(existingSuppress, '');
+    src = src.replace(existingQuietSetup, '');
+    src = src.replace(/\[ -f "\$\{SETUP_SCRIPT\}" \] && source "\$\{SETUP_SCRIPT\}"\n?/g, '');
     const earlyMarker = '# Claude Code Setup';
     const sessionMarker = '# Session Manager (interactive menu)';
     if (src.includes(earlyMarker)) src = src.replace(earlyMarker, `${suppressBlock}\n\n${earlyMarker}`);
     else if (src.includes(sessionMarker)) src = src.replace(sessionMarker, `${suppressBlock}\n\n${sessionMarker}`);
     else src = `${suppressBlock}\n\n${src.replace(/^\s*/, '')}`;
+    const setupMarker = 'SETUP_SCRIPT="/home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh"';
+    if (src.includes(setupMarker)) src = src.replace(setupMarker, `${setupMarker}\n${quietSetupBlock}`);
     const marker = '# Auto-show menu on shell start';
     if (src.includes(marker)) src = src.replace(marker, `${block}\n\n${marker}`);
     else src = `${src.replace(/\s*$/, '\n\n')}${block}\n`;
