@@ -1558,8 +1558,12 @@ async function cmdRuntimeSwitch(args = []) {
   console.log('');
 
   if (args.includes('--apply')) {
-    const applied = await processPendingRuntimeSwitch(cwd);
-    if (!applied) console.log('Could not apply live here; resume the session through dual-brain to use these settings.');
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      console.log('Non-interactive shell detected: saved for the active dual-brain terminal to apply.');
+    } else {
+      const applied = await processPendingRuntimeSwitch(cwd);
+      if (!applied) console.log('Could not apply live here; resume the session through dual-brain to use these settings.');
+    }
   }
 }
 
@@ -1571,6 +1575,12 @@ async function cmdAuto(args = []) {
 }
 
 async function cmdSwitchover(args = []) {
+  const joined = args.join(' ').toLowerCase();
+  if (/\b(auto|automode|auto mode|smart auto)\b/.test(joined)) {
+    await cmdAuto(args);
+    return;
+  }
+
   const cwd = process.cwd();
   let sessions = [];
   try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
@@ -1588,7 +1598,6 @@ async function cmdSwitchover(args = []) {
   }
 
   let target = null;
-  const joined = args.join(' ').toLowerCase();
   if (/\b(gpt|codex|openai)\b/.test(joined)) target = 'codex';
   if (/\bclaude\b/.test(joined)) target = 'claude';
   target ||= _sessionTool(sess) === 'codex' ? 'claude' : 'codex';
