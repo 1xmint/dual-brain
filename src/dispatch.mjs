@@ -16,6 +16,8 @@ import { markHot, markDegraded, markHealthy, recordDispatch } from './health.mjs
 import { redact } from './redact.mjs';
 import { getFailoverOrder } from './decide.mjs';
 import { getTemplate, renderPrompt, quickRender } from './templates.mjs';
+import { compilePacket, shapeForRole } from './context-intel.mjs';
+import { buildContextPack } from './context.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
@@ -754,6 +756,28 @@ async function dispatch(input = {}) {
   // When a tier and/or contract are present, render through templates.mjs for
   // structured, typed prompts. Falls back to raw prompt when no template matches.
   prompt = _renderTemplatedPrompt(prompt, decision);
+
+  // ── Context intelligence: model-specific prompt shaping ─────────────────────
+  // When we have files and a target model, shape the prompt context for optimal
+  // model consumption. This adds structured context without replacing the template output.
+  if (files.length > 0 || decision.tier) {
+    try {
+      const pack = await buildContextPack(prompt, files, cwd);
+      const role = decision.tier === 'think' ? 'thinker'
+                 : decision.tier === 'review' ? 'reviewer'
+                 : 'worker';
+      const targetModel = decision.model || 'sonnet';
+      const tokenBudget = role === 'thinker' ? 3000
+                        : role === 'reviewer' ? 4000
+                        : 8000;
+      const { shaped, tokenEstimate } = shapeForRole(pack, role, targetModel, tokenBudget);
+      if (shaped && tokenEstimate > 0) {
+        prompt = `${shaped}\n\n---\n\n${prompt}`;
+        if (verbose) process.stderr.write(`[dual-brain] context-intel: ${role} packet shaped for ${targetModel} (~${tokenEstimate} tokens)\n`);
+      }
+    } catch { /* non-blocking — context shaping failure never prevents dispatch */ }
+  }
+  // ── End context intelligence ─────────────────────────────────────────────────
 
   // ── Resume brief injection ───────────────────────────────────────────────────
   // Inject the last session's receipt as context when no situationBrief is already set.

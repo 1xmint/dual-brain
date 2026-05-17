@@ -142,7 +142,43 @@ const TEMPLATES = {
   },
 };
 
+// ── Output schemas ───────────────────────────────────────────────────────────
+
+const OUTPUT_SCHEMAS = {
+  think: '{ "decision": "string", "confidence": 0.0-1.0, "reasoning": "string", "workSpec": { "objective": "string", "files": ["path"], "criteria": ["string"] } }',
+  execute: '{ "filesChanged": ["path"], "testsRun": boolean, "issues": ["string"] }',
+  review: '{ "pass": boolean, "findings": [{ "severity": "critical|high|medium|low", "file": "path", "line": number, "issue": "string", "fix": "string" }] }',
+  search: '{ "found": [{ "file": "path", "line": number, "snippet": "string" }], "confidence": 0.0-1.0 }',
+};
+
+// ── Model render hints ────────────────────────────────────────────────────────
+
+const MODEL_RENDER_HINTS = {
+  xml: ['claude', 'sonnet', 'haiku', 'opus'],
+  markdown: ['gpt', 'gpt-4', 'gpt-4.1', 'gpt-4o'],
+  prose: ['o3', 'o4-mini'],
+};
+
 // ── Template API ─────────────────────────────────────────────────────────────
+
+/**
+ * Get the structured output schema for a tier.
+ */
+export function getOutputSchema(tier) {
+  return OUTPUT_SCHEMAS[tier] || null;
+}
+
+/**
+ * Get the preferred prompt rendering format for a given model ID.
+ */
+export function getRenderHint(modelId) {
+  if (!modelId) return 'markdown';
+  const normalized = String(modelId).toLowerCase();
+  for (const [format, patterns] of Object.entries(MODEL_RENDER_HINTS)) {
+    if (patterns.some(p => normalized.includes(p))) return format;
+  }
+  return 'markdown';
+}
 
 /**
  * Get a template by tier name.
@@ -193,6 +229,7 @@ export function renderPrompt(tier, contract, context = {}) {
     errors: [],
     template: { id: template.id, version: template.version },
     contract: { ...contract, id: contract.id || Date.now().toString(36) },
+    outputSchema: OUTPUT_SCHEMAS[tier] || null,
     stats: {
       words: prompt.split(/\s+/).length,
       chars: prompt.length,
