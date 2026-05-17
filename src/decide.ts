@@ -11,6 +11,7 @@
  */
 
 import { readFileSync } from 'fs';
+import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 // @ts-ignore — health.mjs not yet migrated
@@ -190,8 +191,8 @@ export function getModelCapabilities(model: string): ModelCapability | null {
 }
 
 export function getAvailableModels(profile: { providers?: Record<string, { enabled?: boolean; models?: string[] }> }): { claude: string[]; openai: string[] } {
-  const ALL_CLAUDE = ['haiku', 'sonnet', 'opus'];
-  const ALL_OPENAI = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+  const ALL_CLAUDE = detectClaudeModels() || ['haiku', 'sonnet', 'opus'];
+  const ALL_OPENAI = detectCodexModels() || ['gpt-5.5', 'gpt-5.4', 'gpt-5.2-codex', 'gpt-5.1-codex-max', 'gpt-5.1-codex', 'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
 
   const claudeModels = profile?.providers?.claude?.models;
   const openaiModels = profile?.providers?.openai?.models;
@@ -199,6 +200,153 @@ export function getAvailableModels(profile: { providers?: Record<string, { enabl
   return {
     claude: Array.isArray(claudeModels) ? claudeModels : ALL_CLAUDE,
     openai: Array.isArray(openaiModels) ? openaiModels : ALL_OPENAI,
+  };
+}
+
+let _claudeModelCache: { models: string[] | null; checkedAt: number; source: string } = {
+  models: null,
+  checkedAt: 0,
+  source: 'fallback',
+};
+
+let _codexModelCache: { models: string[] | null; checkedAt: number } = { models: null, checkedAt: 0 };
+
+function detectClaudeModels(): string[] | null {
+  const now = Date.now();
+  if (now - _claudeModelCache.checkedAt < 60_000) return _claudeModelCache.models;
+  _claudeModelCache.checkedAt = now;
+  try {
+    const raw = execSync('claude --help', { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (!raw.includes('--model')) {
+      _claudeModelCache.models = null;
+      _claudeModelCache.source = 'unavailable';
+      return null;
+    }
+    const aliases = ['default', 'haiku', 'sonnet', 'opus']
+      .filter(alias => alias === 'default' || raw.toLowerCase().includes(alias) || ['haiku', 'sonnet', 'opus'].includes(alias));
+    _claudeModelCache.models = aliases.length ? aliases : ['haiku', 'sonnet', 'opus'];
+    _claudeModelCache.source = 'claude-cli-aliases';
+  } catch {
+    _claudeModelCache.models = null;
+    _claudeModelCache.source = 'fallback';
+  }
+  return _claudeModelCache.models;
+}
+
+function detectCodexModels(): string[] | null {
+  const now = Date.now();
+  if (now - _codexModelCache.checkedAt < 60_000) return _codexModelCache.models;
+  _codexModelCache.checkedAt = now;
+  try {
+    const raw = execSync('codex debug models', { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const parsed = JSON.parse(raw) as { models?: Array<{ slug?: string; visibility?: string }> };
+    const models = (parsed.models || [])
+      .map(m => m.slug)
+      .filter((slug): slug is string => !!slug && /^(gpt|o\d)/i.test(slug));
+    const unique = [...new Set(models)];
+    _codexModelCache.models = unique.length ? unique : null;
+  } catch {
+    _codexModelCache.models = null;
+  }
+  return _codexModelCache.models;
+}
+
+function rankOpenAIModels(models: string[], purpose: 'head' | 'search' | 'execute' | 'think'): string[] {
+  const patterns: Record<typeof purpose, RegExp[]> = {
+    head: [
+      /^gpt-5\.5$/i, /^gpt-5\.4$/i, /^gpt-5\.2-codex$/i, /^gpt-5\.1-codex-max$/i, /^gpt-5\.1-codex$/i,
+      /^gpt-5\.2$/i, /^gpt-5\.1$/i, /^gpt-5$/i, /^o3$/i, /^gpt-4o$/i,
+    ],
+    search: [
+      /mini/i, /nano/i, /^gpt-4o-mini$/i, /^gpt-4\.1-mini$/i, /^o4-mini$/i, /^gpt-5\.5$/i,
+    ],
+    execute: [
+      /^gpt-5\.5$/i, /^gpt-5\.4$/i, /codex/i, /^gpt-5\.2$/i, /^gpt-5\.1$/i, /^gpt-4\.1$/i, /^gpt-4o$/i,
+    ],
+    think: [
+      /^gpt-5\.5$/i, /^gpt-5\.4$/i, /^gpt-5\.2-codex$/i, /^gpt-5\.1-codex-max$/i, /^o3$/i, /codex/i,
+    ],
+  };
+  return [...models].sort((a, b) => {
+    const score = (m: string) => {
+      const idx = patterns[purpose].findIndex(re => re.test(m));
+      return idx === -1 ? 999 : idx;
+    };
+    return score(a) - score(b);
+  });
+}
+
+export interface HeadRecommendation {
+  provider: 'claude' | 'openai';
+  model: string;
+  effort?: string;
+  confidence: 'high' | 'medium' | 'low';
+  source: string;
+  reason: string;
+  alternatives: Array<{ provider: 'claude' | 'openai'; model: string; reason: string }>;
+}
+
+export function recommendHeadModel(
+  profile: { mode?: string; providers?: Record<string, { enabled?: boolean; models?: string[]; plan?: string }> },
+): HeadRecommendation {
+  const available = getAvailableModels(profile);
+  const claudeEnabled = profile?.providers?.claude?.enabled !== false && available.claude.length > 0;
+  const openaiEnabled = profile?.providers?.openai?.enabled !== false && available.openai.length > 0;
+  const mode = String(profile?.mode || 'auto');
+  const openaiHead = rankOpenAIModels(available.openai, mode === 'cost-saver' ? 'search' : 'head')[0];
+  const claudeHead =
+    mode === 'quality-first' && available.claude.includes('opus') ? 'opus' :
+    available.claude.includes('sonnet') ? 'sonnet' :
+    available.claude.includes('default') ? 'default' :
+    available.claude[0];
+
+  const alternatives: HeadRecommendation['alternatives'] = [];
+  if (claudeEnabled && claudeHead) {
+    alternatives.push({
+      provider: 'claude',
+      model: claudeHead,
+      reason: claudeHead === 'sonnet' ? 'stable Claude Code daily-driver alias' : 'available Claude Code alias',
+    });
+  }
+  if (openaiEnabled && openaiHead) {
+    alternatives.push({
+      provider: 'openai',
+      model: openaiHead,
+      reason: 'detected from local Codex model catalog',
+    });
+  }
+
+  if (openaiEnabled && openaiHead && mode !== 'cost-saver') {
+    return {
+      provider: 'openai',
+      model: openaiHead,
+      effort: openaiHead.includes('5.') ? 'medium' : undefined,
+      confidence: _codexModelCache.models ? 'high' : 'medium',
+      source: _codexModelCache.models ? 'codex debug models' : 'static fallback',
+      reason: `${openaiHead} is the strongest available GPT head candidate from the local Codex catalog; keep Claude available for comparison and failover.`,
+      alternatives,
+    };
+  }
+
+  if (claudeEnabled && claudeHead) {
+    return {
+      provider: 'claude',
+      model: claudeHead,
+      confidence: _claudeModelCache.source === 'claude-cli-aliases' ? 'high' : 'medium',
+      source: _claudeModelCache.source,
+      reason: `${claudeHead} is the best Claude Code head alias available locally; use GPT as the secondary execution/review brain.`,
+      alternatives,
+    };
+  }
+
+  return {
+    provider: 'openai',
+    model: openaiHead || 'gpt-5.5',
+    effort: 'medium',
+    confidence: 'low',
+    source: 'fallback',
+    reason: 'No live provider catalog was available, so this is a fallback recommendation.',
+    alternatives,
   };
 }
 
@@ -277,13 +425,8 @@ function pickOpenAIModel(detection: { intent?: string; risk?: string; complexity
   const needsTop = THINK_INTENTS.includes(intent) || risk === 'critical' || effort === 'xhigh';
   const needsMini = SEARCH_INTENTS.includes(intent) && effort === 'low';
   const needsCodex = ['refactor', 'debug'].includes(intent) && complexity !== 'trivial';
-  const pref = needsTop ? 'o3' : needsMini ? 'gpt-4o-mini' : needsCodex ? 'gpt-4o' : 'gpt-4o';
-  const rank = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
-  const idx = rank.indexOf(pref);
-  for (let i = idx; i >= 0; i--) {
-    if (available.includes(rank[i])) return rank[i];
-  }
-  return available[0] ?? 'gpt-4o-mini';
+  const purpose = needsTop ? 'think' : needsMini ? 'search' : needsCodex ? 'execute' : 'head';
+  return rankOpenAIModels(available, purpose)[0] ?? available[0] ?? 'gpt-5.5';
 }
 
 function toShortName(model: string, provider: string): string {
@@ -318,7 +461,7 @@ function applyHealthDowngrade(model: string, score: number, provider: string, av
     }
     return available[0] ?? 'haiku';
   } else {
-    const oaiRank = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+    const oaiRank = rankOpenAIModels(available, 'execute').reverse();
     const idx = oaiRank.indexOf(model);
     const steps = score === 0 ? 2 : 1;
     const downIdx = Math.max(0, idx - steps);
@@ -334,7 +477,7 @@ function applyProfileBias(model: string, profile: Record<string, unknown>, provi
   if (mode === 'cost-saver') {
     const ranks: Record<string, string[]> = {
       claude: ['haiku', 'sonnet', 'opus'],
-      openai: ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'],
+      openai: rankOpenAIModels(available, 'search'),
     };
     for (const m of ranks[provider]) {
       if (!available.includes(m)) continue;
@@ -346,7 +489,7 @@ function applyProfileBias(model: string, profile: Record<string, unknown>, provi
   if (mode === 'quality-first') {
     const ranks: Record<string, string[]> = {
       claude: ['opus', 'sonnet', 'haiku'],
-      openai: ['o3', 'o4-mini', 'gpt-4o', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o-mini'],
+      openai: rankOpenAIModels(available, 'think'),
     };
     for (const m of ranks[provider]) {
       if (available.includes(m)) return m;
@@ -548,9 +691,8 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
     return available.claude.includes(fb) ? fb : (available.claude[available.claude.length - 1] ?? 'sonnet');
   })();
   const _fallbackOpenAI = (() => {
-    const wantO3 = needsDeepReasoning && workStyle.key === 'fullpower';
-    const fb = wantO3 && available.openai.includes('o3') ? 'o3' : 'gpt-4o';
-    return available.openai.includes(fb) ? fb : (available.openai[available.openai.length - 1] ?? 'gpt-4o');
+    const purpose = needsDeepReasoning || workStyle.key === 'fullpower' ? 'think' : tier === 'search' ? 'search' : 'head';
+    return rankOpenAIModels(available.openai, purpose)[0] ?? available.openai[0] ?? 'gpt-5.5';
   })();
 
   let model: string;
@@ -582,7 +724,7 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
 
   if (thinkTier && !isHighStakes) {
     const claudeRankAsc = ['haiku', 'sonnet', 'opus'];
-    const openaiRankAsc = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+    const openaiRankAsc = rankOpenAIModels(available.openai, 'execute').reverse();
 
     if (thinkTier === 'recall' && provider === 'claude') {
       const target = 'haiku';
@@ -590,7 +732,7 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
       const targetIdx = claudeRankAsc.indexOf(target);
       if (targetIdx !== -1 && targetIdx < currentIdx && available.claude.includes(target)) model = target;
     } else if (thinkTier === 'recall' && provider === 'openai') {
-      const target = 'gpt-4o-mini';
+      const target = rankOpenAIModels(available.openai, 'search')[0] ?? 'gpt-4o-mini';
       const currentIdx = openaiRankAsc.indexOf(model);
       const targetIdx = openaiRankAsc.indexOf(target);
       if (targetIdx !== -1 && targetIdx < currentIdx && available.openai.includes(target)) model = target;
@@ -600,7 +742,7 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
       const targetIdx = claudeRankAsc.indexOf(target);
       if (targetIdx !== -1 && targetIdx < currentIdx && available.claude.includes(target)) model = target;
     } else if (thinkTier === 'quick' && provider === 'openai') {
-      const target = 'gpt-4o';
+      const target = rankOpenAIModels(available.openai, 'head')[0] ?? 'gpt-5.5';
       const currentIdx = openaiRankAsc.indexOf(model);
       const targetIdx = openaiRankAsc.indexOf(target);
       if (targetIdx !== -1 && targetIdx < currentIdx && available.openai.includes(target)) model = target;
@@ -622,7 +764,7 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
           if (available.claude.includes(escalated)) model = escalated;
         }
       } else {
-        const oaiRank = ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o4-mini', 'o3'];
+        const oaiRank = rankOpenAIModels(available.openai, 'execute').reverse();
         const currentIdx = oaiRank.indexOf(model);
         if (currentIdx !== -1 && currentIdx < oaiRank.length - 1) {
           const escalated = oaiRank[currentIdx + 1];
@@ -737,9 +879,9 @@ export function getFailoverOrder(decision: { provider: string; model: string; ti
     search: ['haiku', 'sonnet', 'opus'],
   };
   const openaiRankByTier: Record<string, string[]> = {
-    think: ['o3', 'gpt-4o', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o-mini'],
-    execute: ['gpt-4o', 'gpt-4.1', 'o3', 'gpt-4.1-mini', 'gpt-4o-mini'],
-    search: ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o', 'o3'],
+    think: rankOpenAIModels(available.openai, 'think'),
+    execute: rankOpenAIModels(available.openai, 'execute'),
+    search: rankOpenAIModels(available.openai, 'search'),
   };
 
   const claudeRank = claudeRankByTier[tier] ?? claudeRankByTier.execute;

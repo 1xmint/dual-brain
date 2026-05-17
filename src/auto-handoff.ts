@@ -39,6 +39,8 @@ export interface HandoffOpts {
   auto?: boolean;
   force?: boolean;
   taskBrief?: string;
+  automode?: boolean;
+  bypassPermissions?: boolean;
 }
 
 export interface HandoffResult {
@@ -391,22 +393,36 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
       // cannot start, so use non-interactive exec instead.
       // Codex options must appear before the subcommand, so codexPolicyArgs()
       // returns a full global-policy prefix for both interactive and exec modes.
-      spawnArgs = codexNonTty
-        ? [...codexPolicyArgs('exec'), prompt.slice(0, 4000)]
-        : [...codexPolicyArgs('interactive'), prompt.slice(0, 4000)];
+      if (opts.bypassPermissions) {
+        spawnArgs = ['--dangerously-bypass-approvals-and-sandbox', prompt.slice(0, 4000)];
+      } else {
+        const automode = opts.automode ?? opts.auto ?? false;
+        spawnArgs = codexNonTty
+          ? [...codexPolicyArgs('exec'), prompt.slice(0, 4000)]
+          : [...codexPolicyArgs('interactive', { automode }), prompt.slice(0, 4000)];
+      }
     } else {
       // Claude accepts an initial prompt as a positional argument in interactive mode.
       // Use print mode only for non-TTY callers.
+      const permissionArgs = opts.bypassPermissions
+        ? ['--dangerously-skip-permissions']
+        : (opts.automode ?? opts.auto ?? false)
+          ? ['--permission-mode', 'auto']
+          : [];
       spawnArgs = process.stdin.isTTY
-        ? [prompt.slice(0, 4000)]
-        : ['-p', prompt.slice(0, 4000), '--no-input'];
+        ? [...permissionArgs, prompt.slice(0, 4000)]
+        : [...permissionArgs, '-p', prompt.slice(0, 4000), '--no-input'];
     }
 
     if (opts.interactive !== false) {
       // Spawn with inherited stdio — user stays in same terminal
+      const env = cli === 'codex' && (!process.env.TERM || process.env.TERM === 'dumb')
+        ? { ...process.env, TERM: 'xterm-256color' }
+        : process.env;
       const child = spawn(cli, spawnArgs, {
         stdio: codexNonTty ? ['ignore', 'inherit', 'inherit'] : 'inherit',
         cwd: opts.cwd || process.cwd(),
+        env,
       });
 
       child.on('exit', (code) => {

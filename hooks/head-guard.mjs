@@ -14,21 +14,26 @@
 // subagent (work agent). If absent we are in the HEAD session.
 
 import { readFileSync } from 'fs';
+import { assessCommandRisk } from './command-risk.mjs';
 
 const BLOCKED_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 
-// Patterns that indicate a Bash command is writing/mutating the filesystem.
-// Anchored to avoid false positives on grep/find output containing these words.
-const WRITE_BASH_RE = /\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|\bdd\b|\binstall\b|\btruncate\b|\btee\b|\bsed\s+-i\b|\bawk\s+-i\b|>>|(?<![><])>(?![>=])/;
-
-function isBashWriteIntent(command) {
-  return WRITE_BASH_RE.test(command);
+function deny(reason) {
+  const output = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: reason,
+    },
+  };
+  process.stdout.write(JSON.stringify(output));
+  process.exit(2);
 }
 
 // Read stdin JSON payload
 let input;
 try {
-  const raw = readFileSync('/dev/stdin', 'utf8');
+  const raw = readFileSync(0, 'utf8');
   input = JSON.parse(raw);
 } catch {
   // Can't parse input — fail open. This hook's purpose is to block HEAD from
@@ -41,24 +46,26 @@ try {
 
 const toolName = input.tool_name || '';
 
+if (toolName === 'Bash') {
+  const command = (input.tool_input && input.tool_input.command) || '';
+  const risk = assessCommandRisk(command, { head: !input.agent_id });
+  if (risk.decision === 'deny') {
+    deny(`[dual-brain] Command blocked (${risk.reason}). Full auto cannot run this safely. Use a scoped work task or ask the user for explicit approval.`);
+  }
+  if (risk.decision === 'ask') {
+    deny(`[dual-brain] Approval required (${risk.reason}). Context: ${risk.category}. Ask the user before running this command.`);
+  }
+}
+
 // If this hook is firing inside a subagent, ALLOW — subagents are work agents
-// and are permitted to edit/write/bash.
+// and are permitted to edit/write/bash except for dangerous hard stops above.
 if (input.agent_id) {
   process.exit(0);
 }
 
 // HEAD session: block direct mutation tools
 if (BLOCKED_TOOLS.has(toolName)) {
-  const output = {
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
-      permissionDecisionReason:
-        `[dual-brain] HEAD cannot use ${toolName} directly. Dispatch via: dual-brain go "task description"`,
-    },
-  };
-  process.stdout.write(JSON.stringify(output));
-  process.exit(2);
+  deny(`[dual-brain] HEAD cannot use ${toolName} directly. Dispatch via: dual-brain go "task description"`);
 }
 
 // Bash: allow read-only commands; block write-intent ones.
@@ -68,33 +75,12 @@ if (toolName === 'Bash') {
   if (/^node\s+\.?(?:\.claude\/)?hooks\//.test(command.trimStart())) {
     process.exit(0);
   }
-  if (isBashWriteIntent(command)) {
-    const output = {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason:
-          '[dual-brain] HEAD cannot run write-intent Bash commands. Dispatch via: dual-brain go "task description"',
-      },
-    };
-    process.stdout.write(JSON.stringify(output));
-    process.exit(2);
-  }
   process.exit(0);
 }
 
 // Block MCP filesystem write tools by name.
 if (toolName.startsWith('mcp__') && /write|create|delete|remove|move|rename|append|patch|truncate|copy|commit|push|stage|merge|update|overwrite/i.test(toolName)) {
-  const output = {
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
-      permissionDecisionReason:
-        '[dual-brain] HEAD cannot use MCP write tools. Dispatch via: dual-brain go "task description"',
-    },
-  };
-  process.stdout.write(JSON.stringify(output));
-  process.exit(2);
+  deny('[dual-brain] HEAD cannot use MCP write tools. Dispatch via: dual-brain go "task description"');
 }
 
 // Allow everything else (Read, Agent handled by enforce-tier, etc.)

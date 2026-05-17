@@ -51,6 +51,7 @@ export function installHooks(cwd: string): { installed: string[]; skipped: strin
 
   // Copy hook files from package into project's .claude/hooks/
   const filesToCopy = [
+    { name: 'command-risk.mjs', exec: false },
     { name: 'head-guard.mjs',   exec: true },
     { name: 'enforce-tier.mjs', exec: false },
   ];

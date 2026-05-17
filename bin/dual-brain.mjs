@@ -28,7 +28,12 @@ function _claudeResumeArgs(sessionId, cwd) {
   const args = ['--resume', sessionId];
   const workspace = cwd || process.cwd();
   if (getEffectiveBypassPermissions(workspace)) args.push('--dangerously-skip-permissions');
-  else if (getEffectiveAutomode(loadProfile(workspace), workspace)) args.push('--permission-mode', 'auto');
+  else if (getEffectiveAutomode(loadProfile(workspace), workspace)) {
+    const settings = loadSessionSettings(workspace);
+    if (settings.headModel) args.push('--model', settings.headModel);
+    if (settings.effort) args.push('--effort', settings.effort);
+    args.push('--permission-mode', 'auto');
+  }
   return args;
 }
 
@@ -36,7 +41,12 @@ function _claudeNewArgs(cwd) {
   const args = [];
   const workspace = cwd || process.cwd();
   if (getEffectiveBypassPermissions(workspace)) args.push('--dangerously-skip-permissions');
-  else if (getEffectiveAutomode(loadProfile(workspace), workspace)) args.push('--permission-mode', 'auto');
+  else if (getEffectiveAutomode(loadProfile(workspace), workspace)) {
+    const settings = loadSessionSettings(workspace);
+    if (settings.headModel) args.push('--model', settings.headModel);
+    if (settings.effort) args.push('--effort', settings.effort);
+    args.push('--permission-mode', 'auto');
+  }
   return args;
 }
 
@@ -88,7 +98,7 @@ async function _primeRegistryCache() {
 }
 
 import {
-  decideRoute, getAvailableModels,
+  decideRoute, getAvailableModels, recommendHeadModel,
 } from '../dist/src/decide.js';
 
 import {
@@ -1047,6 +1057,14 @@ async function cmdStatus(args = []) {
   console.log(`\nHead model : ${getHeadModel(profile)}`);
   console.log(`Mode       : ${profile.mode}`);
   console.log(`Solo brain : ${isSoloBrain(profile) ? 'yes' : 'no'}`);
+  try {
+    const headRec = recommendHeadModel(profile);
+    const effort = headRec.effort ? ` (${headRec.effort})` : '';
+    console.log(`Recommended: ${headRec.provider}:${headRec.model}${effort} · ${headRec.confidence} confidence`);
+    console.log(`             ${headRec.reason}`);
+  } catch {
+    // Recommendation is advisory only; status should never fail because model probing failed.
+  }
 
   // Runtime
   console.log('\nRuntime:');
@@ -1229,11 +1247,15 @@ async function cmdHandoff(args = []) {
     console.log(`  ⚡ Switching to ${target}...`);
     console.log('');
     const { spawnHandoff } = autoHandoff;
+    const effectiveAutomode = getEffectiveAutomode(profile, cwd);
+    const effectiveBypass = getEffectiveBypassPermissions(cwd);
     const result = spawnHandoff({
       fromProvider,
       cwd,
       auto: true,
       force: true,
+      automode: effectiveAutomode,
+      bypassPermissions: effectiveBypass,
       interactive: true,
       taskBrief: typeof taskBrief === 'string' ? taskBrief : undefined,
     });
@@ -1252,14 +1274,28 @@ async function cmdHandoff(args = []) {
     fxH.info(ux.text);
     console.log('');
     const { spawnHandoff } = autoHandoff;
-    const result = spawnHandoff({ fromProvider: 'anthropic', cwd, auto: true, interactive: true });
+    const result = spawnHandoff({
+      fromProvider: 'anthropic',
+      cwd,
+      auto: true,
+      automode: getEffectiveAutomode(profile, cwd),
+      bypassPermissions: getEffectiveBypassPermissions(cwd),
+      interactive: true,
+    });
     if (!result.success) fxH.error(result.message);
   } else if (openaiStatus.limited && openaiStatus.otherAvailable) {
     const ux = getHandoffUX(openaiStatus);
     fxH.info(ux.text);
     console.log('');
     const { spawnHandoff } = autoHandoff;
-    const result = spawnHandoff({ fromProvider: 'openai', cwd, auto: true, interactive: true });
+    const result = spawnHandoff({
+      fromProvider: 'openai',
+      cwd,
+      auto: true,
+      automode: getEffectiveAutomode(profile, cwd),
+      bypassPermissions: getEffectiveBypassPermissions(cwd),
+      interactive: true,
+    });
     if (!result.success) fxH.error(result.message);
   } else {
     fxH.success('No provider is currently limited. No handoff needed.');
@@ -1276,6 +1312,78 @@ async function cmdSwitch(args = []) {
   const handoffArgs = ['--to', target.toLowerCase()];
   if (taskBrief) handoffArgs.push('--task', taskBrief);
   await cmdHandoff(handoffArgs);
+}
+
+async function cmdRuntimeSwitch(args = []) {
+  const cwd = process.cwd();
+  let sessions = [];
+  try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
+  const sess = sessions[0];
+  if (!sess) {
+    console.log('No resumable session found.');
+    return;
+  }
+
+  const profile = loadProfile(cwd);
+  const settings = loadSessionSettings(cwd);
+  let provider = _sessionTool(sess);
+  let reason = 'head-runtime-switch';
+  const confirmed = args.includes('--confirm') || args.includes('--go');
+
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if ((a === '--provider' || a === '--to') && args[i + 1]) {
+      const next = args[i + 1].toLowerCase();
+      if (next === 'gpt' || next === 'openai') provider = 'codex';
+      else if (next === 'codex' || next === 'claude') provider = next;
+    }
+    if ((a === '--model' || a === '--head-model') && args[i + 1]) {
+      settings.headModel = args[i + 1];
+    }
+    if (a === '--effort' && args[i + 1]) {
+      settings.effort = args[i + 1];
+    }
+    if (a === '--reason' && args[i + 1]) reason = args[i + 1];
+  }
+
+  if (args.includes('--smart-auto') || args.includes('--automode') || args.includes('--auto')) {
+    settings.automode = true;
+    settings.bypassPermissions = false;
+  }
+  if (args.includes('--manual')) {
+    settings.automode = false;
+    settings.bypassPermissions = false;
+  }
+  if (args.includes('--bypass')) {
+    settings.automode = true;
+    settings.bypassPermissions = true;
+  }
+  saveSessionSettings(cwd, settings);
+
+  const pending = writePendingRuntimeSwitch(cwd, sess, {
+    provider,
+    automode: getEffectiveAutomode(profile, cwd),
+    bypassPermissions: getEffectiveBypassPermissions(cwd),
+    model: settings.headModel || null,
+    effort: settings.effort || null,
+    confirmed,
+    reason,
+  });
+
+  const launchArgs = provider === _sessionTool(sess)
+    ? _sessionLaunchArgs(sess, cwd)
+    : ['handoff', '--to', provider];
+
+  console.log('');
+  console.log(`Runtime switch ${confirmed ? 'confirmed' : 'prepared'} for ${pending?.sessionName || sess.id}`);
+  console.log(`Provider: ${provider}`);
+  console.log(`Mode: ${getEffectiveConversationMode(profile, cwd)}`);
+  console.log(`Launch: ${provider} ${launchArgs.join(' ')}`);
+  console.log('');
+
+  if (args.includes('--apply')) {
+    await processPendingRuntimeSwitch(cwd);
+  }
 }
 
 async function cmdUpdate() {
@@ -2121,6 +2229,15 @@ function getEffectiveBypassPermissions(cwd) {
   return !!profile.bypassPermissions;
 }
 
+function getEffectiveConversationMode(profile, cwd) {
+  const workspace = cwd || process.cwd();
+  const automode = getEffectiveAutomode(profile || loadProfile(workspace), workspace);
+  const bypassPermissions = getEffectiveBypassPermissions(workspace);
+  if (bypassPermissions) return 'bypass';
+  if (!automode) return 'manual';
+  return 'smart-auto';
+}
+
 function parseModeCommand(input) {
   const text = input.trim().toLowerCase().replace(/\s+/g, ' ');
   const wantsSession = /\b(this|current)\s+(session|conversation|terminal|chat)\b|\bfor this\b|\bfor current\b/.test(text);
@@ -2128,7 +2245,8 @@ function parseModeCommand(input) {
   const scope = wantsGlobal && !wantsSession ? 'profile' : 'session';
 
   let key = null;
-  if (/\b(auto|automode|auto mode)\b/.test(text)) key = 'automode';
+  if (/\b(manual|ask me|ask before|approve every|approval every)\b/.test(text)) key = 'manualMode';
+  if (/\b(smart auto|auto|automode|auto mode)\b/.test(text)) key = 'automode';
   if (/\b(bypass|permission|permissions|approval|approvals|sandbox|safe mode)\b/.test(text)) key = 'bypassPermissions';
   if (!key) return null;
 
@@ -2148,18 +2266,78 @@ function applyModeCommand(cmd, cwd) {
     const profile = loadProfile(cwd);
     if (cmd.key === 'automode') {
       profile.automode = cmd.value;
+      if (cmd.value) profile.bypassPermissions = false;
       profile.settings = { ...(profile.settings || {}), automode: cmd.value };
+    } else if (cmd.key === 'manualMode') {
+      profile.automode = !cmd.value;
+      if (cmd.value) profile.bypassPermissions = false;
+      profile.settings = { ...(profile.settings || {}), automode: !cmd.value };
     } else {
       profile.bypassPermissions = cmd.value;
+      if (cmd.value) {
+        profile.automode = true;
+        profile.settings = { ...(profile.settings || {}), automode: true };
+      }
     }
     saveProfile(profile, { cwd });
-    return { scope: 'default', value: cmd.value };
+    return { scope: 'default', value: cmd.value, key: cmd.key };
   }
 
   const settings = loadSessionSettings(cwd);
-  settings[cmd.key] = cmd.value;
+  if (cmd.key === 'automode') {
+    settings.automode = cmd.value;
+    if (cmd.value) settings.bypassPermissions = false;
+  } else if (cmd.key === 'manualMode') {
+    settings.automode = !cmd.value;
+    if (cmd.value) settings.bypassPermissions = false;
+  } else {
+    settings.bypassPermissions = cmd.value;
+    if (cmd.value) settings.automode = true;
+  }
   saveSessionSettings(cwd, settings);
-  return { scope: 'this session', value: cmd.value };
+  return { scope: 'this session', value: cmd.value, key: cmd.key };
+}
+
+async function offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, label = 'runtime settings') {
+  const cyan = '\x1b[36m';
+  const reset = '\x1b[0m';
+  let candidates = Array.isArray(recentSessions) ? recentSessions : [];
+  if (candidates.length === 0) {
+    try { candidates = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 3); } catch {}
+  }
+  const sess = candidates[0] || null;
+  process.stdout.write('  Provider approval flags are applied when Claude/Codex starts.\n');
+  if (!sess) {
+    process.stdout.write(`  ${label} will apply to the next session you launch through dual-brain.\n\n`);
+    await ask('  Press Enter to continue...');
+    return { next: 'main' };
+  }
+
+  const tool = _sessionTool(sess);
+  const launchArgs = _sessionLaunchArgs(sess, cwd);
+  writePendingRuntimeSwitch(cwd, sess, {
+    provider: tool,
+    automode: getEffectiveAutomode(loadProfile(cwd), cwd),
+    bypassPermissions: getEffectiveBypassPermissions(cwd),
+    reason: `${label}-reload`,
+  });
+  process.stdout.write(`  Reload needed: ${tool} must restart with: ${launchArgs.join(' ')}\n\n`);
+  process.stdout.write(`  ${cyan}Enter${reset} reload last session now  ${cyan}n${reset} later\n\n`);
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+  if (choice === 'n' || choice === 'no' || choice === 'later') {
+    process.stdout.write('\n  Saved. It will apply on the next dual-brain resume/switch.\n\n');
+    await ask('  Press Enter to continue...');
+    return { next: 'main' };
+  }
+  writePendingRuntimeSwitch(cwd, sess, {
+    provider: tool,
+    automode: getEffectiveAutomode(loadProfile(cwd), cwd),
+    bypassPermissions: getEffectiveBypassPermissions(cwd),
+    reason: `${label}-reload`,
+    confirmed: true,
+  });
+  const launched = await processPendingRuntimeSwitch(cwd);
+  return launched ? { next: 'main' } : await launchSessionWithLease(sess, cwd, ask);
 }
 
 function pidAlive(pid) {
@@ -2174,6 +2352,70 @@ function activeConversationPath(cwd) {
   return join(cwd, '.dualbrain', 'active-conversation.json');
 }
 
+function pendingRuntimeSwitchPath(cwd) {
+  return join(cwd, '.dualbrain', 'pending-runtime-switch.json');
+}
+
+function writePendingRuntimeSwitch(cwd, session, updates = {}) {
+  if (!session?.id) return null;
+  const dir = join(cwd, '.dualbrain');
+  const tool = updates.provider || _sessionTool(session);
+  const pending = {
+    id: `runtime-switch-${Date.now()}`,
+    status: updates.confirmed ? 'confirmed' : 'prepared',
+    createdAt: new Date().toISOString(),
+    sessionId: session.id,
+    sessionName: session.smartName || session.name || session.prompts?.first || session.firstPrompt || session.id,
+    fromProvider: _sessionTool(session),
+    provider: tool,
+    model: updates.model || null,
+    effort: updates.effort || null,
+    automode: typeof updates.automode === 'boolean' ? updates.automode : null,
+    bypassPermissions: typeof updates.bypassPermissions === 'boolean' ? updates.bypassPermissions : null,
+    reason: updates.reason || 'runtime-settings-change',
+    autoLaunch: updates.autoLaunch !== false,
+    handoffBrief: updates.handoffBrief || _sessionBrief(session, tool),
+  };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(pendingRuntimeSwitchPath(cwd), JSON.stringify(pending, null, 2) + '\n');
+  return pending;
+}
+
+function readPendingRuntimeSwitch(cwd) {
+  try {
+    const pending = JSON.parse(readFileSync(pendingRuntimeSwitchPath(cwd), 'utf8'));
+    return pending?.sessionId ? pending : null;
+  } catch { return null; }
+}
+
+function clearPendingRuntimeSwitch(cwd) {
+  try { unlinkSync(pendingRuntimeSwitchPath(cwd)); } catch {}
+}
+
+function runtimeLaunchArgsForPending(session, cwd, pending) {
+  const tool = pending?.provider === 'codex' || pending?.provider === 'claude'
+    ? pending.provider
+    : _sessionTool(session);
+  if (tool === 'codex') {
+    if (pending?.bypassPermissions) return ['--dangerously-bypass-approvals-and-sandbox', 'resume', session.id];
+    return [
+      '--sandbox', 'workspace-write',
+      '--ask-for-approval', pending?.automode ? 'never' : 'on-request',
+      'resume', session.id,
+    ];
+  }
+
+  const args = ['--resume', session.id];
+  if (pending?.bypassPermissions) {
+    args.push('--dangerously-skip-permissions');
+  } else if (pending?.automode) {
+    if (pending.model) args.push('--model', pending.model);
+    if (pending.effort) args.push('--effort', pending.effort);
+    args.push('--permission-mode', 'auto');
+  }
+  return args;
+}
+
 function readActiveConversation(cwd) {
   try {
     const lease = JSON.parse(readFileSync(activeConversationPath(cwd), 'utf8'));
@@ -2181,6 +2423,49 @@ function readActiveConversation(cwd) {
     if (!pidAlive(lease.ownerPid)) return null;
     return lease;
   } catch { return null; }
+}
+
+async function processPendingRuntimeSwitch(cwd) {
+  const pending = readPendingRuntimeSwitch(cwd);
+  if (!pending || pending.status !== 'confirmed' || pending.autoLaunch === false) return false;
+
+  let sessions = [];
+  try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
+  const sess = sessions.find(s => s.id === pending.sessionId) || sessions[0];
+  if (!sess) {
+    clearPendingRuntimeSwitch(cwd);
+    return false;
+  }
+
+  const currentTool = _sessionTool(sess);
+  const targetTool = pending.provider === 'codex' || pending.provider === 'claude'
+    ? pending.provider
+    : currentTool;
+
+  process.stdout.write(`\n  Reloading HEAD with ${pending.automode ? 'Smart Auto' : 'updated settings'}...\n`);
+  clearPendingRuntimeSwitch(cwd);
+
+  if (targetTool !== currentTool) {
+    writeHandoffConversationLease(cwd, sess, currentTool, targetTool, pending.handoffBrief || _sessionBrief(sess, targetTool));
+    markSessionSuperseded(cwd, sess, targetTool, pending.reason || 'runtime-switch');
+    await cmdSwitch([targetTool, pending.handoffBrief || _sessionBrief(sess, targetTool)]);
+    return true;
+  }
+
+  const { spawnSync } = await import('node:child_process');
+  const launchArgs = runtimeLaunchArgsForPending(sess, cwd, pending);
+  process.stdout.write(`  Launching: ${targetTool} ${launchArgs.join(' ')}\n\n`);
+  writeActiveConversation(cwd, sess, targetTool);
+  const env = targetTool === 'codex' && (!process.env.TERM || process.env.TERM === 'dumb')
+    ? { ...process.env, TERM: 'xterm-256color' }
+    : process.env;
+  try {
+    spawnSync(targetTool, launchArgs, { stdio: 'inherit', cwd, env });
+  } finally {
+    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || targetTool);
+    clearActiveConversation(cwd, sess.id);
+  }
+  return true;
 }
 
 function writeActiveConversation(cwd, session, tool) {
@@ -2199,6 +2484,73 @@ function writeActiveConversation(cwd, session, tool) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(activeConversationPath(cwd), JSON.stringify(lease, null, 2) + '\n');
   return lease;
+}
+
+function writeHandoffConversationLease(cwd, session, fromTool, targetTool, taskBrief = '') {
+  const dir = join(cwd, '.dualbrain');
+  const terminalId = getTerminalId();
+  const lease = {
+    conversationId: session.id,
+    sessionId: session.id,
+    provider: targetTool,
+    previousProvider: fromTool,
+    terminalId,
+    ownerPid: process.pid,
+    startedAt: new Date().toISOString(),
+    lastHeartbeat: new Date().toISOString(),
+    mode: 'handoff-head',
+    taskBrief: taskBrief || null,
+  };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(activeConversationPath(cwd), JSON.stringify(lease, null, 2) + '\n');
+  return lease;
+}
+
+function markSessionSuperseded(cwd, session, targetTool, reason = 'provider-switch') {
+  if (!session?.id) return;
+  try {
+    const meta = getSessionMeta(cwd);
+    const existing = meta[session.id] || {};
+    meta[session.id] = {
+      ...existing,
+      id: session.id,
+      tool: session.tool || _sessionTool(session),
+      status: 'superseded',
+      supersededByProvider: targetTool,
+      supersededReason: reason,
+      supersededAt: new Date().toISOString(),
+      terminalId: getTerminalId(),
+      createdAt: existing.createdAt || session.date || new Date().toISOString(),
+    };
+    saveSessionMeta(meta, cwd);
+  } catch {}
+}
+
+function setSessionResumeProvider(cwd, session, targetTool, reason = 'user-preference') {
+  if (!session?.id || !targetTool) return;
+  try {
+    const meta = getSessionMeta(cwd);
+    const existing = meta[session.id] || {};
+    meta[session.id] = {
+      ...existing,
+      id: session.id,
+      tool: session.tool || _sessionTool(session),
+      resumeProvider: targetTool,
+      resumeProviderReason: reason,
+      resumeProviderSetAt: new Date().toISOString(),
+      createdAt: existing.createdAt || session.date || new Date().toISOString(),
+    };
+    saveSessionMeta(meta, cwd);
+  } catch {}
+}
+
+function getSessionResumeProvider(cwd, session) {
+  if (!session?.id) return null;
+  try {
+    const meta = getSessionMeta(cwd);
+    const provider = meta[session.id]?.resumeProvider;
+    return provider === 'claude' || provider === 'codex' ? provider : null;
+  } catch { return null; }
 }
 
 function clearActiveConversation(cwd, sessionId) {
@@ -2234,6 +2586,15 @@ async function launchSessionWithLease(sess, cwd, ask = null) {
 
   const { spawnSync } = await import('node:child_process');
   const tool = _sessionTool(sess);
+  const preferredTool = getSessionResumeProvider(cwd, sess);
+  if (preferredTool && preferredTool !== tool) {
+    const brief = _sessionBrief(sess, preferredTool);
+    writeHandoffConversationLease(cwd, sess, tool, preferredTool, brief);
+    markSessionSuperseded(cwd, sess, preferredTool, 'resume-provider-preference');
+    process.stdout.write(`\n  Continuing in ${preferredTool === 'codex' ? 'Codex/GPT' : 'Claude'} based on this conversation's setting.\n\n`);
+    await cmdSwitch([preferredTool, brief]);
+    return { next: 'main' };
+  }
   const launchArgs = _sessionLaunchArgs(sess, cwd);
   if (decision === 'takeover') {
     process.stdout.write('  Taking over active conversation in this terminal.\n');
@@ -3341,7 +3702,7 @@ async function mainScreen(rl, ask) {
     [`s`,     'settings & profiles'],
     [`d`,     'doctor — diagnose issues'],
     [`t`,     'team settings'],
-    [`a`,     getEffectiveAutomode(profile, cwd) ? 'auto mode  (on)' : 'auto mode  (off)'],
+    [`a`,     getEffectiveAutomode(profile, cwd) && !getEffectiveBypassPermissions(cwd) ? 'smart auto  (on)' : 'smart auto  (off)'],
     [`q`,     'quit'],
   ];
   for (const [key, label] of shortcuts) {
@@ -3359,7 +3720,7 @@ async function mainScreen(rl, ask) {
 
   // ── Key handling ──────────────────────────────────────────────────────────
   // Use raw keypress mode so we can show a live type-to-start buffer.
-  // Single-key commands (n, s, q, /, 1-9, Enter) only fire when buffer is empty.
+  // Shortcuts resolve on Enter; printable keys should never preempt natural text.
   let taskBuffer = '';
 
   const readline = await import('node:readline');
@@ -3410,8 +3771,15 @@ async function mainScreen(rl, ask) {
       if (name === 'return' || name === 'enter' || seq === '\r' || seq === '\n') {
         cleanup();
         if (taskBuffer.length > 0) {
+          const shortcut = taskBuffer.trim().toLowerCase();
+          const singleKeySet = new Set(['n', 'g', 's', 't', 'q', '/', 'i', '?', 'h', 'd', 'a']);
+          const digit = parseInt(shortcut, 10);
           process.stdout.write('\n');
-          resolve(`__task__:${taskBuffer}`);
+          if (singleKeySet.has(shortcut) || (!isNaN(digit) && digit >= 1 && digit <= 9)) {
+            resolve(shortcut);
+          } else {
+            resolve(`__task__:${taskBuffer}`);
+          }
         } else {
           resolve('');
         }
@@ -3439,25 +3807,6 @@ async function mainScreen(rl, ask) {
       const code = str.codePointAt(0);
       if (code < 32 || code === 127) return;
 
-      // Single-key commands only fire when buffer is empty
-      if (taskBuffer.length === 0) {
-        const lower = str.toLowerCase();
-        const singleKeySet = new Set(['n', 'g', 's', 't', 'q', '/', 'i', '?', 'h', 'd', 'a']);
-        if (singleKeySet.has(lower)) {
-          cleanup();
-          process.stdout.write('\n');
-          resolve(lower);
-          return;
-        }
-        const digit = parseInt(str, 10);
-        if (!isNaN(digit) && digit >= 1 && digit <= 9) {
-          cleanup();
-          process.stdout.write('\n');
-          resolve(str);
-          return;
-        }
-      }
-
       // Accumulate into buffer
       taskBuffer += str;
       renderBuffer(taskBuffer);
@@ -3482,11 +3831,17 @@ async function mainScreen(rl, ask) {
 
       if (cmd === 'mode') {
         const result = applyModeCommand(classified.modeCommand, cwd);
-        const keyLabel = classified.modeCommand.key === 'automode' ? 'Auto mode' : 'Bypass permissions';
+        const keyLabel = classified.modeCommand.key === 'manualMode'
+          ? 'Manual mode'
+          : classified.modeCommand.key === 'automode'
+            ? 'Smart Auto'
+            : 'Bypass mode';
         const state = result.value ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
-        process.stdout.write(`\n  ${keyLabel}: ${state}  \x1b[2m(${result.scope})\x1b[0m\n\n`);
-        await ask('  Press Enter to continue...');
-        return { next: 'main' };
+        const profileNow = loadProfile(cwd);
+        const modeNow = getEffectiveConversationMode(profileNow, cwd);
+        process.stdout.write(`\n  ${keyLabel}: ${state}  \x1b[2m(${result.scope})\x1b[0m\n`);
+        process.stdout.write(`  Effective mode: ${modeNow === 'bypass' ? '\x1b[31mBypass\x1b[0m' : modeNow === 'manual' ? '\x1b[2mManual\x1b[0m' : '\x1b[32mSmart Auto\x1b[0m'}\n\n`);
+        return await offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, keyLabel);
       }
 
       if (cmd === 'resume' || cmd === 'r') {
@@ -3569,12 +3924,12 @@ async function mainScreen(rl, ask) {
         const nextAuto = !getEffectiveAutomode(prof, cwd2);
         const settings = loadSessionSettings(cwd2);
         settings.automode = nextAuto;
+        if (nextAuto) settings.bypassPermissions = false;
         saveSessionSettings(cwd2, settings);
         const state = nextAuto ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
-        process.stdout.write(`\n  Automode: ${state}  \x1b[2m(this session)\x1b[0m\n`);
-        process.stdout.write(`  ${nextAuto ? 'Tasks dispatch immediately (HEAD still gates dangerous ops)' : 'Tasks require Enter to confirm'}\n\n`);
-        await ask('  Press Enter to continue...');
-        return { next: 'main' };
+        process.stdout.write(`\n  Smart Auto: ${state}  \x1b[2m(this session)\x1b[0m\n`);
+        process.stdout.write(`  ${nextAuto ? 'Safe tasks dispatch immediately; critical findings still interrupt.' : 'Manual mode: tasks require confirmation.'}\n\n`);
+        return await offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, 'Smart Auto');
       }
       if (cmd === 'init --replit') {
         await cmdInit(rl);
@@ -3764,10 +4119,10 @@ async function mainScreen(rl, ask) {
     const nextAuto = !getEffectiveAutomode(prof, cwd);
     const settings = loadSessionSettings(cwd);
     settings.automode = nextAuto;
+    if (nextAuto) settings.bypassPermissions = false;
     saveSessionSettings(cwd, settings);
-    process.stdout.write(`\n  Automode: ${nextAuto ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m'}  \x1b[2m(this session)\x1b[0m\n\n`);
-    await ask('  Press Enter to continue...');
-    return { next: 'main' };
+    process.stdout.write(`\n  Smart Auto: ${nextAuto ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m'}  \x1b[2m(this session)\x1b[0m\n\n`);
+    return await offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, 'Smart Auto');
   }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
@@ -3802,11 +4157,20 @@ async function switchProviderScreen(rl, ask, ctx = {}) {
   process.stdout.write('\n');
   process.stdout.write(`  Continue in ${target === 'codex' ? 'Codex/GPT' : 'Claude'}\n`);
   process.stdout.write(`  From: ${currentTool} · ${String(label || '').replace(/\s+/g, ' ').slice(0, 80)}\n\n`);
-  process.stdout.write(`  \x1b[36mEnter\x1b[0m switch now  \x1b[36mb\x1b[0m back\n\n`);
+  process.stdout.write(`  \x1b[36mEnter\x1b[0m switch now  \x1b[36mn\x1b[0m next resume  \x1b[36mb\x1b[0m back\n\n`);
 
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
-  if (choice === 'b' || choice === 'q' || choice === 'n') return { next: 'main' };
+  if (choice === 'n' || choice === 'next') {
+    setSessionResumeProvider(cwd, session, target, 'user-next-resume');
+    process.stdout.write(`\n  Next resume will continue this conversation in ${target === 'codex' ? 'Codex/GPT' : 'Claude'}.\n\n`);
+    await ask('  Press Enter to continue...');
+    return { next: 'main' };
+  }
+  if (choice === 'b' || choice === 'q') return { next: 'main' };
 
+  setSessionResumeProvider(cwd, session, target, 'user-switch-now');
+  writeHandoffConversationLease(cwd, session, currentTool, target, brief);
+  markSessionSuperseded(cwd, session, target, 'manual-provider-switch');
   await cmdSwitch([target, brief]);
   return { next: 'main' };
 }
@@ -3827,7 +4191,7 @@ async function paletteHelpScreen(rl, ask) {
   const CYAN = '\x1b[36m';
   const lines = [
     top,
-    row(`${CYAN}Keyboard Shortcuts${RESET} (single key, no Enter needed)`),
+    row(`${CYAN}Keyboard Shortcuts${RESET} (type key, then Enter)`),
     sep,
     row(`${CYAN}Enter${RESET}   Resume last session`),
     row(`${CYAN}n${RESET}       New coding session`),
@@ -4345,6 +4709,7 @@ async function settingsScreen(rl, ask) {
   const automode = getEffectiveAutomode(profile, cwd);
   const sessionSettings = loadSessionSettings(cwd);
   const bypassPermissions = getEffectiveBypassPermissions(cwd);
+  const conversationMode = getEffectiveConversationMode(profile, cwd);
   const autoScope = typeof sessionSettings.automode === 'boolean' ? 'session' : 'default';
   const permissionScope = typeof sessionSettings.bypassPermissions === 'boolean' ? 'session' : 'default';
 
@@ -4393,10 +4758,17 @@ async function settingsScreen(rl, ask) {
   const permMode = bypassPermissions
     ? `${RED}bypass approvals and sandbox${RESET}`
     : `${GREEN}safe approvals + workspace sandbox${RESET}`;
+  const modeLabel = conversationMode === 'bypass'
+    ? `${RED}Bypass${RESET}`
+    : conversationMode === 'manual'
+      ? `${DIM}Manual${RESET}`
+      : `${GREEN}Smart Auto${RESET}`;
   const convLines = [
-    `  ${DIM}Auto mode${RESET}      ${autoMark} ${automode ? 'run safe tasks immediately' : 'ask before launching tasks'}  ${DIM}[${autoScope}]${RESET}`,
-    `  ${DIM}Permissions${RESET}    ${permMark} ${permMode}  ${DIM}[${permissionScope}]${RESET}`,
-    `  ${DIM}Claude resume${RESET}  ${bypassPermissions ? '--dangerously-skip-permissions' : 'normal permissions'}`,
+    `  ${DIM}Mode${RESET}           ${modeLabel}`,
+    `  ${DIM}Manual${RESET}         ${automode ? xmark + ' off' : chk + ' on'}  ${DIM}[${autoScope}]${RESET}`,
+    `  ${DIM}Smart Auto${RESET}     ${autoMark} ${automode ? 'safe tasks run immediately' : 'disabled'}  ${DIM}[${autoScope}]${RESET}`,
+    `  ${DIM}Safety${RESET}         ${permMark} ${permMode}  ${DIM}[${permissionScope}]${RESET}`,
+    `  ${DIM}Claude resume${RESET}  ${bypassPermissions ? '--dangerously-skip-permissions' : automode ? '--permission-mode auto' : 'default permissions'}`,
     `  ${DIM}Codex resume${RESET}   ${bypassPermissions ? '--dangerously-bypass-approvals-and-sandbox' : `workspace-write + ${automode ? 'never ask' : 'on-request'}`}`,
   ];
 
@@ -4473,7 +4845,7 @@ async function settingsScreen(rl, ask) {
   const convContent = [
     ...convLines.map(l => l.replace(/^  /, '')),
     '',
-    signalLine('info', `${DIM}[o] auto mode  [v] permission mode${RESET}`),
+    signalLine('info', `${DIM}[o] smart auto  [m] manual  [v] bypass/safety${RESET}`),
   ];
 
   const sysContent = [
@@ -4518,23 +4890,34 @@ async function settingsScreen(rl, ask) {
 
   // Conversation behavior toggles
   if (choice === 'o') {
-    const nextAuto = !automode;
     const settings = loadSessionSettings(cwd);
-    settings.automode = nextAuto;
+    settings.automode = true;
+    settings.bypassPermissions = false;
     saveSessionSettings(cwd, settings);
-    process.stdout.write(`\n  Auto mode: ${nextAuto ? GREEN + 'ON' + RESET : DIM + 'OFF' + RESET} ${DIM}(this session)${RESET}\n\n`);
-    await ask('  Press Enter to continue...');
-    return { next: 'settings' };
+    process.stdout.write(`\n  Mode: ${GREEN}Smart Auto${RESET} ${DIM}(this session)${RESET}\n\n`);
+    const reload = await offerRuntimeReloadAfterModeChange(cwd, ask, [], 'Smart Auto');
+    return reload?.next === 'main' ? { next: 'settings' } : reload;
+  }
+
+  if (choice === 'm') {
+    const settings = loadSessionSettings(cwd);
+    settings.automode = false;
+    settings.bypassPermissions = false;
+    saveSessionSettings(cwd, settings);
+    process.stdout.write(`\n  Mode: ${DIM}Manual${RESET} ${DIM}(this session)${RESET}\n\n`);
+    const reload = await offerRuntimeReloadAfterModeChange(cwd, ask, [], 'Manual mode');
+    return reload?.next === 'main' ? { next: 'settings' } : reload;
   }
 
   if (choice === 'v') {
     if (bypassPermissions) {
       const settings = loadSessionSettings(cwd);
       settings.bypassPermissions = false;
+      settings.automode = true;
       saveSessionSettings(cwd, settings);
-      process.stdout.write(`\n  Permission mode: ${GREEN}safe approvals + workspace sandbox${RESET} ${DIM}(this session)${RESET}\n\n`);
-      await ask('  Press Enter to continue...');
-      return { next: 'settings' };
+      process.stdout.write(`\n  Mode: ${GREEN}Smart Auto${RESET}; safety boundary restored ${DIM}(this session)${RESET}\n\n`);
+      const reload = await offerRuntimeReloadAfterModeChange(cwd, ask, [], 'Smart Auto');
+      return reload?.next === 'main' ? { next: 'settings' } : reload;
     }
 
     process.stdout.write(`\n  ${RED}Bypass mode disables provider approval prompts and sandboxing.${RESET}\n`);
@@ -4543,8 +4926,11 @@ async function settingsScreen(rl, ask) {
     if (confirm === 'YES') {
       const settings = loadSessionSettings(cwd);
       settings.bypassPermissions = true;
+      settings.automode = true;
       saveSessionSettings(cwd, settings);
-      process.stdout.write(`\n  Permission mode: ${RED}bypass approvals and sandbox${RESET} ${DIM}(this session)${RESET}\n\n`);
+      process.stdout.write(`\n  Mode: ${RED}Bypass${RESET} ${DIM}(this session)${RESET}\n\n`);
+      const reload = await offerRuntimeReloadAfterModeChange(cwd, ask, [], 'Bypass mode');
+      return reload?.next === 'main' ? { next: 'settings' } : reload;
     } else {
       process.stdout.write('\n  Permission mode unchanged.\n\n');
     }
@@ -6454,6 +6840,15 @@ async function runScreens(startScreen = 'dashboard') {
   let current = startScreen;
   let ctx = {};
   while (current && current !== 'exit') {
+    if (current === 'main' || current === 'dashboard') {
+      const launchedPending = await processPendingRuntimeSwitch(process.cwd());
+      if (launchedPending) {
+        current = 'main';
+        ctx = {};
+        continue;
+      }
+    }
+
     // Handle type-to-start dispatch from mainScreen — all work routes through pipeline.
     if (current === 'go' && ctx.prompt) {
       const prompt = ctx.prompt;
@@ -7228,6 +7623,7 @@ async function main() {
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'handoff')  { await cmdHandoff(args.slice(1)); return; }
   if (cmd === 'switch')   { await cmdSwitch(args.slice(1)); return; }
+  if (cmd === 'runtime-switch') { await cmdRuntimeSwitch(args.slice(1)); return; }
   if (cmd === 'update' || cmd === 'upgrade') { await cmdUpdate(); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
@@ -7292,7 +7688,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'hot', 'cool',
+    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'runtime-switch', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch', 'update', 'upgrade',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),

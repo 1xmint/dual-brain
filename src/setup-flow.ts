@@ -30,6 +30,8 @@ interface SetupAnswers {
   workStyle?: string;
   automode?: boolean;
   bypassPermissions?: boolean;
+  automationLevel?: 'manual' | 'smart-auto';
+  permissionBoundary?: 'sandboxed' | 'bypass';
   advanced?: AdvancedOptions;
   setupMode?: string;
   shellDefault?: boolean;
@@ -64,7 +66,12 @@ interface SetupConfig {
   };
   models: Record<string, string>;
   budget: { sessionLimitTokens: number | null; warnAtPercent: number };
-  behavior: { automode: boolean; bypassPermissions: boolean };
+  behavior: {
+    automode: boolean;
+    bypassPermissions: boolean;
+    automationLevel: 'manual' | 'smart-auto';
+    permissionBoundary: 'sandboxed' | 'bypass';
+  };
   configuredAt: string;
   setupMode: string;
   shellDefault: boolean;
@@ -155,8 +162,8 @@ export function renderConfirmation(config: SetupConfig): string {
     row('Primary model:', config.models.execute),
     row('Think agent:', config.routing.thinkEnabled ? 'enabled' : 'disabled'),
     row('Learning:', config.routing.learningEnabled ? 'on' : 'off'),
-    row('Auto mode:', config.behavior.automode ? 'on' : 'off'),
-    row('Permissions:', config.behavior.bypassPermissions ? 'bypass approvals/sandbox' : 'safe approvals + sandbox'),
+    row('Automation:', config.behavior.automationLevel === 'smart-auto' ? 'Smart Auto' : 'Manual'),
+    row('Safety:', config.behavior.permissionBoundary === 'bypass' ? 'Bypass approvals/sandbox' : 'Sandboxed approvals'),
     row('Shell default:', config.shellDefault ? 'dual-brain' : 'leave current shell menu'),
     '',
   ].join('\n');
@@ -165,6 +172,8 @@ export function renderConfirmation(config: SetupConfig): string {
 // ── Config builder ────────────────────────────────────────────────────────────
 export function buildConfig(answers: SetupAnswers, detected: DetectedEnvironment): SetupConfig {
   const { subscription = 'auto-detected', subscriptionCapacity, workStyle = 'balanced', automode = workStyle === 'auto', bypassPermissions = false, advanced = {}, setupMode = 'quick', shellDefault = true } = answers;
+  const automationLevel = answers.automationLevel || (automode ? 'smart-auto' : 'manual');
+  const permissionBoundary = answers.permissionBoundary || (bypassPermissions ? 'bypass' : 'sandboxed');
   const dual = subscription.startsWith('dual-');
   const isMax = subscription.includes('max') || subscription === 'chatgpt-pro';
   const topModel = isMax ? 'opus' : 'sonnet';
@@ -184,7 +193,7 @@ export function buildConfig(answers: SetupAnswers, detected: DetectedEnvironment
     },
     models: advanced.models || { search: 'haiku', execute: 'sonnet', think: topModel, review: topModel },
     budget: { sessionLimitTokens: advanced.sessionLimitTokens ?? null, warnAtPercent: advanced.warnAtPercent ?? 80 },
-    behavior: { automode, bypassPermissions },
+    behavior: { automode, bypassPermissions, automationLevel, permissionBoundary },
     configuredAt: new Date().toISOString(),
     setupMode,
     shellDefault,
@@ -329,19 +338,19 @@ export async function runSetup(cwd: string, options: SetupOptions = {}): Promise
     const subscriptionCapacity = parseCapacity(capacityRaw);
     const subscription = subscriptionCapacity ? 'declared-capacity' : 'auto-detected';
     const workStyle = await ask(rl, 'How should dual-brain route your work?', [
-      { label: 'Balanced',     value: 'balanced',     description: 'smart defaults, asks before expensive ops' },
+      { label: 'Balanced',     value: 'balanced',     description: 'smart defaults, asks before expensive/high-risk ops' },
       { label: 'Conservative', value: 'conservative', description: 'minimize tokens, prefer cheaper models' },
       { label: 'Aggressive',   value: 'aggressive',   description: 'best model available, maximize quality' },
-      { label: 'Full auto',    value: 'auto',         description: 'never ask, optimize silently' },
+      { label: 'Smart Auto',   value: 'auto',         description: 'safe tasks run automatically; risky work gates' },
     ]) as string;
     const automode = await askYN(
       rl,
-      'Auto mode by default? (safe tasks launch without asking; high-risk work still gates)',
+      'Smart Auto by default? (safe tasks launch without asking; high-risk work still gates)',
       workStyle === 'auto'
     );
     const permissionMode = await ask(rl, 'Provider permission mode:', [
-      { label: 'Safe approvals + sandbox', value: 'safe',   description: 'recommended; enforced workspace sandbox and approval policy' },
-      { label: 'Bypass approvals/sandbox', value: 'bypass', description: 'advanced; trusted workspaces only' },
+      { label: 'Sandboxed approvals', value: 'safe',   description: 'recommended; workspace sandbox with smart approvals' },
+      { label: 'Bypass approvals/sandbox', value: 'bypass', description: 'advanced; trusted workspaces only; disables provider safety boundary' },
     ]) as string;
     const bypassPermissions = permissionMode === 'bypass'
       ? await askYN(rl, 'Confirm bypass mode? This disables provider approval prompts/sandboxing.', false)
@@ -359,7 +368,18 @@ export async function runSetup(cwd: string, options: SetupOptions = {}): Promise
       ]) as number;
       advanced = { thinkEnabled, cascadeEnabled, learningEnabled, explorationRate };
     }
-    const config = buildConfig({ subscription, subscriptionCapacity, workStyle, automode, bypassPermissions, advanced, setupMode: mode, shellDefault }, detected);
+    const config = buildConfig({
+      subscription,
+      subscriptionCapacity,
+      workStyle,
+      automode,
+      bypassPermissions,
+      automationLevel: automode ? 'smart-auto' : 'manual',
+      permissionBoundary: bypassPermissions ? 'bypass' : 'sandboxed',
+      advanced,
+      setupMode: mode,
+      shellDefault,
+    }, detected);
     console.log(renderConfirmation(config));
     if (!await askYN(rl, 'Save and start?', true)) {
       console.log('\n' + c.yellow('Setup cancelled.') + '\n');

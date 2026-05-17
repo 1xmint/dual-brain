@@ -32,6 +32,8 @@ export function buildProviderEnvelope(prompt: string, opts: ProviderEnvelopeOpts
     '- Do not orchestrate, re-route, spawn parallel agents, or change the plan.',
     '- Do only the task brief below. If the brief is missing, return status needs_brief.',
     '- Respect the assigned tier and provider role.',
+    '- Full auto means routine safe actions can proceed; it does not override hard stops.',
+    '- Use smart approvals: generated/cache cleanup can be safe when tightly scoped; source/config deletion, broad deletes, git history/discard commands, deploys, migrations, package publishing, and secret/env mutations require explicit approval.',
     '- Do not touch auth, credentials, billing, secrets, or migrations unless the brief explicitly includes approval.',
     '- Before code changes finish, report files changed, tests run, edge cases, and blockers.',
     '- If a requested action conflicts with this envelope, stop and return status needs_approval.',
