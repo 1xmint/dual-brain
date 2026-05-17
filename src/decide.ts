@@ -276,6 +276,28 @@ function rankOpenAIModels(models: string[], purpose: 'head' | 'search' | 'execut
   });
 }
 
+function pickOpenAIHeadForLevel(models: string[], level: number): string | undefined {
+  const preferred = level >= 5
+    ? [/^gpt-5\.5$/i, /^gpt-5\.4$/i, /^gpt-5\.2$/i]
+    : level >= 4
+      ? [/^gpt-5\.5$/i, /^gpt-5\.4$/i, /^gpt-5\.4-mini$/i]
+      : level >= 3
+        ? [/^gpt-5\.4$/i, /^gpt-5\.4-mini$/i, /^gpt-5\.5$/i]
+        : [/^gpt-5\.4-mini$/i, /^gpt-4\.1-mini$/i, /^gpt-4o-mini$/i, /^gpt-5\.4$/i];
+  for (const re of preferred) {
+    const match = models.find(m => re.test(m));
+    if (match) return match;
+  }
+  return rankOpenAIModels(models, 'head')[0];
+}
+
+function pickClaudeHeadForLevel(models: string[], level: number): string | undefined {
+  if (level >= 4 && models.includes('opus')) return 'opus';
+  if (models.includes('sonnet')) return 'sonnet';
+  if (models.includes('default')) return 'default';
+  return models[0];
+}
+
 export interface HeadRecommendation {
   provider: 'claude' | 'openai';
   model: string;
@@ -287,18 +309,18 @@ export interface HeadRecommendation {
 }
 
 export function recommendHeadModel(
-  profile: { mode?: string; providers?: Record<string, { enabled?: boolean; models?: string[]; plan?: string }> },
+  profile: { mode?: string; intelligenceLevel?: number; settings?: { intelligenceLevel?: number }; providers?: Record<string, { enabled?: boolean; models?: string[]; plan?: string }> },
 ): HeadRecommendation {
   const available = getAvailableModels(profile);
   const claudeEnabled = profile?.providers?.claude?.enabled !== false && available.claude.length > 0;
   const openaiEnabled = profile?.providers?.openai?.enabled !== false && available.openai.length > 0;
   const mode = String(profile?.mode || 'auto');
-  const openaiHead = rankOpenAIModels(available.openai, mode === 'cost-saver' ? 'search' : 'head')[0];
-  const claudeHead =
-    mode === 'quality-first' && available.claude.includes('opus') ? 'opus' :
-    available.claude.includes('sonnet') ? 'sonnet' :
-    available.claude.includes('default') ? 'default' :
-    available.claude[0];
+  const level = Math.max(1, Math.min(5, Number(profile?.intelligenceLevel ?? profile?.settings?.intelligenceLevel ?? 3) || 3));
+  const levelName = ['Quick', 'Daily', 'Smart', 'Expert', 'Max'][level - 1] || 'Smart';
+  const openaiHead = mode === 'cost-saver'
+    ? rankOpenAIModels(available.openai, 'search')[0]
+    : pickOpenAIHeadForLevel(available.openai, level);
+  const claudeHead = pickClaudeHeadForLevel(available.claude, level);
 
   const alternatives: HeadRecommendation['alternatives'] = [];
   if (claudeEnabled && claudeHead) {
@@ -323,7 +345,7 @@ export function recommendHeadModel(
       effort: openaiHead.includes('5.') ? 'medium' : undefined,
       confidence: _codexModelCache.models ? 'high' : 'medium',
       source: _codexModelCache.models ? 'codex debug models' : 'static fallback',
-      reason: `${openaiHead} is the strongest available GPT head candidate from the local Codex catalog; keep Claude available for comparison and failover.`,
+      reason: `${openaiHead} matches Intelligence ${level} (${levelName}) for an always-on orchestration HEAD; stronger models remain available for escalation.`,
       alternatives,
     };
   }
@@ -332,9 +354,10 @@ export function recommendHeadModel(
     return {
       provider: 'claude',
       model: claudeHead,
+      effort: claudeHead === 'opus' ? 'medium' : undefined,
       confidence: _claudeModelCache.source === 'claude-cli-aliases' ? 'high' : 'medium',
       source: _claudeModelCache.source,
-      reason: `${claudeHead} is the best Claude Code head alias available locally; use GPT as the secondary execution/review brain.`,
+      reason: `${claudeHead} matches Intelligence ${level} (${levelName}) for the conversational HEAD; use premium think/review escalation when needed.`,
       alternatives,
     };
   }

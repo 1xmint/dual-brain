@@ -30,7 +30,7 @@ function _claudeResumeArgs(sessionId, cwd) {
   if (getEffectiveBypassPermissions(workspace)) args.push('--dangerously-skip-permissions');
   else if (getEffectiveAutomode(loadProfile(workspace), workspace)) {
     const settings = loadSessionSettings(workspace);
-    if (settings.headModel) args.push('--model', settings.headModel);
+    if (_modelMatchesProvider(settings.headModel, 'claude')) args.push('--model', settings.headModel);
     if (settings.effort) args.push('--effort', settings.effort);
     args.push('--permission-mode', 'auto');
   }
@@ -43,7 +43,7 @@ function _claudeNewArgs(cwd) {
   if (getEffectiveBypassPermissions(workspace)) args.push('--dangerously-skip-permissions');
   else if (getEffectiveAutomode(loadProfile(workspace), workspace)) {
     const settings = loadSessionSettings(workspace);
-    if (settings.headModel) args.push('--model', settings.headModel);
+    if (_modelMatchesProvider(settings.headModel, 'claude')) args.push('--model', settings.headModel);
     if (settings.effort) args.push('--effort', settings.effort);
     args.push('--permission-mode', 'auto');
   }
@@ -55,8 +55,17 @@ function _codexResumeArgs(sessionId, cwd) {
   if (getEffectiveBypassPermissions(workspace)) {
     return ['--dangerously-bypass-approvals-and-sandbox', 'resume', sessionId];
   }
+  const settings = loadSessionSettings(workspace);
   const approvalMode = getEffectiveAutomode(loadProfile(workspace), workspace) ? 'never' : 'on-request';
-  return [..._codexApprovalArgs(workspace, approvalMode), 'resume', sessionId];
+  return [
+    ..._codexModelEffortArgs(
+      _modelMatchesProvider(settings.headModel, 'codex') ? settings.headModel : null,
+      settings.effort,
+    ),
+    ..._codexApprovalArgs(workspace, approvalMode),
+    'resume',
+    sessionId,
+  ];
 }
 
 function _isReplitWorkspace(cwd) {
@@ -76,6 +85,86 @@ function _codexApprovalArgs(cwd, approvalMode = 'on-request') {
   // Codex approvals instead of launching a HEAD that cannot run any command.
   const sandboxMode = _isReplitWorkspace(cwd) ? 'danger-full-access' : 'workspace-write';
   return ['--sandbox', sandboxMode, '--ask-for-approval', approvalMode];
+}
+
+const INTELLIGENCE_LEVELS = {
+  1: {
+    name: 'Quick',
+    tagline: 'fast answers and obvious edits',
+    claude: { model: 'sonnet', effort: 'low' },
+    codex: { model: 'gpt-5.4-mini', effort: 'low' },
+  },
+  2: {
+    name: 'Daily',
+    tagline: 'normal vibe coding with light escalation',
+    claude: { model: 'sonnet', effort: 'medium' },
+    codex: { model: 'gpt-5.4-mini', effort: 'medium' },
+  },
+  3: {
+    name: 'Smart',
+    tagline: 'recommended product/dev orchestration',
+    claude: { model: 'sonnet', effort: 'medium' },
+    codex: { model: 'gpt-5.4', effort: 'medium' },
+  },
+  4: {
+    name: 'Expert',
+    tagline: 'hard debugging, architecture, auth, security',
+    claude: { model: 'opus', effort: 'medium' },
+    codex: { model: 'gpt-5.5', effort: 'medium' },
+  },
+  5: {
+    name: 'Max',
+    tagline: 'highest-quality HEAD, slower and heavier',
+    claude: { model: 'opus', effort: 'high' },
+    codex: { model: 'gpt-5.5', effort: 'high' },
+  },
+};
+
+function _normalizeIntelligenceLevel(value, fallback = 3) {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(n) && n >= 1 && n <= 5 ? n : fallback;
+}
+
+function _getIntelligenceLevel(profile, settings = {}) {
+  return _normalizeIntelligenceLevel(
+    settings.intelligenceLevel ?? profile?.intelligenceLevel ?? profile?.settings?.intelligenceLevel,
+    3,
+  );
+}
+
+function _headPolicyFor(provider, profile, settings = {}) {
+  const level = _getIntelligenceLevel(profile, settings);
+  const policy = INTELLIGENCE_LEVELS[level] || INTELLIGENCE_LEVELS[3];
+  const target = provider === 'claude' ? 'claude' : 'codex';
+  return {
+    level,
+    levelName: policy.name,
+    tagline: policy.tagline,
+    provider: target,
+    model: policy[target].model,
+    effort: policy[target].effort,
+  };
+}
+
+function _defaultHeadModelForProvider(provider, profile = null, settings = {}) {
+  return _headPolicyFor(provider, profile, settings).model;
+}
+
+function _defaultEffortForModel(model, provider = 'codex', profile = null, settings = {}) {
+  return _headPolicyFor(provider, profile, settings).effort || (model ? 'medium' : null);
+}
+
+function _modelMatchesProvider(model, provider) {
+  if (!model) return false;
+  if (provider === 'claude') return /^(opus|sonnet|haiku|claude)/i.test(model);
+  return /^(gpt|o[0-9]|codex)/i.test(model);
+}
+
+function _codexModelEffortArgs(model, effort) {
+  const args = [];
+  if (model) args.push('--model', model);
+  if (effort) args.push('-c', `model_reasoning_effort="${effort}"`);
+  return args;
 }
 
 function _sessionTool(session) {
@@ -1073,7 +1162,11 @@ async function cmdStatus(args = []) {
   }
 
   // Head model
+  const settings = loadSessionSettings(cwd);
+  const intelligenceLevel = _getIntelligenceLevel(profile, settings);
+  const intelligencePolicy = INTELLIGENCE_LEVELS[intelligenceLevel] || INTELLIGENCE_LEVELS[3];
   console.log(`\nHead model : ${getHeadModel(profile)}`);
+  console.log(`Intelligence: ${intelligenceLevel} · ${intelligencePolicy.name} — ${intelligencePolicy.tagline}`);
   console.log(`Mode       : ${profile.mode}`);
   console.log(`Solo brain : ${isSoloBrain(profile) ? 'yes' : 'no'}`);
   try {
@@ -1337,14 +1430,22 @@ async function cmdRuntimeSwitch(args = []) {
   const cwd = process.cwd();
   let sessions = [];
   try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
-  const sess = sessions[0];
+  const active = readActiveConversation(cwd);
+  const sess = active
+    ? (sessions.find(s => s.id === active.sessionId) || {
+        id: active.sessionId,
+        tool: active.provider,
+        smartName: active.sessionName || active.conversationId || active.sessionId,
+      })
+    : sessions[0];
   if (!sess) {
     console.log('No resumable session found.');
     return;
   }
 
   const profile = loadProfile(cwd);
-  const settings = loadSessionSettings(cwd);
+  const settingsTerminalId = active?.terminalId || getTerminalId();
+  const settings = loadSessionSettings(cwd, settingsTerminalId);
   let provider = _sessionTool(sess);
   let reason = 'head-runtime-switch';
   const confirmed = args.includes('--confirm') || args.includes('--go');
@@ -1362,6 +1463,9 @@ async function cmdRuntimeSwitch(args = []) {
     if (a === '--effort' && args[i + 1]) {
       settings.effort = args[i + 1];
     }
+    if ((a === '--level' || a === '--intelligence' || a === '--intelligence-level') && args[i + 1]) {
+      settings.intelligenceLevel = _normalizeIntelligenceLevel(args[i + 1], settings.intelligenceLevel || 3);
+    }
     if (a === '--reason' && args[i + 1]) reason = args[i + 1];
   }
 
@@ -1377,14 +1481,27 @@ async function cmdRuntimeSwitch(args = []) {
     settings.automode = true;
     settings.bypassPermissions = true;
   }
-  saveSessionSettings(cwd, settings);
+
+  const headPolicy = _headPolicyFor(provider, profile, settings);
+  if (!settings.headModel || !_modelMatchesProvider(settings.headModel, provider)) {
+    settings.headModel = headPolicy.model;
+  }
+  if (!settings.effort) settings.effort = headPolicy.effort;
+  saveSessionSettings(cwd, settings, settingsTerminalId);
+
+  const effectiveAutomode = typeof settings.automode === 'boolean'
+    ? settings.automode
+    : (profile.automode ?? profile.settings?.automode ?? false);
+  const effectiveBypass = typeof settings.bypassPermissions === 'boolean'
+    ? settings.bypassPermissions
+    : !!profile.bypassPermissions;
 
   const pending = writePendingRuntimeSwitch(cwd, sess, {
     provider,
-    automode: getEffectiveAutomode(profile, cwd),
-    bypassPermissions: getEffectiveBypassPermissions(cwd),
-    model: settings.headModel || null,
-    effort: settings.effort || null,
+    automode: effectiveAutomode,
+    bypassPermissions: effectiveBypass,
+    model: settings.headModel,
+    effort: settings.effort,
     confirmed,
     reason,
   });
@@ -1398,11 +1515,27 @@ async function cmdRuntimeSwitch(args = []) {
   console.log(`Provider: ${provider}`);
   console.log(`Mode: ${getEffectiveConversationMode(profile, cwd)}`);
   console.log(`Launch: ${provider} ${launchArgs.join(' ')}`);
+  if (confirmed) {
+    const activeForSwitch = readActiveConversation(cwd);
+    if (activeForSwitch?.sessionId === sess.id) {
+      console.log('Active supervisor detected: HEAD will restart with these settings.');
+    } else if (!args.includes('--apply')) {
+      console.log('No active supervisor detected: saved for the next dual-brain resume/switch, not live yet.');
+    }
+  }
   console.log('');
 
   if (args.includes('--apply')) {
-    await processPendingRuntimeSwitch(cwd);
+    const applied = await processPendingRuntimeSwitch(cwd);
+    if (!applied) console.log('Could not apply live here; resume the session through dual-brain to use these settings.');
   }
+}
+
+async function cmdAuto(args = []) {
+  const switchArgs = ['--automode', '--confirm'];
+  const levelIdx = args.findIndex(a => a === '--level' || a === '--intelligence' || a === '--intelligence-level');
+  if (levelIdx !== -1 && args[levelIdx + 1]) switchArgs.push('--level', args[levelIdx + 1]);
+  await cmdRuntimeSwitch(switchArgs);
 }
 
 async function cmdUpdate() {
@@ -2317,41 +2450,125 @@ function applyModeCommand(cmd, cwd) {
   return { scope: 'this session', value: cmd.value, key: cmd.key };
 }
 
+function parseIntelligenceCommand(input, cwd = process.cwd()) {
+  const text = input.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!/\b(intelligence|intel|smartness|brain|level|quality)\b/.test(text)) return null;
+  const wantsSession = /\b(this|current)\s+(session|conversation|terminal|chat|manager|supervisor)\b|\bfor this\b|\bfor current\b/.test(text);
+  const wantsGlobal = /\b(default|global|profile|always|future sessions|all sessions)\b/.test(text);
+  const scope = wantsGlobal && !wantsSession ? 'profile' : 'session';
+
+  let level = null;
+  const named = [
+    ['quick', 1],
+    ['daily', 2],
+    ['smart', 3],
+    ['expert', 4],
+    ['max', 5],
+    ['maximum', 5],
+  ];
+  for (const [name, value] of named) {
+    if (new RegExp(`\\b${name}\\b`).test(text)) level = value;
+  }
+  const num = text.match(/\b(?:level\s*)?([1-5])\b/);
+  if (num) level = Number.parseInt(num[1], 10);
+
+  if (/\b(up|higher|raise|increase|smarter|stronger|better)\b/.test(text)) {
+    const current = _getIntelligenceLevel(loadProfile(cwd), loadSessionSettings(cwd));
+    level = Math.min(5, current + 1);
+  }
+  if (/\b(down|lower|decrease|cheaper|faster|lighter)\b/.test(text)) {
+    const current = _getIntelligenceLevel(loadProfile(cwd), loadSessionSettings(cwd));
+    level = Math.max(1, current - 1);
+  }
+  if (!level) return null;
+  return { level: _normalizeIntelligenceLevel(level, 3), scope };
+}
+
+function applyIntelligenceCommand(cmd, cwd) {
+  const profile = loadProfile(cwd);
+  if (cmd.scope === 'profile') {
+    profile.intelligenceLevel = cmd.level;
+    profile.settings = { ...(profile.settings || {}), intelligenceLevel: cmd.level };
+    saveProfile(profile, { cwd });
+    return { scope: 'default', level: cmd.level };
+  }
+
+  const settings = loadSessionSettings(cwd);
+  settings.intelligenceLevel = cmd.level;
+  delete settings.headModel;
+  delete settings.effort;
+  saveSessionSettings(cwd, settings);
+  return { scope: 'this session', level: cmd.level };
+}
+
 async function offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, label = 'runtime settings') {
   const cyan = '\x1b[36m';
   const reset = '\x1b[0m';
+  const profile = loadProfile(cwd);
+  const active = readActiveConversation(cwd);
   let candidates = Array.isArray(recentSessions) ? recentSessions : [];
   if (candidates.length === 0) {
     try { candidates = enrichSessions(importReplitSessions(cwd), cwd).slice(0, 3); } catch {}
   }
-  const sess = candidates[0] || null;
+  const sess = active
+    ? (candidates.find(s => s.id === active.sessionId) || {
+        id: active.sessionId,
+        tool: active.provider,
+        smartName: active.sessionName || active.conversationId || active.sessionId,
+      })
+    : candidates[0] || null;
   process.stdout.write('  Provider approval flags are applied when Claude/Codex starts.\n');
   if (!sess) {
-    process.stdout.write(`  ${label} will apply to the next session you launch through dual-brain.\n\n`);
+    process.stdout.write(`  ${label} saved, but no resumable HEAD session was found.\n`);
+    process.stdout.write('  It will apply to the next session launched through dual-brain.\n\n');
     await ask('  Press Enter to continue...');
     return { next: 'main' };
   }
 
   const tool = _sessionTool(sess);
-  const launchArgs = _sessionLaunchArgs(sess, cwd);
+  const settings = loadSessionSettings(cwd, active?.terminalId || getTerminalId());
+  const headPolicy = _headPolicyFor(tool, profile, settings);
+  if (!settings.headModel || !_modelMatchesProvider(settings.headModel, tool)) settings.headModel = headPolicy.model;
+  if (!settings.effort) settings.effort = headPolicy.effort;
+  saveSessionSettings(cwd, settings, active?.terminalId || getTerminalId());
+  const effectiveAutomode = typeof settings.automode === 'boolean'
+    ? settings.automode
+    : (profile.automode ?? profile.settings?.automode ?? false);
+  const effectiveBypass = typeof settings.bypassPermissions === 'boolean'
+    ? settings.bypassPermissions
+    : !!profile.bypassPermissions;
+  const launchArgs = runtimeLaunchArgsForPending(sess, cwd, {
+    provider: tool,
+    model: settings.headModel,
+    effort: settings.effort,
+    automode: effectiveAutomode,
+    bypassPermissions: effectiveBypass,
+  });
   writePendingRuntimeSwitch(cwd, sess, {
     provider: tool,
-    automode: getEffectiveAutomode(loadProfile(cwd), cwd),
-    bypassPermissions: getEffectiveBypassPermissions(cwd),
+    model: settings.headModel,
+    effort: settings.effort,
+    automode: effectiveAutomode,
+    bypassPermissions: effectiveBypass,
     reason: `${label}-reload`,
   });
   process.stdout.write(`  Reload needed: ${tool} must restart with: ${launchArgs.join(' ')}\n\n`);
+  if (!active) {
+    process.stdout.write('  No active dual-brain supervisor is attached to this shell, so this cannot be applied live.\n');
+  }
   process.stdout.write(`  ${cyan}Enter${reset} reload last session now  ${cyan}n${reset} later\n\n`);
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
   if (choice === 'n' || choice === 'no' || choice === 'later') {
-    process.stdout.write('\n  Saved. It will apply on the next dual-brain resume/switch.\n\n');
+    process.stdout.write('\n  Saved for next dual-brain resume/switch. It is not live in the current provider process.\n\n');
     await ask('  Press Enter to continue...');
     return { next: 'main' };
   }
   writePendingRuntimeSwitch(cwd, sess, {
     provider: tool,
-    automode: getEffectiveAutomode(loadProfile(cwd), cwd),
-    bypassPermissions: getEffectiveBypassPermissions(cwd),
+    model: settings.headModel,
+    effort: settings.effort,
+    automode: effectiveAutomode,
+    bypassPermissions: effectiveBypass,
     reason: `${label}-reload`,
     confirmed: true,
   });
@@ -2418,6 +2635,7 @@ function runtimeLaunchArgsForPending(session, cwd, pending) {
   if (tool === 'codex') {
     if (pending?.bypassPermissions) return ['--dangerously-bypass-approvals-and-sandbox', 'resume', session.id];
     return [
+      ..._codexModelEffortArgs(pending?.model, pending?.effort),
       ..._codexApprovalArgs(cwd, pending?.automode ? 'never' : 'on-request'),
       'resume', session.id,
     ];
@@ -2488,6 +2706,7 @@ function writeActiveConversation(cwd, session, tool, extra = {}) {
   const lease = {
     conversationId: session.id,
     sessionId: session.id,
+    sessionName: session.smartName || session.name || session.prompts?.first || session.firstPrompt || session.id,
     provider: tool,
     terminalId,
     ownerPid: process.pid,
@@ -2686,6 +2905,7 @@ async function launchSupervisedHandoff(session, cwd, currentTool, targetTool, br
     launchArgs = pending?.bypassPermissions
       ? ['--dangerously-bypass-approvals-and-sandbox', prompt.slice(0, 4000)]
       : [
+          ..._codexModelEffortArgs(pending?.model, pending?.effort),
           ..._codexApprovalArgs(cwd, pending?.automode ? 'never' : 'on-request'),
           prompt.slice(0, 4000),
         ];
@@ -2695,7 +2915,10 @@ async function launchSupervisedHandoff(session, cwd, currentTool, targetTool, br
       : pending?.automode
         ? ['--permission-mode', 'auto']
         : [];
-    launchArgs = [...permissionArgs, prompt.slice(0, 4000)];
+    const modelArgs = [];
+    if (pending?.model) modelArgs.push('--model', pending.model);
+    if (pending?.effort) modelArgs.push('--effort', pending.effort);
+    launchArgs = [...modelArgs, ...permissionArgs, prompt.slice(0, 4000)];
   }
 
   process.stdout.write(`  Launching: ${targetTool} ${launchArgs.slice(0, -1).join(' ')} [handoff context]\n\n`);
@@ -3100,6 +3323,11 @@ function classifyInput(input) {
   const modeCommand = parseModeCommand(trimmed);
   if (modeCommand) {
     return { tier: 'free', command: 'mode', args: [], modeCommand };
+  }
+
+  const intelligenceCommand = parseIntelligenceCommand(trimmed);
+  if (intelligenceCommand) {
+    return { tier: 'free', command: 'intelligence', args: [], intelligenceCommand };
   }
 
   // Tier 0: SKILL — slash commands (checked first, deterministic)
@@ -3988,6 +4216,14 @@ async function mainScreen(rl, ask) {
         return await offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, keyLabel);
       }
 
+      if (cmd === 'intelligence') {
+        const result = applyIntelligenceCommand(classified.intelligenceCommand, cwd);
+        const policy = INTELLIGENCE_LEVELS[result.level] || INTELLIGENCE_LEVELS[3];
+        process.stdout.write(`\n  Intelligence: \x1b[32m${result.level} · ${policy.name}\x1b[0m  \x1b[2m(${result.scope})\x1b[0m\n`);
+        process.stdout.write(`  ${policy.tagline}\n\n`);
+        return await offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, `Intelligence ${result.level}`);
+      }
+
       if (cmd === 'resume' || cmd === 'r') {
         if (recentSessions.length === 0) return { next: 'new-session' };
         return { next: 'sessions' };
@@ -4854,6 +5090,10 @@ async function settingsScreen(rl, ask) {
   const sessionSettings = loadSessionSettings(cwd);
   const bypassPermissions = getEffectiveBypassPermissions(cwd);
   const conversationMode = getEffectiveConversationMode(profile, cwd);
+  const intelligenceLevel = _getIntelligenceLevel(profile, sessionSettings);
+  const intelligencePolicy = INTELLIGENCE_LEVELS[intelligenceLevel] || INTELLIGENCE_LEVELS[3];
+  const gptHead = _headPolicyFor('codex', profile, sessionSettings);
+  const claudeHead = _headPolicyFor('claude', profile, sessionSettings);
   const autoScope = typeof sessionSettings.automode === 'boolean' ? 'session' : 'default';
   const permissionScope = typeof sessionSettings.bypassPermissions === 'boolean' ? 'session' : 'default';
 
@@ -4894,6 +5134,15 @@ async function settingsScreen(rl, ask) {
     `  ${dot(_stIsFast)} ${_stIsFast ? BOLD : DIM}Fast${RESET}   speed over caution`,
     `  ${dot(_stIsBal)}  ${_stIsBal ? BOLD : DIM}Balanced${RESET}   smart routing, reviews on important`,
     `  ${dot(_stIsFull)} ${_stIsFull ? BOLD : DIM}Full Power${RESET}   dual-brain everything, max quality`,
+  ];
+
+  const intelTicks = [1, 2, 3, 4, 5].map(n => n === intelligenceLevel ? `${GREEN}${n}${RESET}` : `${DIM}${n}${RESET}`).join(' ');
+  const intelLines = [
+    `  ${DIM}Level${RESET}          ${BOLD}${intelligenceLevel} · ${intelligencePolicy.name}${RESET}`,
+    `  ${DIM}Good for${RESET}       ${intelligencePolicy.tagline}`,
+    `  ${DIM}Scale${RESET}          ${intelTicks}  ${DIM}Quick → Max${RESET}`,
+    `  ${DIM}GPT HEAD${RESET}       ${gptHead.model} (${gptHead.effort})`,
+    `  ${DIM}Claude HEAD${RESET}    ${claudeHead.model} (${claudeHead.effort})`,
   ];
 
   // ── Conversation behavior ───────────────────────────────────────────────
@@ -4986,6 +5235,12 @@ async function settingsScreen(rl, ask) {
     signalLine('info', `${DIM}[1-3] change${RESET}`),
   ];
 
+  const intelContent = [
+    ...intelLines.map(l => l.replace(/^  /, '')),
+    '',
+    signalLine('info', `${DIM}[4] Quick  [5] Daily  [6] Smart  [7] Expert  [8] Max${RESET}`),
+  ];
+
   const convContent = [
     ...convLines.map(l => l.replace(/^  /, '')),
     '',
@@ -5006,6 +5261,7 @@ async function settingsScreen(rl, ask) {
   process.stdout.write('\n');
   process.stdout.write(panel('Subscriptions', subsContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('Work style', wsContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
+  process.stdout.write(panel('Intelligence', intelContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('Conversation', convContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('System', sysContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('Navigation', navContent, { width: settingsPanelW }) + '\n\n');
@@ -5030,6 +5286,21 @@ async function settingsScreen(rl, ask) {
       await ask('  Press Enter to continue...');
     }
     return { next: 'settings' };
+  }
+
+  if (['4', '5', '6', '7', '8'].includes(choice)) {
+    const levelMap = { '4': 1, '5': 2, '6': 3, '7': 4, '8': 5 };
+    const level = levelMap[choice];
+    const settings = loadSessionSettings(cwd);
+    settings.intelligenceLevel = level;
+    delete settings.headModel;
+    delete settings.effort;
+    saveSessionSettings(cwd, settings);
+    const policy = INTELLIGENCE_LEVELS[level] || INTELLIGENCE_LEVELS[3];
+    process.stdout.write(`\n  Intelligence: ${GREEN}${level} · ${policy.name}${RESET} ${DIM}(this session)${RESET}\n`);
+    process.stdout.write(`  ${DIM}${policy.tagline}${RESET}\n\n`);
+    const reload = await offerRuntimeReloadAfterModeChange(cwd, ask, [], `Intelligence ${level}`);
+    return reload?.next === 'main' ? { next: 'settings' } : reload;
   }
 
   // Conversation behavior toggles
@@ -7754,6 +8025,7 @@ async function main() {
   if (cmd === 'handoff')  { await cmdHandoff(args.slice(1)); return; }
   if (cmd === 'switch')   { await cmdSwitch(args.slice(1)); return; }
   if (cmd === 'runtime-switch') { await cmdRuntimeSwitch(args.slice(1)); return; }
+  if (cmd === 'auto' || cmd === 'automode' || cmd === 'smart-auto') { await cmdAuto(args.slice(1)); return; }
   if (cmd === 'update' || cmd === 'upgrade') { await cmdUpdate(); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
@@ -7818,7 +8090,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'runtime-switch', 'hot', 'cool',
+    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'runtime-switch', 'auto', 'automode', 'smart-auto', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch', 'update', 'upgrade',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),

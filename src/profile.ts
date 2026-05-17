@@ -61,10 +61,14 @@ export interface Profile {
   bias: string;
   preferences: Preference[];
   apiGuardrail: boolean;
+  settings?: Record<string, unknown>;
   capabilities?: DetectedCapabilities;
   detectedAt?: string;
   forbiddenModels?: string[];
   preferredModels?: string[];
+  headModel?: string;
+  headEffort?: string;
+  intelligenceLevel?: number;
   costBias?: number;
   subscription?: unknown;
   budget?: unknown;
@@ -716,11 +720,14 @@ function isSoloBrain(profile: Profile): boolean {
 }
 
 function getHeadModel(profile: Profile): string {
+  if (profile.headModel) return profile.headModel;
+  const level = Math.max(1, Math.min(5, Number(profile.intelligenceLevel ?? profile.settings?.intelligenceLevel ?? 3) || 3));
   const providers = getAvailableProviders(profile);
   if (providers.length === 0) return 'sonnet';
-  if (providers.length === 1) return providers[0].name === 'openai' ? 'gpt-4o' : 'sonnet';
-  // Both available — default to Claude (we're running in Claude Code)
-  return 'sonnet';
+  const openaiHead = level >= 4 ? 'gpt-5.5' : level >= 3 ? 'gpt-5.4' : 'gpt-5.4-mini';
+  const claudeHead = level >= 4 ? 'opus' : 'sonnet';
+  if (providers.length === 1) return providers[0].name === 'openai' ? openaiHead : claudeHead;
+  return openaiHead;
 }
 
 // ---------------------------------------------------------------------------
