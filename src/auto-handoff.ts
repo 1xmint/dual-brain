@@ -362,8 +362,9 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
     // Build the command based on which CLI we're launching
     let spawnArgs: string[];
     if (cli === 'codex') {
-      // Codex: pass prompt directly
-      spawnArgs = ['-p', prompt.slice(0, 4000)];
+      // Codex accepts the initial prompt as a positional argument.
+      // `-p` is the config profile flag, so do not use it here.
+      spawnArgs = [prompt.slice(0, 4000)];
     } else {
       // Claude: use -p flag with prompt
       spawnArgs = ['-p', prompt.slice(0, 4000), '--no-input'];
