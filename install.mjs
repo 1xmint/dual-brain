@@ -15,8 +15,8 @@ import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
-import { spinner, success as fxSuccess, warn as fxWarn, error as fxError, info as fxInfo, banner, celebrate, colors, sleep, nl, getMode } from './src/fx.mjs';
-import { panel, signalLine, headerBar } from './src/tui.mjs';
+import { spinner, success as fxSuccess, warn as fxWarn, error as fxError, info as fxInfo, banner, celebrate, colors, sleep, nl, getMode } from './dist/src/fx.js';
+import { panel, signalLine, headerBar } from './dist/src/tui.js';
 
 // Skip hook installation during global npm install — hooks are installed
 // when the user runs 'dual-brain install' in their project directory.
@@ -916,7 +916,10 @@ function install(workspace, env, mode) {
     'auto-update-wrapper.mjs',
     'head-guard.mjs',
   ];
-  for (const h of HOOKS) cpSync(join(__dirname, 'hooks', h), join(target, 'hooks', h));
+  for (const h of HOOKS) {
+    const hSrc = join(__dirname, 'hooks', h);
+    if (existsSync(hSrc)) cpSync(hSrc, join(target, 'hooks', h));
+  }
 
   // Copy bash hooks (auto-update.sh lives alongside .mjs hooks in the package)
   const BASH_HOOKS = ['auto-update.sh'];
@@ -935,8 +938,12 @@ function install(workspace, env, mode) {
     'hookify.orchestrator-gate.local.md',
     'hookify.orchestrator-cost.local.md',
   ];
-  for (const r of RULES) cpSync(join(__dirname, r), join(target, r));
-  actions.push(`✓ ${RULES.length} hookify rules`);
+  let rulesInstalled = 0;
+  for (const r of RULES) {
+    const rSrc = join(__dirname, r);
+    if (existsSync(rSrc)) { cpSync(rSrc, join(target, r)); rulesInstalled++; }
+  }
+  if (rulesInstalled) actions.push(`✓ ${rulesInstalled} hookify rules`);
 
   const orch = generateOrchestrator(mode, workspace);
   writeFileSync(join(target, 'orchestrator.json'), JSON.stringify(orch, null, 2) + '\n');
@@ -954,8 +961,9 @@ function install(workspace, env, mode) {
   actions.push('✓ CLAUDE.md (session instructions)');
 
   const rulesTarget = join(target, 'review-rules.md');
-  if (!existsSync(rulesTarget) || force) {
-    cpSync(join(__dirname, 'review-rules.md'), rulesTarget);
+  const rulesSrc = join(__dirname, 'review-rules.md');
+  if (existsSync(rulesSrc) && (!existsSync(rulesTarget) || force)) {
+    cpSync(rulesSrc, rulesTarget);
     actions.push('✓ review-rules.md template');
   } else {
     actions.push('⊘ review-rules.md (kept yours)');
