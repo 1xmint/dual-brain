@@ -192,6 +192,96 @@ function quickPressureCheck(tier) {
   }
 }
 
+// ─── Governance Check (inlined for standalone hook execution) ─────────────────
+
+const GOVERNANCE_MODEL_TIERS = {
+  1: ['claude-haiku-4-5-20251001', 'haiku', 'gpt-4o-mini', 'o4-mini'],
+  2: ['claude-sonnet-4-6', 'sonnet', 'gpt-4o', 'gpt-4.1'],
+  3: ['claude-opus-4-6', 'claude-opus-4-7', 'opus', 'o3'],
+};
+
+function getGovernanceTier(modelId) {
+  if (!modelId) return 2;
+  const normalized = String(modelId).toLowerCase();
+  for (const [tier, models] of Object.entries(GOVERNANCE_MODEL_TIERS)) {
+    if (models.some(m => normalized.includes(m))) return Number(tier);
+  }
+  return 2;
+}
+
+function loadWorkStyle() {
+  try {
+    const data = JSON.parse(readFileSync(PROFILE_FILE, 'utf8'));
+    return data.workStyle || data.active || 'auto';
+  } catch { return 'auto'; }
+}
+
+function loadGovernanceBudget() {
+  const statePath = resolve(__dirname, '..', '..', '.dualbrain', 'governance-state.json');
+  try {
+    const raw = JSON.parse(readFileSync(statePath, 'utf8'));
+    // Check staleness (30 min gap = new session)
+    const lastDispatch = raw.dispatches?.[raw.dispatches.length - 1];
+    if (lastDispatch && (Date.now() - Date.parse(lastDispatch.ts)) > 30 * 60 * 1000) {
+      return { totalEstimatedCost: 0 };
+    }
+    return raw;
+  } catch {
+    return { totalEstimatedCost: 0 };
+  }
+}
+
+function governanceCheck(input) {
+  const ti = input.tool_input || {};
+  const model = ti.model || '';
+  const tier = getGovernanceTier(model);
+
+  // Only apply governance enforcement to tier 3 models
+  if (tier < 3) return null;
+
+  const workStyle = loadWorkStyle();
+
+  // cost-saver profile: DENY tier 3
+  if (workStyle === 'cost-saver') {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          '[governance] Tier 3 (heavy) model denied — profile is cost-saver. Use tier 1-2 models or switch profile.',
+      },
+    };
+  }
+
+  // Budget check
+  try {
+    const configPath = resolve(__dirname, '..', 'orchestrator.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    const sessionLimit = config?.budgets?.session_limit_usd || 10;
+    const state = loadGovernanceBudget();
+    const remaining = sessionLimit - (state.totalEstimatedCost || 0);
+    if (remaining <= 0) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            `[governance] Session budget exhausted ($${state.totalEstimatedCost.toFixed(2)} / $${sessionLimit}). Wait for session reset or increase budget.`,
+        },
+      };
+    }
+  } catch {}
+
+  // auto/balanced profile: emit warning for tier 3 (pipeline handles consent)
+  if (workStyle === 'auto' || workStyle === 'balanced') {
+    return {
+      systemMessage: `[governance] Tier 3 (heavy) model requested: ${model || 'opus'}. Profile "${workStyle}" requires consent for heavy models. Proceeding — pipeline will handle approval.`,
+    };
+  }
+
+  return null;
+}
+
 const SEARCH_WORDS = /\b(explore|search|find|grep|locate|where\s+is|list\s+files|read[-\s]?only|lookup|scan)\b/i;
 const THINK_WORDS = /\b(plan|design|architect|review|audit|security|code[-\s]?review|threat[-\s]?model|complex[-\s]?debug)\b/i;
 
@@ -256,6 +346,16 @@ try {
   }
   // (If hasMarker is true OR the prompt is read-only we fall through to normal
   //  tier-routing logic below.)
+
+  // ── Governance enforcement (tier 3 gating + budget) ──────────────────────────
+  const govResult = governanceCheck(input);
+  if (govResult) {
+    if (govResult.hookSpecificOutput?.permissionDecision === 'deny') {
+      process.stdout.write(JSON.stringify(govResult));
+      process.exit(2);
+    }
+    // Non-blocking governance warning — will be included in final output
+  }
 
   // Compute prompt hash early for duplicate detection and logging
   const promptHash = computePromptHash(ti);
