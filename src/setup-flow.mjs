@@ -148,6 +148,14 @@ async function askYN(rl, question, defaultYes = true) {
 export async function runSetup(cwd, options = {}) {
   const detected = detectEnvironment(cwd);
 
+  // Non-TTY fast path — stdin is piped or in CI
+  if (!process.stdin.isTTY && !options.nonInteractive) {
+    process.stderr.write('[dual-brain] Non-interactive terminal detected. Use --non-interactive flag or run in a TTY.\n');
+    const config = buildConfig({ subscription: 'claude-pro', workStyle: 'balanced' }, detected);
+    saveConfig(config, cwd);
+    return config;
+  }
+
   // Non-interactive fast path
   if (options.nonInteractive) {
     const config = buildConfig({

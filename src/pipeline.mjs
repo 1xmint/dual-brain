@@ -1270,6 +1270,17 @@ export async function runPipeline(trigger, prompt, options = {}) {
         run._thinkRefinedFiles   = thinkRefinement.files;
         decision                 = thinkRefinement.decision;
 
+        // Record the think→work handoff for cross-agent context continuity
+        try {
+          const { createHandoff } = await import('./handoff.mjs');
+          createHandoff('thinker', 'worker', {
+            objective: thinkRefinement.prompt,
+            files: thinkRefinement.files,
+            criteria: thinkRefinement.decision?.criteria || [],
+            confidence: thinkRefinement.confidence,
+          }, run.id || Date.now().toString(36), cwd);
+        } catch { /* non-blocking */ }
+
         // Cascade: if think agent is highly confident and task is simple, downgrade worker model
         if (thinkRefinement.decision) {
           const thinkConf = thinkRefinement.confidence || 0;
@@ -1287,6 +1298,17 @@ export async function runPipeline(trigger, prompt, options = {}) {
         }
       }
     }
+
+    // Strategy selection — may override dispatch pattern
+    try {
+      const { selectStrategy } = await import('./strategy.mjs');
+      const strategyResult = selectStrategy(run.context.detection, decision, run.context.profile);
+      if (strategyResult.strategy !== 'direct') {
+        decision._strategy = strategyResult.strategy;
+        decision._strategyReason = strategyResult.reason;
+        if (verbose) process.stderr.write(`[dual-brain] strategy: ${strategyResult.strategy} (${strategyResult.reason})\n`);
+      }
+    } catch { /* non-blocking */ }
 
     // Resolve the (possibly refined) prompt and file list for dispatch
     const dispatchPrompt = run._thinkRefinedPrompt ?? effectivePrompt;

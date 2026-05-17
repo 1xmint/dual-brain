@@ -22,10 +22,11 @@ function validate(from, to, data) {
 export function createHandoff(fromStage, toStage, data, runId, cwd) {
   try {
     validate(fromStage, toStage, data);
+    const safeRunId = String(runId).replace(/[^a-z0-9_-]/gi, '_').slice(0, 50);
     const dir = hDir(cwd);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const record = { fromStage, toStage, runId, createdAt: new Date().toISOString(), data };
-    const dest = hPath(runId, fromStage, toStage, cwd); const tmp = dest + '.tmp';
+    const record = { fromStage, toStage, runId: safeRunId, createdAt: new Date().toISOString(), data };
+    const dest = hPath(safeRunId, fromStage, toStage, cwd); const tmp = dest + '.tmp';
     writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8');
     try { renameSync(tmp, dest); } catch { writeFileSync(dest, JSON.stringify(record, null, 2), 'utf8'); }
     return record;
@@ -34,7 +35,8 @@ export function createHandoff(fromStage, toStage, data, runId, cwd) {
 
 export function consumeHandoff(runId, fromStage, toStage, cwd) {
   try {
-    const p = hPath(runId, fromStage, toStage, cwd);
+    const safeRunId = String(runId).replace(/[^a-z0-9_-]/gi, '_').slice(0, 50);
+    const p = hPath(safeRunId, fromStage, toStage, cwd);
     if (!existsSync(p)) return null;
     const record = JSON.parse(readFileSync(p, 'utf8'));
     try { unlinkSync(p); } catch { /* best-effort */ }

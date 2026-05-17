@@ -29,7 +29,11 @@ function stateFile(cwd) { return join(cwd || process.cwd(), '.dualbrain', 'routi
 function loadState(cwd) {
   try {
     const p = stateFile(cwd);
-    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
+    if (!existsSync(p)) return {};
+    const raw = readFileSync(p, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
   } catch { return {}; }
 }
 

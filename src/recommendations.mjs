@@ -67,6 +67,7 @@ function thinkROI(metrics) {
 function modelMismatch(routingState) {
   const recs = [];
   for (const [taskType, models] of Object.entries(routingState)) {
+    if (taskType.startsWith('_')) continue; // skip metadata keys
     for (const [model, stats] of Object.entries(models)) {
       const { ema, observations } = stats || {};
       if (observations >= 10 && ema < 0.4) {
@@ -156,12 +157,16 @@ function subscriptionUtilization(subscription, routingState) {
   const { tier, maxMultiplier } = subscription;
   if (!tier) return null;
 
-  const opusUses = Object.values(routingState)
+  const routingCells = Object.entries(routingState)
+    .filter(([k]) => !k.startsWith('_')) // skip metadata keys
+    .map(([, v]) => v);
+
+  const opusUses = routingCells
     .flatMap(m => Object.entries(m))
     .filter(([model]) => model === 'opus' || model.includes('opus'))
     .reduce((s, [, stats]) => s + (stats.observations || 0), 0);
 
-  const totalUses = Object.values(routingState)
+  const totalUses = routingCells
     .flatMap(m => Object.values(m))
     .reduce((s, stats) => s + (stats.observations || 0), 0);
 

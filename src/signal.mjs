@@ -9,8 +9,9 @@ export const EXPECTED_DURATION_MS = { search: 15000, execute: 45000, think: 3000
 
 export function scoreDurationRatio(durationMs, tier) {
   try {
-    const expected = EXPECTED_DURATION_MS[tier] ?? EXPECTED_DURATION_MS.execute;
-    const ratio = durationMs / expected;
+    if (durationMs <= 0) return null;
+    const expectedMs = EXPECTED_DURATION_MS[tier] || EXPECTED_DURATION_MS.execute;
+    const ratio = durationMs / expectedMs;
     if (ratio >= 0.5 && ratio <= 1.5) return 1.0;
     if (ratio < 0.2) return 0.5;
     if (ratio > 3.0) return 0.3;

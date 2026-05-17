@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'fs';
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
@@ -55,6 +55,19 @@ function deriveIntent(prompt, tier) {
   return tier ?? 'execute';
 }
 
+function pruneOutcomes(cwd) {
+  const dir = join(cwd, '.dualbrain', 'outcomes');
+  try {
+    const files = readdirSync(dir).filter(f => f.startsWith('outcome_')).sort();
+    if (files.length > 500) {
+      const toDelete = files.slice(0, files.length - 400);
+      for (const f of toDelete) {
+        try { unlinkSync(join(dir, f)); } catch {}
+      }
+    }
+  } catch {}
+}
+
 export function recordDispatchOutcome(dispatchInput, result) {
   try {
     const cwd = dispatchInput.cwd ?? process.cwd();
@@ -97,6 +110,7 @@ export function recordDispatchOutcome(dispatchInput, result) {
       ).catch(() => { /* non-blocking */ });
     } catch { /* non-blocking */ }
 
+    pruneOutcomes(cwd);
     return record;
   } catch {
     return null;

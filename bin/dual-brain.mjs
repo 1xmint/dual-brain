@@ -1106,6 +1106,29 @@ async function cmdStatus(args = []) {
       if (rec.action) console.log(`     → ${rec.action}`);
     }
   } catch { /* non-blocking */ }
+
+  // Intelligence layer status
+  try {
+    const { getRoutingStats } = await import('../src/routing-advisor.mjs');
+    const { getThinkingStats } = await import('../src/think-engine.mjs');
+    const stats = getRoutingStats(cwd);
+    const thinkStats = getThinkingStats(cwd);
+
+    if (stats.totalObservations > 0 || thinkStats.totalDecisions > 0) {
+      console.log('');
+      console.log('  \x1b[2m─── Intelligence ───\x1b[0m');
+      if (stats.totalObservations > 0) {
+        console.log(`  Routing: ${stats.totalObservations} observations, learning ${stats.totalObservations >= 5 ? 'active' : 'warming up'}`);
+        if (stats.topPerformers?.length > 0) {
+          const top = stats.topPerformers[0];
+          console.log(`  Best: ${top.model} on ${top.cell} (${(top.ema * 100).toFixed(0)}% EMA, n=${top.observations})`);
+        }
+      }
+      if (thinkStats.totalDecisions > 0) {
+        console.log(`  Think: ${thinkStats.totalDecisions} decisions, ${(thinkStats.cacheHitRate * 100).toFixed(0)}% cache hit rate`);
+      }
+    }
+  } catch { /* non-blocking */ }
 }
 
 // ─── cmdHot / cmdCool ─────────────────────────────────────────────────────────
@@ -6510,6 +6533,12 @@ async function main() {
   const args = process.argv.slice(2);
   const cmd  = args[0];
 
+  // Session start marker — feeds routing advisor with cross-session timing signals
+  try {
+    const { markSessionStart } = await import('../src/routing-advisor.mjs');
+    markSessionStart(process.cwd());
+  } catch { /* non-blocking */ }
+
   if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
   if (cmd === '--version' || cmd === '-v') { console.log(readVersion()); return; }
 
@@ -6651,10 +6680,52 @@ async function main() {
     const { generateRecommendations, formatRecommendations } = await import('../src/recommendations.mjs');
     const recs = generateRecommendations(process.cwd());
     if (recs.length === 0) {
-      console.log('  No recommendations yet. Need 20+ dispatches to generate advice.');
+      console.log('');
+      console.log('  \x1b[2m─── HEAD Analysis ───\x1b[0m');
+      console.log('');
+      const { getRoutingStats } = await import('../src/routing-advisor.mjs');
+      const stats = getRoutingStats(process.cwd());
+      if (stats.totalObservations < 20) {
+        console.log(`  Need more data: ${stats.totalObservations}/20 observations before recommendations.`);
+        console.log(`  Keep dispatching — the system learns from every task.`);
+      } else {
+        console.log('  No recommendations — current configuration is performing well.');
+      }
+      console.log('');
     } else {
       console.log(formatRecommendations(recs));
     }
+    return;
+  }
+
+  if (cmd === 'stats' || cmd === 'intelligence') {
+    const { getRoutingStats } = await import('../src/routing-advisor.mjs');
+    const { getThinkingStats } = await import('../src/think-engine.mjs');
+    const stats = getRoutingStats(process.cwd());
+    const thinkStats = getThinkingStats(process.cwd());
+
+    console.log('');
+    console.log('  \x1b[1mdual-brain intelligence report\x1b[0m');
+    console.log('');
+    console.log(`  Routing observations: ${stats.totalObservations}`);
+    if (stats.topPerformers?.length > 0) {
+      console.log('  Top performers:');
+      for (const p of stats.topPerformers.slice(0, 5)) {
+        console.log(`    ${p.cell} → ${p.model} (${(p.ema * 100).toFixed(0)}%, n=${p.observations})`);
+      }
+    }
+    if (stats.worstPerformers?.length > 0) {
+      console.log('  Underperformers:');
+      for (const p of stats.worstPerformers.slice(0, 3)) {
+        console.log(`    ${p.cell} → ${p.model} (${(p.ema * 100).toFixed(0)}%, n=${p.observations})`);
+      }
+    }
+    console.log('');
+    console.log(`  Think decisions: ${thinkStats.totalDecisions}`);
+    console.log(`  Cache hit rate: ${(thinkStats.cacheHitRate * 100).toFixed(0)}%`);
+    console.log(`  Tokens saved: ~${(thinkStats.totalTokensSaved / 1000).toFixed(0)}K`);
+    console.log(`  Tier distribution: recall=${thinkStats.tierDistribution.recall}, quick=${thinkStats.tierDistribution.quick}, standard=${thinkStats.tierDistribution.standard}, deep=${thinkStats.tierDistribution.deep}, ultra=${thinkStats.tierDistribution.ultra}`);
+    console.log('');
     return;
   }
 

@@ -131,6 +131,7 @@ export function buildRetryDecision(originalDecision, strategy, failure) {
 // Export 4: shouldRetry(result, originalDecision, attemptNumber)
 export function shouldRetry(result, originalDecision, attemptNumber = 1) {
   try {
+    if (attemptNumber >= MAX_ATTEMPTS) return { retry: false, reason: `max attempts (${MAX_ATTEMPTS}) reached`, strategy: 'give-up' };
     const failure = classifyFailure(result);
     const { strategy, newDecision, reason } = selectStrategy(failure, originalDecision, attemptNumber);
 
