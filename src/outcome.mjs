@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, readFileSync, existsSync } from 'fs';
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 
@@ -42,6 +42,36 @@ function last7DaysFiles(cwd) {
     if (existsSync(f)) files.push(f);
   }
   return files;
+}
+
+export function recordDispatchOutcome(dispatchInput, result) {
+  try {
+    const cwd = dispatchInput.cwd ?? process.cwd();
+    const decision = dispatchInput.decision ?? {};
+    ensureDir(cwd);
+
+    const id = `out_${Date.now().toString(36)}`;
+    const record = {
+      id,
+      timestamp: new Date().toISOString(),
+      prompt: (dispatchInput.prompt ?? '').slice(0, 200),
+      tier: decision.tier ?? result.tier ?? 'execute',
+      model: decision.model ?? result.model ?? 'unknown',
+      provider: decision.provider ?? result.provider ?? 'unknown',
+      success: result.status === 'success' || result.status === 'completed',
+      status: result.status ?? 'unknown',
+      durationMs: result.durationMs ?? 0,
+      filesChanged: result.filesChanged?.length ?? 0,
+      errors: (result.errors ?? (result.error ? [result.error] : [])).slice(0, 3),
+      lesson: '',
+    };
+
+    const filePath = join(outcomesDir(cwd), `outcome_${id}.json`);
+    writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf8');
+    return record;
+  } catch {
+    return null;
+  }
 }
 
 export function computeRoutingScore(plan, result, verification) {

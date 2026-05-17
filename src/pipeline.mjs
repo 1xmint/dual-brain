@@ -12,6 +12,8 @@ import { dispatch } from './dispatch.mjs';
 import { loadProfile } from './profile.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { buildContextPack as buildContextPackIntel } from './context.mjs';
+import { compilePacket } from './context-intel.mjs';
 
 // Lazy-load collaboration module
 let _collab = null;
@@ -648,6 +650,143 @@ function runGate(run, gateName, gateFn) {
   return result.passed;
 }
 
+// ─── Pre-dispatch think (Position 1: context intelligence) ───────────────────
+
+/**
+ * Optionally spawn a cheap think agent to produce a refined work spec before
+ * the real dispatch. Non-blocking on any failure.
+ *
+ * @param {string}   prompt
+ * @param {string[]} files
+ * @param {object}   decision   — from plan._decision
+ * @param {string}   cwd
+ * @param {object}   profile
+ * @param {object}   [opts]
+ * @param {boolean}  [opts._skipPreDispatchThink]  — set true on recursive calls
+ * @param {object}   [opts.log]                    — logging function
+ * @returns {Promise<{ refined: boolean, prompt?, files?, decision? }>}
+ */
+async function preDispatchThink(prompt, files, decision, cwd, profile, opts = {}) {
+  const log = opts.log ?? (() => {});
+
+  // Guard: never recurse
+  if (opts._skipPreDispatchThink) {
+    log('[dual-brain] pre-dispatch think: skipped (recursive call)');
+    return { refined: false };
+  }
+
+  // Guard: only execute/think tiers
+  const tier = decision?.tier ?? 'execute';
+  if (tier === 'search') {
+    log('[dual-brain] pre-dispatch think: skipped (search tier)');
+    return { refined: false };
+  }
+
+  // Guard: governance tier >= 2 (map tier names to numeric levels)
+  const TIER_LEVEL = { search: 1, execute: 2, think: 3 };
+  const tierLevel = TIER_LEVEL[tier] ?? 2;
+  if (tierLevel < 2) {
+    log('[dual-brain] pre-dispatch think: skipped (tier < 2)');
+    return { refined: false };
+  }
+
+  // Guard: decision confidence must be < 0.9
+  const confidence = decision?.confidence ?? 0.5;
+  if (confidence >= 0.9) {
+    log('[dual-brain] pre-dispatch think: skipped (confidence >= 0.9)');
+    return { refined: false };
+  }
+
+  // Guard: not cost-saver work style
+  try {
+    const style = getWorkStyle(profile);
+    if (style.key === 'cost-saver') {
+      log('[dual-brain] pre-dispatch think: skipped (cost-saver profile)');
+      return { refined: false };
+    }
+  } catch {
+    // profile unavailable — proceed
+  }
+
+  try {
+    log('[dual-brain] pre-dispatch think: refining work spec...');
+
+    // Build the thinker context pack
+    const pack = await buildContextPackIntel(prompt, files, cwd);
+
+    // Compile to a thinker-shaped prompt (sonnet, 3000 token budget)
+    const thinkerPrompt = compilePacket(pack, 'thinker', 'sonnet', 3000);
+
+    // Dispatch to a think agent — use sonnet, tier=think, skip all extras
+    const thinkDecision = {
+      provider: 'claude',
+      model: 'sonnet',
+      tier: 'think',
+      confidence: 1,   // internal call — fully confident
+    };
+
+    const thinkResult = await dispatch({
+      decision: thinkDecision,
+      prompt: thinkerPrompt,
+      files: [],
+      cwd,
+      dryRun: false,
+      verbose: false,
+      profile,
+      _skipPreDispatchThink: true,
+      _skipRelatedContext: true,
+    });
+
+    // Parse the think result — expect JSON with { decision, confidence, workSpec }
+    let parsed = null;
+    try {
+      const raw = typeof thinkResult === 'string'
+        ? thinkResult
+        : (thinkResult?.output ?? thinkResult?.result ?? thinkResult?.text ?? JSON.stringify(thinkResult));
+
+      // Extract JSON from possible prose wrapping
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[0]);
+      }
+    } catch {
+      // JSON parse failed — proceed unchanged
+    }
+
+    if (!parsed || typeof parsed.confidence !== 'number' || parsed.confidence <= 0.7) {
+      const reason = !parsed ? 'unparseable response' : `confidence ${parsed.confidence} <= 0.7`;
+      log(`[dual-brain] pre-dispatch think: skipped (${reason})`);
+      return { refined: false };
+    }
+
+    const ws = parsed.workSpec;
+    if (!ws || !ws.objective) {
+      log('[dual-brain] pre-dispatch think: skipped (no workSpec.objective)');
+      return { refined: false };
+    }
+
+    // Apply refinements
+    const newObjective = ws.objective;
+    const newFiles     = [...new Set([...files, ...(ws.files ?? [])])];
+    const newDecision  = ws.criteria?.length
+      ? { ...decision, acceptanceCriteria: [...(decision.acceptanceCriteria ?? []), ...ws.criteria] }
+      : decision;
+
+    log(`[dual-brain] think refined: "${newObjective.slice(0, 60)}..." (confidence: ${parsed.confidence})`);
+
+    return {
+      refined:  true,
+      prompt:   newObjective,
+      files:    newFiles,
+      decision: newDecision,
+    };
+  } catch (err) {
+    // Non-blocking on any failure
+    log(`[dual-brain] pre-dispatch think: skipped (error: ${err.message})`);
+    return { refined: false };
+  }
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /**
@@ -1070,7 +1209,33 @@ export async function runPipeline(trigger, prompt, options = {}) {
       }
     }
 
-    const decision = { ...run.plan._decision };
+    let decision = { ...run.plan._decision };
+
+    // ── Pre-dispatch think (Position 1: context intelligence) ────────────────
+    // For tier-2+ non-trivial tasks with decision confidence < 0.9, spawn a
+    // cheap sonnet think agent to produce a refined work spec before the real
+    // dispatch. Non-blocking — if it fails or confidence is low, proceed as-is.
+    {
+      const thinkRefinement = await preDispatchThink(
+        effectivePrompt,
+        files,
+        decision,
+        cwd,
+        run.context?.profile ?? {},
+        { log, _skipPreDispatchThink: options._skipPreDispatchThink }
+      );
+      if (thinkRefinement.refined) {
+        // Mutate locals so both collab and direct paths use the refined inputs
+        // (effectivePrompt is const — store refinement in a mutable local)
+        run._thinkRefinedPrompt  = thinkRefinement.prompt;
+        run._thinkRefinedFiles   = thinkRefinement.files;
+        decision                 = thinkRefinement.decision;
+      }
+    }
+
+    // Resolve the (possibly refined) prompt and file list for dispatch
+    const dispatchPrompt = run._thinkRefinedPrompt ?? effectivePrompt;
+    const dispatchFiles  = run._thinkRefinedFiles  ?? files;
 
     // ── HEAD judgment injection into agent prompts ─────────────────────────────
     // HEAD's obligations, noticings, and uncertainties flow to the work agent
@@ -1130,13 +1295,13 @@ export async function runPipeline(trigger, prompt, options = {}) {
 
       // Inject collaboration context + HEAD judgment into prompt
       const collabContext = collab.buildAgentContext(session, primaryId);
-      const promptParts = [collabContext, headJudgmentBlock, effectivePrompt].filter(Boolean);
+      const promptParts = [collabContext, headJudgmentBlock, dispatchPrompt].filter(Boolean);
       const collabPrompt = promptParts.join('\n\n');
 
       run.result = await dispatch({
         decision,
         prompt: collabPrompt,
-        files,
+        files: dispatchFiles,
         cwd,
         dryRun: false,
         verbose,
@@ -1192,13 +1357,13 @@ export async function runPipeline(trigger, prompt, options = {}) {
       try { collab.persistEvents(session, cwd); } catch {}
     } else {
       const directPrompt = headJudgmentBlock
-        ? `${headJudgmentBlock}\n\n${effectivePrompt}`
-        : effectivePrompt;
+        ? `${headJudgmentBlock}\n\n${dispatchPrompt}`
+        : dispatchPrompt;
 
       run.result = await dispatch({
         decision,
         prompt: directPrompt,
-        files,
+        files: dispatchFiles,
         cwd,
         dryRun: false,
         verbose,

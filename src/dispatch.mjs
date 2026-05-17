@@ -18,6 +18,7 @@ import { getFailoverOrder } from './decide.mjs';
 import { getTemplate, renderPrompt, quickRender } from './templates.mjs';
 import { compilePacket, shapeForRole } from './context-intel.mjs';
 import { buildContextPack } from './context.mjs';
+import { scoreTask, computeRequiredTier } from './governance.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USAGE_DIR = join(__dirname, '..', '.dualbrain', 'usage');
@@ -706,8 +707,8 @@ function _renderTemplatedPrompt(prompt, decision, context = {}) {
 // Prepend a marker to every prompt that goes through the official dispatch pipeline.
 // The enforce-tier hook checks for this marker to distinguish legitimate dispatches
 // from raw Agent calls made by the HEAD that bypass the dual-brain pipeline.
-// Format: <!-- dual-brain-dispatch: <runId> -->
-// runId is a short timestamp-based ID that ties back to this dispatch session.
+// Format: <!-- dual-brain-dispatch:<runId>|tier:<tier>|model:<model>|risk:<risk>|req:<requiredTier> -->
+// runId is a short timestamp-based ID; governance fields enable over-provisioning validation.
 
 let _dispatchRunId = null;
 
@@ -719,9 +720,14 @@ function _getDispatchRunId() {
   return _dispatchRunId;
 }
 
-function _prependDispatchMarker(prompt) {
+function _prependDispatchMarker(prompt, decision = {}) {
   const runId = _getDispatchRunId();
-  return `<!-- dual-brain-dispatch: ${runId} -->\n${prompt}`;
+  const tier = decision.tier || 'execute';
+  const model = decision.model || 'sonnet';
+  const risk = decision.risk || 'medium';
+  const requiredTier = decision._requiredTier || '';
+  const marker = `<!-- dual-brain-dispatch:${runId}|tier:${tier}|model:${model}|risk:${risk}|req:${requiredTier} -->`;
+  return `${marker}\n${prompt}`;
 }
 
 // ─── Related session age label ────────────────────────────────────────────────
@@ -845,7 +851,12 @@ async function dispatch(input = {}) {
 
   // Stamp the prompt with the dispatch marker so enforce-tier.mjs can recognise
   // that this agent call came through the official pipeline.
-  prompt = _prependDispatchMarker(prompt);
+  // Compute required tier for governance validation
+  try {
+    const scores = scoreTask({ intent: decision.tier, risk: decision.risk, files, objective: prompt.slice(0, 200) });
+    decision = { ...decision, _requiredTier: computeRequiredTier(scores) };
+  } catch { /* non-blocking */ }
+  prompt = _prependDispatchMarker(prompt, decision);
 
   // ── Situation brief injection ────────────────────────────────────────────────
   // Prepend a compact project-state summary when provided by the pipeline.
@@ -1149,7 +1160,7 @@ async function dispatch(input = {}) {
     }
     // ── End auto-review annotation ────────────────────────────────────────────
 
-    return {
+    const nativeResult = {
       status:        success ? 'completed' : 'failed',
       type:          'native-agent',
       provider:      currentProvider,
@@ -1166,6 +1177,11 @@ async function dispatch(input = {}) {
       authVerified:  true,
       error: success ? null : errorText.slice(0, 200),
     };
+    try {
+      const { recordDispatchOutcome } = await import('./outcome.mjs');
+      recordDispatchOutcome(input, nativeResult);
+    } catch { /* never block */ }
+    return nativeResult;
   }
 
   const command = buildCommand(effectiveDecision, prompt, files, cwd);
@@ -1268,7 +1284,7 @@ async function dispatch(input = {}) {
   }
   // ── End auto-review annotation ──────────────────────────────────────────────
 
-  return {
+  const subResult = {
     status:      success ? 'completed' : 'failed',
     provider:    subProvider,
     model:       subModel,
@@ -1283,6 +1299,11 @@ async function dispatch(input = {}) {
     authVerified: true,
     error: success ? null : errorText.slice(0, 200),
   };
+  try {
+    const { recordDispatchOutcome } = await import('./outcome.mjs');
+    recordDispatchOutcome(input, subResult);
+  } catch { /* never block */ }
+  return subResult;
 }
 
 // ─── Dual-brain dispatch (parallel) ───────────────────────────────────────────
@@ -1295,7 +1316,12 @@ async function dispatchDualBrain(input = {}) {
   prompt = redact(prompt);
 
   // Stamp with dispatch marker so enforce-tier.mjs allows this Agent call
-  prompt = _prependDispatchMarker(prompt);
+  // Compute required tier for governance validation
+  try {
+    const scores = scoreTask({ intent: decision.tier, risk: decision.risk, files, objective: prompt.slice(0, 200) });
+    decision = { ...decision, _requiredTier: computeRequiredTier(scores) };
+  } catch { /* non-blocking */ }
+  prompt = _prependDispatchMarker(prompt, decision);
 
   // ── Situation brief injection ────────────────────────────────────────────────
   const _dualBrainBrief = typeof input.situationBrief === 'string' && input.situationBrief.trim()
