@@ -68,6 +68,7 @@ import { loadRepoCache } from '../src/repo.mjs';
 import { loadSession, saveSession, formatSessionCard, importReplitSessions, getSessionMeta, saveSessionMeta, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions, archiveSession, getArchivedSessions } from '../src/session.mjs';
 
 import { box, bar, badge, menu, separator, panel, divider, statusChip, headerBar, prompt as tuiPrompt, signalLine } from '../src/tui.mjs';
+import { checkBudget } from '../src/governance.mjs';
 
 // ─── Dynamic imports for receipts + failure memory ───────────────────────────
 
@@ -2884,66 +2885,157 @@ async function mainScreen(rl, ask) {
   if (_spinnerTimeout) clearTimeout(_spinnerTimeout);
   if (dashSpinner) dashSpinner.succeed('Dashboard ready');
 
-  // ── Stale hint ────────────────────────────────────────────────────────────
-  if (staleCount >= 3) {
-    process.stdout.write(`${DIM}${staleCount} stale sessions (>7d) — type "sessions" to manage${RST}\n`);
-  }
-
   // ── Render Studio Console (paneled layout) ────────────────────────────────
   const CYAN = '\x1b[36m';
   const panelW = Math.min(sepW + 2, 72);
 
-  // Header panel — project, branch, providers, version
-  const headerLeft  = `${DIM}${projectName}${RST}  ${BOLD}${branchStr}${RST}  ${DIM}Claude${RST} ${claudeDot}  ${DIM}GPT${RST} ${openaiDot}`;
-  const headerRight = `${DIM}v${version}${RST}`;
-  const headerContent = [headerBar(headerLeft, headerRight, panelW - 4)];
-  process.stdout.write('\n' + panel('dual-brain', headerContent, { width: panelW, titleColor: CYAN }) + '\n\n');
+  // ── Budget / governance data ──────────────────────────────────────────────
+  let budgetInfo = null;
+  try {
+    const orchestratorCfg = JSON.parse(readFileSync(join(cwd, '.claude', 'orchestrator.json'), 'utf8'));
+    budgetInfo = checkBudget(cwd, orchestratorCfg);
+  } catch {
+    // No orchestrator config or no state — use a fresh read with defaults
+    try { budgetInfo = checkBudget(cwd, {}); } catch {}
+  }
 
-  // Resume / prompt panel (only when there is something to show)
-  if (isReturning || !anyProviderAvail) {
-    const resumeContent = [];
-    if (!anyProviderAvail) {
-      resumeContent.push(`${BOLD}Connect a provider to start working${RST}`);
-    } else {
-      const labelTrunc = (resumeState.label || 'last session').slice(0, 45);
-      const agePart    = resumeState.ageLabel ? ` · ${resumeState.ageLabel}` : '';
-      const nextPart   = resumeState.nextAction ? ` · next: ${resumeState.nextAction}` : '';
-      resumeContent.push(`${DIM}Last task${RST}   ${BOLD}${labelTrunc}${RST}${DIM}${agePart}${RST}`);
-      if (nextPart) resumeContent.push(`${DIM}Next step${RST}   ${nextPart.replace(/^ · /, '')}`);
+  // ── Panel 1: Providers + Budget (top priority — always render) ───────────
+  {
+    const providerLines = [];
+
+    // Provider health rows
+    const claudeLabel = claudeAvail ? `${GRN}✓${RST} Claude` : `${RED}✗${RST} ${DIM}Claude${RST}`;
+    const openaiLabel = openaiAvail ? `${GRN}✓${RST} GPT-4`  : `${RED}✗${RST} ${DIM}GPT-4${RST}`;
+
+    // Detect subscription expiry warnings
+    const claudeWarnStr = (claudeSub?.expiresAt && Date.parse(claudeSub.expiresAt) < Date.now())
+      ? `  ${YLW}⚠ expired${RST}` : '';
+    const openaiWarnStr = (openaiSub?.expiresAt && Date.parse(openaiSub.expiresAt) < Date.now())
+      ? `  ${YLW}⚠ expired${RST}` : '';
+
+    const providerCols = `${claudeLabel}${claudeWarnStr}   ${openaiLabel}${openaiWarnStr}`;
+
+    // Budget row
+    let budgetRow = null;
+    if (budgetInfo) {
+      const spent     = budgetInfo.spent.toFixed(2);
+      const remaining = budgetInfo.remaining.toFixed(2);
+      const limit     = budgetInfo.limit.toFixed(2);
+      const tc        = budgetInfo.tierCounts || {};
+      const tierStr   = `${DIM}t1:${tc[1] || 0}  t2:${tc[2] || 0}  t3:${tc[3] || 0}${RST}`;
+
+      if (budgetInfo.blocked) {
+        budgetRow = `${RED}✗${RST} Budget exhausted  $${spent}/$${limit}   ${tierStr}`;
+      } else if (budgetInfo.warning) {
+        budgetRow = `${YLW}⚠${RST} Budget low  ${YLW}$${remaining} remaining${RST}  of $${limit}   ${tierStr}`;
+      } else if (budgetInfo.spent > 0) {
+        budgetRow = `${GRN}✓${RST} Budget  ${DIM}$${spent} spent · $${remaining} remaining${RST}   ${tierStr}`;
+      } else {
+        budgetRow = `${DIM}· Budget  $0 spent · $${remaining} remaining   t1:0  t2:0  t3:0${RST}`;
+      }
     }
-    resumeContent.push('');
-    resumeContent.push(`  ${CYAN}›${RST} ${BOLD}${suggestions[0]}${RST}    ${DIM}${suggestions[1] || ''}${RST}    ${DIM}${suggestions[2] || ''}${RST}`);
-    process.stdout.write(panel(isReturning ? 'Resume work' : 'Get started', resumeContent, { width: panelW }) + '\n\n');
-  } else {
-    // Fresh / no-resume state — just show suggestions inline
-    const suggestContent = [`  ${CYAN}›${RST} ${BOLD}${suggestions[0]}${RST}    ${DIM}${suggestions[1] || ''}${RST}    ${DIM}${suggestions[2] || ''}${RST}`];
-    process.stdout.write(panel('Get started', suggestContent, { width: panelW }) + '\n\n');
+
+    providerLines.push(providerCols);
+    if (budgetRow) providerLines.push(budgetRow);
+
+    process.stdout.write('\n' + panel('dual-brain', providerLines, { width: panelW, titleColor: CYAN }) + '\n\n');
   }
 
-  // Signals panel — recent work items (only when there are items)
-  if (recentLines.length > 0) {
-    process.stdout.write(panel('Signals', recentLines, { width: panelW }) + '\n\n');
+  // ── Panel 2: Workspace signals (contextual, semantic icons) ──────────────
+  {
+    const signalLines = [];
+
+    // Git workspace status
+    if (gitBranch !== 'unknown') {
+      const dirtyStr = gitUncommitted > 0
+        ? `${YLW}⚠${RST} ${gitUncommitted} uncommitted file${gitUncommitted !== 1 ? 's' : ''}`
+        : `${GRN}✓${RST} ${DIM}clean${RST}`;
+      const aheadStr = gitAheadCount > 0 ? `  ${YLW}⚠${RST} ${gitAheadCount} ahead of remote` : '';
+      signalLines.push(`${DIM}${gitBranch}${RST}   ${dirtyStr}${aheadStr}`);
+    }
+
+    // Last commit
+    if (gitLastMsg) {
+      const isStale = /\d{2,}d ago/.test(gitLastAgo);
+      const icon = isStale ? `${YLW}⚠${RST}` : `${DIM}·${RST}`;
+      signalLines.push(`${icon} ${DIM}${gitLastMsg}  ${gitLastAgo}${RST}`);
+    }
+
+    // Open PRs
+    if (openPRs.length > 0) {
+      const prSummary = openPRs.slice(0, 2).map(pr => `#${pr.number}`).join(', ');
+      const trunc = openPRs.length > 2 ? ` +${openPRs.length - 2}` : '';
+      signalLines.push(`${DIM}·${RST} ${openPRs.length} open PR${openPRs.length !== 1 ? 's' : ''}${DIM}: ${prSummary}${trunc}${RST}`);
+    }
+
+    // Observer / awareness signals (high-priority only)
+    for (const obs of quickObservations) {
+      if (obs.priority === 'high') {
+        signalLines.push(`${RED}✗${RST} ${obs.message}`);
+      } else if (obs.priority === 'medium') {
+        signalLines.push(`${YLW}⚠${RST} ${obs.message}`);
+      }
+    }
+
+    // Risk / model registry
+    if (awarenessLine3 && !/No risk flags/.test(awarenessLine3)) {
+      const clean3 = awarenessLine3.replace(/\x1b\[[0-9;]*m/g, '').replace(/^[⚠✓]\s*/, '').trim();
+      if (clean3) signalLines.push(`${YLW}⚠${RST} ${clean3}`);
+    }
+
+    // Stale sessions hint
+    if (staleCount >= 3) {
+      signalLines.push(`${DIM}· ${staleCount} stale sessions (>7d) — type "sessions" to manage${RST}`);
+    }
+
+    // Resume / continuation hint
+    if (isReturning) {
+      const labelTrunc = (resumeState.label || 'last session').slice(0, 40);
+      const agePart    = resumeState.ageLabel ? `  ${DIM}${resumeState.ageLabel}${RST}` : '';
+      const nextPart   = resumeState.nextAction ? `  ${DIM}→ ${resumeState.nextAction}${RST}` : '';
+      signalLines.push(`${CYAN}↩${RST} Resume: ${BOLD}${labelTrunc}${RST}${agePart}${nextPart}`);
+    }
+
+    if (!anyProviderAvail) {
+      signalLines.push(`${RED}✗${RST} ${BOLD}No provider connected${RST}  — run: dual-brain login`);
+    }
+
+    if (signalLines.length > 0) {
+      process.stdout.write(panel('Workspace', signalLines, { width: panelW }) + '\n\n');
+    }
   }
 
-  // Shortcut bar — always visible so the user never has to guess
+  // ── Panel 3: What do you want to do? (suggestions) ───────────────────────
+  {
+    const promptTitle = !anyProviderAvail ? 'Get started' : isReturning ? 'Continue' : 'Start';
+    const suggestContent = suggestions.map((s, i) => {
+      return i === 0
+        ? `  ${CYAN}›${RST} ${BOLD}${s}${RST}`
+        : `    ${DIM}${s}${RST}`;
+    });
+    process.stdout.write(panel(promptTitle, suggestContent, { width: panelW }) + '\n\n');
+  }
+
+  // ── Shortcuts (vertical layout, one per line) ────────────────────────────
   const shortcuts = [
-    [`Enter`, isReturning ? 'resume last session' : 'start working'],
-    [`n`, 'new session'],
-    [`/`, 'search sessions'],
-    [`s`, 'settings & profiles'],
-    [`d`, 'doctor (diagnose issues)'],
-    [`a`, profile.automode ? 'auto mode ⚡ on' : 'auto mode'],
-    [`q`, 'quit'],
+    [`Enter`, isReturning ? 'resume last session' : 'start working  (or type a task)'],
+    [`n`,     'new session'],
+    [`/`,     'search sessions'],
+    [`s`,     'settings & profiles'],
+    [`d`,     'doctor — diagnose issues'],
+    [`a`,     profile.automode ? 'auto mode  (on)' : 'auto mode  (off)'],
+    [`q`,     'quit'],
   ];
-  process.stdout.write('\n');
   for (const [key, label] of shortcuts) {
-    const keyStr = key === 'Enter' ? `${CYAN}Enter${RST}` : `  ${CYAN}${key}${RST}  `;
-    const padded = key === 'Enter' ? ' ' : '  ';
-    process.stdout.write(`   ${keyStr}${padded}${DIM}${label}${RST}\n`);
+    const keyStr = key === 'Enter'
+      ? `${CYAN}Enter${RST}`
+      : `${CYAN}${key}${RST}    `;
+    const padder = key === 'Enter' ? '    ' : '';
+    process.stdout.write(`   ${keyStr}${padder}${DIM}${label}${RST}\n`);
   }
   process.stdout.write('\n');
 
-  // Input bar — rendered below shortcut bar
+  // Input bar — rendered below shortcuts
   const inputLeft = tuiPrompt('task or command...');
   process.stdout.write(` ${inputLeft}\n`);
 
