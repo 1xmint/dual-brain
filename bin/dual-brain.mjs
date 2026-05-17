@@ -297,6 +297,7 @@ Commands:
   handoff                   Cross-provider switch (auto-detect limited provider)
     --to claude|codex       Force handoff to a specific provider
     --show                  Show current handoff context without switching
+  switch claude|codex       Force switch to a provider
   think "question"          Multi-round architecture decision with dual-brain
   pr                        Show PR status for current branch
   pr create                 Create PR from current branch with auto-generated description
@@ -1178,22 +1179,7 @@ async function cmdHandoff(args = []) {
     return;
   }
 
-  // Detect which provider is limited
-  const limitStatus = detectLimitReached(cwd);
-  const ux = getHandoffUX(limitStatus, toProvider || null);
-
-  // Display UX message
-  if (ux.title) console.log(box(ux.title));
-  if (ux.message) {
-    console.log('');
-    fxH.info(ux.message);
-  }
-  if (ux.detail) {
-    fxH.dim(ux.detail);
-  }
-  console.log('');
-
-  // If --to is specified, force handoff regardless of limit status
+  // If --to is specified, force switch regardless of limit status
   if (toProvider) {
     const target = toProvider.toLowerCase();
     if (target !== 'claude' && target !== 'codex') {
@@ -1203,29 +1189,43 @@ async function cmdHandoff(args = []) {
     console.log(`  ⚡ Switching to ${target}...`);
     console.log('');
     const { spawnHandoff } = autoHandoff;
-    const result = spawnHandoff({ fromProvider, cwd, auto: true, interactive: true });
+    const result = spawnHandoff({ fromProvider, cwd, auto: true, force: true, interactive: true });
     if (!result.success) {
       fxH.error(result.message);
     }
-    // If spawn succeeded, the child process takes over — we don't return
     return;
   }
 
-  // Auto-detect: if a provider is limited, switch to the other
-  if (limitStatus.limited) {
-    const target = limitStatus.switchTo;
-    const fromProvider = limitStatus.provider;
-    console.log(`  ⚡ ${fromProvider} limit reached → switching to ${target}...`);
+  // Auto-detect: check both providers, switch if one is limited
+  const anthropicStatus = detectLimitReached('anthropic', cwd);
+  const openaiStatus = detectLimitReached('openai', cwd);
+
+  if (anthropicStatus.limited && anthropicStatus.otherAvailable) {
+    const ux = getHandoffUX(anthropicStatus);
+    fxH.info(ux.text);
     console.log('');
     const { spawnHandoff } = autoHandoff;
-    const result = spawnHandoff({ fromProvider, cwd, auto: true, interactive: true });
-    if (!result.success) {
-      fxH.error(result.message);
-    }
+    const result = spawnHandoff({ fromProvider: 'anthropic', cwd, auto: true, interactive: true });
+    if (!result.success) fxH.error(result.message);
+  } else if (openaiStatus.limited && openaiStatus.otherAvailable) {
+    const ux = getHandoffUX(openaiStatus);
+    fxH.info(ux.text);
+    console.log('');
+    const { spawnHandoff } = autoHandoff;
+    const result = spawnHandoff({ fromProvider: 'openai', cwd, auto: true, interactive: true });
+    if (!result.success) fxH.error(result.message);
   } else {
     fxH.success('No provider is currently limited. No handoff needed.');
     fxH.dim('Use --to claude or --to codex to force a switch.');
   }
+}
+
+async function cmdSwitch(args = []) {
+  const target = args[0];
+  if (!target || !['claude', 'codex'].includes(target.toLowerCase())) {
+    err('Usage: dual-brain switch <claude|codex>');
+  }
+  await cmdHandoff(['--to', target.toLowerCase()]);
 }
 
 function cmdHot(providerArg) {
@@ -6860,6 +6860,7 @@ async function main() {
   if (cmd === 'pr')       { await cmdPR(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'handoff')  { await cmdHandoff(args.slice(1)); return; }
+  if (cmd === 'switch')   { await cmdSwitch(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
   if (cmd === 'remember')    { cmdRemember(args[1]); return; }
@@ -6923,7 +6924,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'hot', 'cool',
+    'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),

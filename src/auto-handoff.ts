@@ -36,6 +36,7 @@ export interface HandoffOpts {
   fromProvider: string;
   cwd?: string;
   auto?: boolean;
+  force?: boolean;
 }
 
 export interface HandoffResult {
@@ -284,17 +285,19 @@ export function buildHandoffPrompt(context: HandoffContext): string {
  */
 export function executeHandoff(opts: HandoffOpts): HandoffResult {
   try {
-    const { fromProvider, cwd, auto } = opts;
+    const { fromProvider, cwd, auto, force } = opts;
     const normalized = normalizeProvider(fromProvider);
     const other = OTHER_PROVIDER[normalized] || (normalized === 'anthropic' ? 'openai' : 'anthropic');
 
-    // Check that the other provider is available
-    const otherState = getProviderState(other, cwd);
-    if (otherState.status === 'rate-limited' || otherState.status === 'down') {
-      return {
-        success: false,
-        message: `Cannot handoff: ${other} is also ${otherState.status}. Both providers unavailable.`,
-      };
+    // Check that the other provider is available (skip if forced)
+    if (!force) {
+      const otherState = getProviderState(other, cwd);
+      if (otherState.status === 'rate-limited' || otherState.status === 'down') {
+        return {
+          success: false,
+          message: `Cannot handoff: ${other} is also ${otherState.status}. Both providers unavailable.`,
+        };
+      }
     }
 
     // Export session context
@@ -343,9 +346,9 @@ export function executeHandoff(opts: HandoffOpts): HandoffResult {
  * Replaces the current process — user stays in the same terminal,
  * conversation continues with the new provider.
  */
-export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean }): HandoffResult {
+export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?: boolean }): HandoffResult {
   try {
-    const result = executeHandoff(opts);
+    const result = executeHandoff({ ...opts, force: opts.force });
     if (!result.success || !result.command || !result.contextFile) return result;
 
     const [cli, ...cliArgs] = result.command;
