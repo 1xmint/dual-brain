@@ -23,7 +23,6 @@ import { spawnSync } from 'child_process';
 import { appendFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { scorePrompt, logPromptExchange } from '../../src/prompt-audit.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
@@ -234,25 +233,9 @@ export async function dualThink({ question, context, files, round, claudePerspec
   }
 
   const prompt = buildGptPrompt({ question, context, files, round: effectiveRound, claudePerspective });
-
-  // Score the question prompt for quality before sending to GPT
-  const promptScore = scorePrompt(question, { type: 'think' });
-
   const raw = runGptAnalysis(codexBin, prompt);
 
   logUsage({ durationMs: raw.durationMs, usage: raw.usage, success: raw.success });
-
-  // Log the exchange for audit trail
-  logPromptExchange({
-    type: 'think',
-    round: effectiveRound,
-    prompt: question,
-    response: raw.success ? raw.text : null,
-    provider: 'gpt',
-    model: MODEL,
-    durationMs: raw.durationMs,
-    promptScore,
-  });
 
   if (!raw.success) {
     return {
@@ -273,7 +256,6 @@ export async function dualThink({ question, context, files, round, claudePerspec
         durationMs: raw.durationMs,
         tokens: raw.usage,
       },
-      promptQuality: { score: promptScore.score, grade: promptScore.grade, issues: promptScore.issues },
       instructions: `GPT has responded to your analysis. Now synthesize both rounds into a FINAL DECISION:
 1. Where you both agree → high confidence, proceed
 2. Where GPT pushed back on your points → re-evaluate honestly
@@ -291,7 +273,6 @@ export async function dualThink({ question, context, files, round, claudePerspec
       durationMs: raw.durationMs,
       tokens: raw.usage,
     },
-    promptQuality: { score: promptScore.score, grade: promptScore.grade, issues: promptScore.issues },
     instructions: `Round 1 complete. Now:
 1. Provide YOUR independent analysis of the same question (same structure: recommendation, rationale, alternatives, risks, confidence, verification)
 2. Then call Round 2 to send your perspective back to GPT:
@@ -367,14 +348,6 @@ function printResult(result, question) {
   const gptData = result.gpt;
   const durSec = (gptData.durationMs / 1000).toFixed(1);
   console.log(`║ 🤖 GPT-5.5 (${durSec}s):`.padEnd(51) + '║');
-
-  if (result.promptQuality) {
-    const pq = result.promptQuality;
-    const issueStr = pq.issues.length ? ` [${pq.issues.map(i => i.rule).join(', ')}]` : '';
-    const qualityLine = `Prompt quality: ${pq.grade} (${pq.score}/100)${issueStr}`;
-    console.log(`║ ${qualityLine.slice(0, 48).padEnd(48)} ║`);
-  }
-
   console.log(BAR);
   console.log('');
   console.log(gptData.recommendation || gptData.rebuttal);

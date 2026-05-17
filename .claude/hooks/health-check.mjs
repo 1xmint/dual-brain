@@ -23,7 +23,6 @@ import { existsSync, accessSync, readFileSync, constants } from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
-import { checkHookHealth } from "../../src/health.mjs";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -316,44 +315,7 @@ function checkCodexCli() {
   return check("codex CLI", STATUS.warn, `found at ${codexPath} — auth status unknown`);
 }
 
-/** 7. Hook file health — verify hook files exist and have valid syntax */
-function checkHookFileHealth() {
-  let result;
-  try {
-    result = checkHookHealth(WORKSPACE);
-  } catch (err) {
-    return check("hook file health", STATUS.fail, `checkHookHealth threw: ${err.message}`);
-  }
-
-  if (result.missing.length > 0) {
-    const first = result.missing[0];
-    const extra = result.missing.length > 1 ? ` (+${result.missing.length - 1} more)` : "";
-    return check("hook file health", STATUS.fail, `missing: ${first}${extra}`);
-  }
-
-  if (result.conflicts.length > 0) {
-    return check(
-      "hook file health",
-      STATUS.warn,
-      `conflicts: ${result.conflicts.length} hook(s) defined in both local and global settings`
-    );
-  }
-
-  if (result.degraded.length > 0) {
-    const first = result.degraded[0];
-    const extra = result.degraded.length > 1 ? ` (+${result.degraded.length - 1} more)` : "";
-    return check("hook file health", STATUS.warn, `syntax errors: ${first}${extra}`);
-  }
-
-  const total = result.hooks.length;
-  if (total === 0) {
-    return check("hook file health", STATUS.warn, "no hooks registered in settings");
-  }
-
-  return check("hook file health", STATUS.pass, `${total} hook(s) verified`);
-}
-
-/** 8. Git repo — verify we're in a git repo */
+/** 7. Git repo — verify we're in a git repo */
 function checkGitRepo() {
   const result = spawnSync("git", ["-C", WORKSPACE, "status", "--porcelain"], {
     encoding: "utf8",
@@ -445,7 +407,6 @@ function main() {
     checkModelIntelligence(),
     checkHookScripts(),
     checkHookRegistration(),
-    checkHookFileHealth(),
     checkUsageJsonl(),
     checkCodexCli(),
     checkGitRepo(),

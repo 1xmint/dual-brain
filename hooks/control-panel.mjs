@@ -649,6 +649,72 @@ async function showToolsMenu(rl) {
   }
 }
 
+// ─── Submenu: Data Tools Status ───────────────────────────────────────────
+
+async function showDataToolsStatus(rl, providers) {
+  const dtPath = join(CWD, '.replit-tools');
+  const configPath = join(dtPath, 'config.json');
+  const claudeArchive = join(dtPath, '.session-archive', 'claude', 'history.jsonl');
+  const codexArchive = join(dtPath, '.session-archive', 'codex', 'history.jsonl');
+  const claudeCreds = join(dtPath, '.claude-persistent', '.credentials.json');
+  const codexAuth = join(dtPath, '.codex-persistent', 'auth.json');
+  const sessionManager = join(dtPath, 'scripts', 'claude-session-manager.sh');
+
+  const fileStatus = (p) => existsSync(p) ? green('present') : yellow('missing');
+  const countLines = (p) => {
+    try {
+      return readFileSync(p, 'utf8').split('\n').filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  };
+
+  console.log('');
+  console.log(`  ${bold('Data Tools Integration')}`);
+  console.log('  ' + '─'.repeat(44));
+  if (!existsSync(dtPath)) {
+    console.log(`  ${yellow('replit-tools is not installed in this workspace.')}`);
+    console.log('');
+    console.log(`  ${bold('[i]')} Install replit-tools`);
+    console.log(`  ${bold('[q]')} Back to main menu`);
+    const choice = (await new Promise(resolve => rl.question('  Choice: ', resolve))).trim().toLowerCase();
+    if (choice === 'i') spawnSync('npx', ['-y', 'data-tools'], { stdio: 'inherit', cwd: CWD });
+    return;
+  }
+
+  console.log(`  Root:            ${dim(dtPath)}`);
+  console.log(`  Config:          ${fileStatus(configPath)}`);
+  console.log(`  Claude auth:     ${providers.claude.authed ? green('authenticated') : yellow('not authenticated')} ${dim('(' + fileStatus(claudeCreds) + ')')}`);
+  console.log(`  Codex auth:      ${providers.codex.authed ? green('authenticated') : yellow('not authenticated')} ${dim('(' + fileStatus(codexAuth) + ')')}`);
+  console.log(`  Claude archive:  ${countLines(claudeArchive)} entries`);
+  console.log(`  Codex archive:   ${countLines(codexArchive)} entries`);
+  console.log(`  Session manager: ${fileStatus(sessionManager)}`);
+  console.log('');
+  console.log(`  ${dim('The original Replit/Data Tools menu is still available with:')} ${cyan('claude-menu')}`);
+  console.log('');
+  console.log(`  ${bold('[r]')} Refresh auth`);
+  console.log(`  ${bold('[m]')} Open original session manager`);
+  console.log(`  ${bold('[q]')} Back to main menu`);
+  console.log('');
+
+  const choice = (await new Promise(resolve => rl.question('  Choice: ', resolve))).trim().toLowerCase();
+  if (choice === 'r') {
+    const refreshScript = join(dtPath, 'scripts', 'claude-auth-refresh.sh');
+    if (existsSync(refreshScript)) {
+      spawnSync('bash', [refreshScript, '--force'], { stdio: 'inherit', cwd: CWD });
+    } else {
+      console.log(`  ${yellow('Refresh script missing.')}`);
+    }
+    await new Promise(resolve => rl.question('  Press Enter to continue...', resolve));
+  }
+  if (choice === 'm') {
+    console.log('');
+    console.log(`  ${dim('Opening the original Data Tools session manager. Use [s] there to return to shell.')}`);
+    console.log('');
+    spawnSync('bash', ['-lc', `source "${sessionManager}" && claude_prompt`], { stdio: 'inherit', cwd: CWD });
+  }
+}
+
 // ─── Submenu: Vibe Workflow ───────────────────────────────────────────────
 
 async function showVibeWorkflow(rl) {
@@ -748,9 +814,9 @@ function renderFirstRunMenu(providers) {
     lines.push('');
   }
 
-  // Data Tools shortcut
+  // Data Tools integration status
   if (IS_REPLIT && existsSync(join(CWD, '.replit-tools'))) {
-    lines.push(`  ${bold('[t]')} Open Data Tools dashboard`);
+    lines.push(`  ${bold('[t]')} Data Tools status`);
   } else if (IS_REPLIT) {
     lines.push(`  ${bold('[t]')} Install replit-tools ${dim('(recommended for Replit)')}`);
   }
@@ -854,7 +920,7 @@ function renderReturningMenu(providers, sessions) {
   lines.push(`  ${bold('[u]')} Update Dual Brain ${dim('(' + formatVersionStatus(updateInfo) + ')')}`);
 
   if (IS_REPLIT && existsSync(join(CWD, '.replit-tools'))) {
-    lines.push(`  ${bold('[t]')} Open Data Tools dashboard`);
+    lines.push(`  ${bold('[t]')} Data Tools status`);
   } else if (IS_REPLIT) {
     lines.push(`  ${bold('[t]')} Install replit-tools`);
   }
@@ -1100,18 +1166,7 @@ async function mainLoop() {
     if (choice === 't') {
       const dtPath = join(CWD, '.replit-tools');
       if (existsSync(dtPath)) {
-        const scriptPath = join(dtPath, 'scripts', 'setup-claude-code.sh');
-        if (existsSync(scriptPath)) {
-          console.log('');
-          console.log('  Opening Data Tools dashboard...');
-          console.log('');
-          spawnSync('bash', [scriptPath], { stdio: 'inherit', cwd: CWD });
-        } else {
-          console.log('');
-          console.log(`  Data Tools present but dashboard script missing.`);
-          console.log(`  Try: ${cyan('source .replit-tools/scripts/setup-claude-code.sh')}`);
-          console.log('');
-        }
+        await showDataToolsStatus(rl, providers);
       } else if (IS_REPLIT) {
         console.log('');
         console.log('  Installing replit-tools (Data Tools)...');

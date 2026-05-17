@@ -290,7 +290,19 @@ const THINK_WORDS = /\b(plan|design|architect|review|audit|security|code[-\s]?re
 const WRITE_INTENT_WORDS = /\b(edit|fix|change|update|create|write|modify|implement|refactor|add|remove|delete|build|install|configure|patch|apply|move|rename|migrate|replace|rewrite|generate|scaffold|init(?:ialize)?|setup|deploy|run\s+tests?|commit|push|install|uninstall)\b/i;
 
 // Dispatch marker prefix stamped by src/dispatch.mjs for all legitimate dispatches.
-const DISPATCH_MARKER_RE = /<!--\s*dual-brain-dispatch:\s*[a-z0-9]+\s*-->/i;
+const DISPATCH_MARKER_RE = /<!--\s*dual-brain-dispatch:[a-z0-9|:.\-]+\s*-->/i;
+
+function parseDispatchMarker(prompt) {
+  const match = prompt?.match(/<!-- dual-brain-dispatch:([^>]+) -->/);
+  if (!match) return null;
+  const parts = match[1].split('|');
+  const fields = { runId: parts[0] };
+  for (const part of parts.slice(1)) {
+    const [key, val] = part.split(':');
+    if (key && val) fields[key] = val;
+  }
+  return fields;
+}
 
 /**
  * Determine whether a prompt is purely read-only (no write keywords at all).
@@ -357,6 +369,22 @@ try {
     // Non-blocking governance warning — will be included in final output
   }
 
+  // ── Over-provisioning check via enriched dispatch marker ───────────────────
+  // If the marker carries governance scores, validate that the model tier isn't
+  // higher than the task actually requires (closes the brainstorm-opus loophole).
+  const markerFields = parseDispatchMarker(rawPrompt);
+  if (markerFields?.req && markerFields?.model) {
+    const reqTier = parseInt(markerFields.req, 10);
+    const modelTier = getGovernanceTier(markerFields.model);
+    if (!isNaN(reqTier) && modelTier > reqTier && reqTier <= 2) {
+      process.stdout.write(JSON.stringify({
+        systemMessage: `[governance] Over-provisioned: task requires tier ${reqTier} but using tier ${modelTier} model (${markerFields.model}). Consider downgrading.`,
+      }));
+      process.exit(0);
+    }
+  }
+  // ── End over-provisioning check ────────────────────────────────────────────
+
   // Compute prompt hash early for duplicate detection and logging
   const promptHash = computePromptHash(ti);
 
@@ -403,8 +431,9 @@ try {
   let autoStatus = null;
 
   // Helper to prepend optional warnings (duplicate + drift + balance + auto) before a message
+  const govWarning = govResult?.systemMessage || null;
   const prependWarnings = (msg) => {
-    const parts = [duplicateWarning, driftWarning, failureMessage, msg, autoStatus, balanceHint].filter(Boolean);
+    const parts = [govWarning, duplicateWarning, driftWarning, failureMessage, msg, autoStatus, balanceHint].filter(Boolean);
     return parts.join('\n\n');
   };
 
@@ -508,7 +537,7 @@ try {
         followed: true,
         profile: profileName,
       });
-      const onlyWarnings = [duplicateWarning, driftWarning, failureMessage, autoStatus, balanceHint].filter(Boolean).join('\n\n');
+      const onlyWarnings = [govWarning, duplicateWarning, driftWarning, failureMessage, autoStatus, balanceHint].filter(Boolean).join('\n\n');
       if (onlyWarnings) {
         process.stdout.write(JSON.stringify({ systemMessage: onlyWarnings }));
       } else {
@@ -539,7 +568,7 @@ try {
         followed: true,
         profile: profileName,
       });
-      const onlyWarnings = [duplicateWarning, driftWarning, failureMessage, autoStatus, balanceHint].filter(Boolean).join('\n\n');
+      const onlyWarnings = [govWarning, duplicateWarning, driftWarning, failureMessage, autoStatus, balanceHint].filter(Boolean).join('\n\n');
       if (onlyWarnings) {
         process.stdout.write(JSON.stringify({ systemMessage: onlyWarnings }));
       } else {

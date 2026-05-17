@@ -82,15 +82,20 @@
           {
             "type": "command",
             "command": "node .claude/hooks/enforce-tier.mjs"
-          },
-          {
-            "type": "command",
-            "command": "node .claude/hooks/deliberation-gate.mjs"
           }
         ]
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/cost-logger.mjs"
+          }
+        ]
+      },
       {
         "matcher": "",
         "hooks": [
