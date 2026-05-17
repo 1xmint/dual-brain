@@ -1181,6 +1181,29 @@ async function dispatch(input = {}) {
       const { recordDispatchOutcome } = await import('./outcome.mjs');
       recordDispatchOutcome(input, nativeResult);
     } catch { /* never block */ }
+
+    // ── Self-correction: intelligent retry after failover exhaustion ──────────
+    if (!success) {
+      const attemptNumber = input._retryAttempt || 1;
+      try {
+        const { shouldRetry } = await import('./self-correct.mjs');
+        const retry = shouldRetry(nativeResult, decision, attemptNumber);
+        if (retry.retry && retry.decision) {
+          if (verbose) process.stderr.write(`[dual-brain] self-correct: ${retry.strategy} (attempt ${attemptNumber + 1}, reason: ${retry.reason})\n`);
+          return dispatch({
+            ...input,
+            decision: retry.decision,
+            _retryAttempt: attemptNumber + 1,
+            _skipPreDispatchThink: retry.strategy !== 'rethink',
+            _skipRelatedContext: true,
+          });
+        } else if (verbose) {
+          process.stderr.write(`[dual-brain] self-correct: giving up (${retry.reason})\n`);
+        }
+      } catch { /* non-blocking — if self-correct fails, return original failure */ }
+    }
+    // ── End self-correction ───────────────────────────────────────────────────
+
     return nativeResult;
   }
 
@@ -1303,6 +1326,29 @@ async function dispatch(input = {}) {
     const { recordDispatchOutcome } = await import('./outcome.mjs');
     recordDispatchOutcome(input, subResult);
   } catch { /* never block */ }
+
+  // ── Self-correction: intelligent retry after failover exhaustion ──────────
+  if (!success) {
+    const attemptNumber = input._retryAttempt || 1;
+    try {
+      const { shouldRetry } = await import('./self-correct.mjs');
+      const retry = shouldRetry(subResult, decision, attemptNumber);
+      if (retry.retry && retry.decision) {
+        if (verbose) process.stderr.write(`[dual-brain] self-correct: ${retry.strategy} (attempt ${attemptNumber + 1}, reason: ${retry.reason})\n`);
+        return dispatch({
+          ...input,
+          decision: retry.decision,
+          _retryAttempt: attemptNumber + 1,
+          _skipPreDispatchThink: retry.strategy !== 'rethink',
+          _skipRelatedContext: true,
+        });
+      } else if (verbose) {
+        process.stderr.write(`[dual-brain] self-correct: giving up (${retry.reason})\n`);
+      }
+    } catch { /* non-blocking — if self-correct fails, return original failure */ }
+  }
+  // ── End self-correction ───────────────────────────────────────────────────
+
   return subResult;
 }
 

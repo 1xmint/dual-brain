@@ -45,6 +45,16 @@ function last7DaysFiles(cwd) {
   return files;
 }
 
+const INTENT_KEYWORDS = ['implement', 'fix', 'refactor', 'review', 'search', 'test'];
+
+function deriveIntent(prompt, tier) {
+  const lower = (prompt ?? '').toLowerCase();
+  for (const kw of INTENT_KEYWORDS) {
+    if (lower.includes(kw)) return kw;
+  }
+  return tier ?? 'execute';
+}
+
 export function recordDispatchOutcome(dispatchInput, result) {
   try {
     const cwd = dispatchInput.cwd ?? process.cwd();
@@ -69,6 +79,24 @@ export function recordDispatchOutcome(dispatchInput, result) {
 
     const filePath = join(outcomesDir(cwd), `outcome_${id}.json`);
     writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf8');
+
+    // Score the outcome for the routing advisor (non-blocking)
+    try {
+      import('./signal.mjs').then(({ scoreOutcome }) =>
+        import('./routing-advisor.mjs').then(({ recordReward }) => {
+          const scored = scoreOutcome(record);
+          const intent = deriveIntent(record.prompt, record.tier);
+          const cellKey = `${record.tier}:${intent}`;
+          // Normalize full model ID to short name for the advisor cell
+          const modelId = record.model ?? 'sonnet';
+          const shortModel = /haiku/i.test(modelId) ? 'haiku'
+            : /opus/i.test(modelId) ? 'opus'
+            : 'sonnet';
+          recordReward(cellKey, shortModel, scored.reward, cwd);
+        })
+      ).catch(() => { /* non-blocking */ });
+    } catch { /* non-blocking */ }
+
     return record;
   } catch {
     return null;

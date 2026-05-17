@@ -49,6 +49,28 @@ function _loadModelRegistry() {
 // Kick off the load immediately so it is ready before the first routing call.
 _loadModelRegistry();
 
+// ─── Routing Advisor (optional, lazy-loaded) ──────────────────────────────────
+
+/**
+ * Cached reference to routing-advisor.mjs exports. Populated on first import.
+ * Remains null if unavailable — decideRoute skips advisor consultation in that case.
+ */
+let routingAdvisor = null;
+let _advisorLoadAttempted = false;
+
+function _loadRoutingAdvisor() {
+  if (_advisorLoadAttempted) return;
+  _advisorLoadAttempted = true;
+  import('./routing-advisor.mjs').then(mod => {
+    routingAdvisor = mod;
+  }).catch(() => {
+    // routing-advisor.mjs unavailable — skip learned routing
+  });
+}
+
+// Kick off the load immediately so it is ready before the first routing call.
+_loadRoutingAdvisor();
+
 // ─── Work Styles ─────────────────────────────────────────────────────────────
 
 /**
@@ -890,6 +912,28 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
   // If the pipeline changed the model (downgrade/bias/floor), resolve the new short name to a full ID.
   model = toFullModelId(model, provider, tier);
 
+  // ── Routing advisor: consult learned EMA model for this task type ─────────
+  // Non-blocking: only overrides when advisor has enough observations (confidence > 0.3).
+  // Uses short model names; advisor only covers Claude models (haiku/sonnet/opus).
+  let _advisorOverride = null;
+  if (routingAdvisor && provider === 'claude') {
+    try {
+      const advice = routingAdvisor.adviseModel(
+        { intent: detection.intent, tier, risk: detection.risk },
+        cwd
+      );
+      if (advice.confidence > 0.3 && advice.model) {
+        const advisorShort = advice.model; // advisor returns short names
+        const previousModel = toShortName(model, 'claude');
+        if (advisorShort !== previousModel && available.claude.includes(advisorShort)) {
+          const overrideFullId = toFullModelId(advisorShort, 'claude', tier);
+          _advisorOverride = { from: model, to: overrideFullId, reason: advice.reason, explored: advice.explored };
+          model = overrideFullId;
+        }
+      }
+    } catch { /* non-blocking */ }
+  }
+
   // ── Challenger / dual-brain decision ─────────────────────────────────────
   const hasBothProviders = !!(
     profile?.providers?.claude?.enabled &&
@@ -938,6 +982,7 @@ export function decideRoute({ profile = {}, detection = {}, cwd, thinkResult, se
     explanation: '',
     _healthScores: healthScores,
     _workStyle: workStyle,
+    ...(_advisorOverride   && { _advisorOverride }),
   };
 
   decision.explanation = explainDecision(decision, detection, profileWithEffectiveBias);

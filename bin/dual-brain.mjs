@@ -1094,6 +1094,18 @@ async function cmdStatus(args = []) {
       }
     }
   } catch { /* network unavailable — skip */ }
+
+  // Show top recommendation if available
+  try {
+    const { getTopRecommendation } = await import('../src/recommendations.mjs');
+    const rec = getTopRecommendation(process.cwd());
+    if (rec) {
+      console.log('');
+      console.log(`  \x1b[33m💡 ${rec.title}\x1b[0m`);
+      console.log(`     ${rec.description}`);
+      if (rec.action) console.log(`     → ${rec.action}`);
+    }
+  } catch { /* non-blocking */ }
 }
 
 // ─── cmdHot / cmdCool ─────────────────────────────────────────────────────────
@@ -6532,6 +6544,18 @@ async function main() {
   }
 
   if (cmd === 'init') {
+    // init --reconfigure: run setup-flow reconfiguration
+    if (args.includes('--reconfigure')) {
+      try {
+        const { runSetup } = await import('../src/setup-flow.mjs');
+        await runSetup(process.cwd(), { reconfigure: true });
+      } catch (e) {
+        console.error('setup-flow.mjs not available — skipping reconfigure');
+        if (process.env.DEBUG) console.error(e.message);
+      }
+      return;
+    }
+
     // init --reset: clear credentials.json and re-run wizard
     if (args.includes('--reset')) {
       const cwd = process.cwd();
@@ -6589,6 +6613,23 @@ async function main() {
       await runScreens('main');
     } else {
       await cmdInit();
+    }
+    return;
+  }
+
+  if (cmd === 'setup') {
+    const { runSetup } = await import('../src/setup-flow.mjs');
+    await runSetup(process.cwd(), { reconfigure: args.includes('--reconfigure') });
+    return;
+  }
+
+  if (cmd === 'advice' || cmd === 'recommend') {
+    const { generateRecommendations, formatRecommendations } = await import('../src/recommendations.mjs');
+    const recs = generateRecommendations(process.cwd());
+    if (recs.length === 0) {
+      console.log('  No recommendations yet. Need 20+ dispatches to generate advice.');
+    } else {
+      console.log(formatRecommendations(recs));
     }
     return;
   }
