@@ -23,6 +23,7 @@ import { compilePacket, shapeForRole } from './context-intel.js';
 import { buildContextPack } from './context.js';
 // @ts-ignore
 import { scoreTask, computeRequiredTier } from './governance.js';
+import { buildProviderEnvelope, codexPolicyArgs } from './provider-enforcement.js';
 
 import type { Provider, Tier, Risk, DispatchDecision } from './types.js';
 
@@ -683,17 +684,29 @@ function buildCommand(decision: Record<string, unknown>, prompt: string, files: 
   const provider = (decision?.provider as string) ?? 'claude';
   const modelAlias = (decision?.model as string) ?? 'sonnet';
   const effort = (decision?.effort as string | null) ?? null;
-  const sandbox = (decision?.sandbox as string) ?? 'danger-full-access';
+  const tier = (decision?.tier as string) ?? 'execute';
 
   if (provider === 'claude') {
     const modelId = CLAUDE_MODEL_IDS[modelAlias] ?? modelAlias;
-    const cmd = ['claude', '--model', modelId, '--print', '--output-format', 'json', '-p', prompt];
+    const wrappedPrompt = buildProviderEnvelope(prompt, {
+      provider: 'claude',
+      mode: 'dispatch',
+      tier,
+      cwd: _cwd,
+    });
+    const cmd = ['claude', '--model', modelId, '--print', '--output-format', 'json', '-p', wrappedPrompt];
     if (effort) cmd.push('--effort', effort);
     return cmd;
   }
 
   // openai / codex
-  const cmd = ['codex', 'exec', '-m', modelAlias, '-s', sandbox, prompt];
+  const wrappedPrompt = buildProviderEnvelope(prompt, {
+    provider: 'codex',
+    mode: 'dispatch',
+    tier,
+    cwd: _cwd,
+  });
+  const cmd = ['codex', ...codexPolicyArgs('exec'), '-m', modelAlias, wrappedPrompt];
   if (effort) cmd.push('-c', `reasoning.effort="${effort}"`);
   return cmd;
 }

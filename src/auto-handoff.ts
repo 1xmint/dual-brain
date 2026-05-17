@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 import { atomicWriteJson, readJsonSafe } from './integrity.js';
 import { getProviderState, getAllProviderStates } from './provider-manager.js';
 import { loadSession } from './session.js';
+import { buildProviderEnvelope, codexPolicyArgs } from './provider-enforcement.js';
 import type { Provider } from './types.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -313,16 +314,25 @@ export function executeHandoff(opts: HandoffOpts): HandoffResult {
         : context.currentPhase;
     }
 
-    // Build handoff prompt
-    const prompt = buildHandoffPrompt(context);
+    // Build handoff prompt and wrap it in the provider enforcement contract.
+    const basePrompt = buildHandoffPrompt(context);
 
     // Write context to handoff file
     ensureHandoffDir(cwd);
     const contextFilePath = handoffFile(cwd);
 
+    const prompt = buildProviderEnvelope(basePrompt, {
+      provider: other,
+      mode: 'handoff',
+      tier: 'execute',
+      runId: `handoff:${normalized}->${other}:${Date.now()}`,
+      cwd,
+    });
+
     const handoffData = {
       context,
       prompt,
+      basePrompt,
       fromProvider: normalized,
       toProvider: other,
       auto: auto ?? false,
@@ -379,12 +389,11 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
       // `-p` is the config profile flag, so do not use it here.
       // In non-TTY contexts like Claude Code's shell tool, the interactive TUI
       // cannot start, so use non-interactive exec instead.
-      // Replit's bubblewrap setup can reject Codex's workspace sandbox, so the
-      // non-TTY fallback uses Codex's no-sandbox mode and relies on Replit's
-      // outer workspace isolation.
+      // Codex options must appear before the subcommand, so codexPolicyArgs()
+      // returns a full global-policy prefix for both interactive and exec modes.
       spawnArgs = codexNonTty
-        ? ['exec', '--sandbox', 'danger-full-access', prompt.slice(0, 4000)]
-        : [prompt.slice(0, 4000)];
+        ? [...codexPolicyArgs('exec'), prompt.slice(0, 4000)]
+        : [...codexPolicyArgs('interactive'), prompt.slice(0, 4000)];
     } else {
       // Claude accepts an initial prompt as a positional argument in interactive mode.
       // Use print mode only for non-TTY callers.

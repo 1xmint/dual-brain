@@ -8,7 +8,7 @@
  */
 
 import readline from 'readline';
-import { existsSync, readFileSync, readdirSync, statSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
@@ -366,6 +366,46 @@ function countRunning() {
     codex = (r.stdout || '').trim().split('\n').filter(Boolean).length;
   } catch {}
   return { claude, codex };
+}
+
+function otherProviderForSession(session) {
+  return session?.tool === 'codex' ? 'claude' : 'codex';
+}
+
+function sessionBrief(session, target) {
+  const prompt = session?.firstPrompt || session?.name || session?.id || 'previous session';
+  return [
+    `Continue the ${session?.tool || 'claude'} session in ${target}.`,
+    session?.id ? `Original session id: ${session.id}.` : '',
+    `Context: ${String(prompt).replace(/\s+/g, ' ').slice(0, 700)}`,
+  ].filter(Boolean).join(' ');
+}
+
+function importVisibleSessions(sessions) {
+  const dir = join(CWD, '.dualbrain');
+  const file = join(dir, 'sessions.json');
+  mkdirSync(dir, { recursive: true });
+  let meta = {};
+  try { meta = JSON.parse(readFileSync(file, 'utf8')); } catch {}
+  const now = new Date().toISOString();
+  let count = 0;
+  for (const s of sessions) {
+    if (!s?.id) continue;
+    if (meta[s.id]?.source === 'data-tools') continue;
+    meta[s.id] = {
+      ...(meta[s.id] || {}),
+      source: 'data-tools',
+      tool: s.tool || 'claude',
+      importedAt: now,
+      createdAt: meta[s.id]?.createdAt || now,
+      name: s.firstPrompt || s.id,
+    };
+    count++;
+  }
+  const tmp = file + '.tmp.' + process.pid;
+  writeFileSync(tmp, JSON.stringify(meta, null, 2) + '\n');
+  renameSync(tmp, file);
+  return count;
 }
 
 // ─── Provider Balance ─────────────────────────────────────────────────────
@@ -893,8 +933,10 @@ function renderReturningMenu(providers, sessions) {
   // ── Sessions
   lines.push(`  ${dim('─── Sessions')}`);
   lines.push(`  ${bold('[c]')} Continue last session`);
+  lines.push(`  ${bold('[g]')} Continue last in other provider`);
   if (sessions.length > 0) lines.push(`  ${bold('[1-9]')} Resume numbered above`);
   lines.push(`  ${bold('[n]')} New session`);
+  lines.push(`  ${bold('[i]')} Import/sync sessions`);
   lines.push(`  ${bold('[w]')} Vibe workflow ${dim('(say what you want, we handle the rest)')}`);
 
   // ── Settings
@@ -1075,6 +1117,23 @@ async function mainLoop() {
       continue;
     }
 
+    if (choice === 'g') {
+      if (sessions.length === 0) {
+        console.log('');
+        console.log(`  ${yellow('No recent session to switch.')} Start a new session first.`);
+        console.log('');
+        continue;
+      }
+      const s = sessions[0];
+      const target = otherProviderForSession(s);
+      const brief = sessionBrief(s, target);
+      console.log('');
+      console.log(`  Switching ${s.tool || 'claude'} session to ${target}...`);
+      console.log('');
+      spawnSync('dual-brain', ['switch', target, brief], { stdio: 'inherit', cwd: CWD });
+      continue;
+    }
+
     const num = parseInt(choice, 10);
     if (num >= 1 && num <= 9 && sessions[num - 1]) {
       const s = sessions[num - 1];
@@ -1099,6 +1158,17 @@ async function mainLoop() {
       } else {
         runSession('claude', [], 'Starting new session...');
       }
+      continue;
+    }
+
+    if (choice === 'i') {
+      const count = importVisibleSessions(sessions);
+      console.log('');
+      console.log(count > 0
+        ? `  ${green('Imported ' + count + ' session' + (count === 1 ? '' : 's') + '.')}`
+        : `  ${dim('Sessions already synced.')}`);
+      console.log('');
+      await ask();
       continue;
     }
 

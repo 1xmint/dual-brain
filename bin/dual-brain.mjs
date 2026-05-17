@@ -38,8 +38,12 @@ function _claudeNewArgs(cwd) {
   return args;
 }
 
-function _codexResumeArgs(sessionId) {
-  return ['resume', sessionId];
+function _codexResumeArgs(sessionId, cwd) {
+  const prof = loadProfile(cwd || process.cwd());
+  if (prof.bypassPermissions) {
+    return ['--dangerously-bypass-approvals-and-sandbox', 'resume', sessionId];
+  }
+  return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request', 'resume', sessionId];
 }
 
 function _sessionTool(session) {
@@ -48,7 +52,7 @@ function _sessionTool(session) {
 
 function _sessionLaunchArgs(session, cwd) {
   return _sessionTool(session) === 'codex'
-    ? _codexResumeArgs(session.id)
+    ? _codexResumeArgs(session.id, cwd)
     : _claudeResumeArgs(session.id, cwd);
 }
 
@@ -355,8 +359,9 @@ Commands:
                             Usage: dual-brain shell-hook >> ~/.bashrc
 
 Interactive mode (entered with no args on a TTY):
-  Session manager with recent sessions and routing.
-  [n] New session, [c] Continue last, [1-9] Resume, [s] Settings, [q] Exit
+  Enforced dual-brain shell with recent sessions and routing.
+  Enter Resume last, [n] New work, [g] Switch provider, [i] Import,
+  [/] Search, [s] Settings, [d] Doctor, [a] Auto mode, [q] Exit
 
 Options:
   --version                 Print version
@@ -417,7 +422,7 @@ function printSubscriptionTable(auth, profile) {
 
   const claudeLine1 = auth.claude.found
     ? `  Claude:  logged in (${auth.claude.source})`
-    : `  Claude:  not logged in — run: claude auth login`;
+    : `  Claude:  not logged in — run: claude login`;
   const claudeLine2 = `           plan: ${claudePlanLabel}${claudeLabel}`;
 
   const openaiLine1 = auth.openai.found
@@ -447,7 +452,7 @@ async function cmdInit(rl) {
   const noneFound = !auth.claude.found && !auth.openai.found;
   if (noneFound) {
     console.log('\nNo AI provider found. Log in first:');
-    console.log('  Claude:  claude auth login');
+    console.log('  Claude:  claude login');
     console.log('  OpenAI:  codex login\n');
     console.log('Then re-run: dual-brain init');
     return;
@@ -500,7 +505,7 @@ async function cmdAuth(subArgs = []) {
 
   if (!auth.claude.found || !auth.openai.found) {
     console.log('');
-    if (!auth.claude.found) console.log('  Claude not logged in. Run: claude auth login');
+    if (!auth.claude.found) console.log('  Claude not logged in. Run: claude login');
     if (!auth.openai.found) console.log('  OpenAI not logged in. Run: codex login');
   }
 }
@@ -1874,7 +1879,7 @@ async function welcomeScreen(rl, ask) {
 
   if (!claudeReady && !openaiReady) {
     console.log('No CLI login found. Log in first:');
-    console.log('  claude auth login   — for Claude');
+    console.log('  claude login        — for Claude');
     console.log('  codex login         — for OpenAI/Codex\n');
     console.log('Then re-run: dual-brain init');
     return { next: 'exit' };
@@ -3195,7 +3200,7 @@ async function mainScreen(rl, ask) {
     }
 
     if (!anyProviderAvail) {
-      signalLines.push(`${RED}✗${RST} ${BOLD}No provider connected${RST}  — run: dual-brain login`);
+      signalLines.push(`${RED}✗${RST} ${BOLD}No provider connected${RST}  — run: dual-brain auth`);
     }
 
     if (signalLines.length > 0) {
@@ -3223,6 +3228,7 @@ async function mainScreen(rl, ask) {
     [`i`,     'import sessions'],
     [`s`,     'settings & profiles'],
     [`d`,     'doctor — diagnose issues'],
+    [`t`,     'team settings'],
     [`a`,     profile.automode ? 'auto mode  (on)' : 'auto mode  (off)'],
     [`q`,     'quit'],
   ];
@@ -3429,7 +3435,7 @@ async function mainScreen(rl, ask) {
           const sess = results[num - 1];
           const { spawnSync: sp2 } = await import('node:child_process');
           const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-          const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id) : _claudeResumeArgs(sess.id, cwd);
+          const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id, cwd) : _claudeResumeArgs(sess.id, cwd);
           process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
           sp2(tool, launchArgs, { stdio: 'inherit' });
         }
@@ -3443,7 +3449,9 @@ async function mainScreen(rl, ask) {
       if (cmd === 'auto') {
         const cwd2 = process.cwd();
         const prof = loadProfile(cwd2);
-        prof.automode = !prof.automode;
+        const nextAuto = !(prof.automode ?? prof.settings?.automode ?? false);
+        prof.automode = nextAuto;
+        prof.settings = { ...(prof.settings || {}), automode: nextAuto };
         saveProfile(prof, { cwd: cwd2 });
         const state = prof.automode ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
         process.stdout.write(`\n  Automode: ${state}\n`);
@@ -3640,7 +3648,7 @@ async function mainScreen(rl, ask) {
       const sess = results[num - 1];
       const { spawnSync } = await import('node:child_process');
       const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-      const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id) : _claudeResumeArgs(sess.id, cwd);
+      const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id, cwd) : _claudeResumeArgs(sess.id, cwd);
       process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
       spawnSync(tool, launchArgs, { stdio: 'inherit' });
     }
@@ -3652,7 +3660,9 @@ async function mainScreen(rl, ask) {
   if (choice === 'i') { return { next: 'import-picker' }; }
   if (choice === 'a') {
     const prof = loadProfile(cwd);
-    prof.automode = !(prof.automode ?? prof.settings?.automode ?? false);
+    const nextAuto = !(prof.automode ?? prof.settings?.automode ?? false);
+    prof.automode = nextAuto;
+    prof.settings = { ...(prof.settings || {}), automode: nextAuto };
     saveProfile(prof, { cwd });
     process.stdout.write(`\n  Automode: ${prof.automode ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m'}\n\n`);
     await ask('  Press Enter to continue...');
@@ -4231,6 +4241,8 @@ async function settingsScreen(rl, ask) {
   // Load current work style
   const profile = loadProfile(cwd);
   const currentBias = profile?.bias || profile?.mode || 'balanced';
+  const automode = profile.automode ?? profile.settings?.automode ?? false;
+  const bypassPermissions = !!profile.bypassPermissions;
 
   // Work style current markers
   const _stIsFast = ['cost-saver', 'auto', 'solo-claude', 'solo-openai'].includes(currentBias);
@@ -4269,6 +4281,19 @@ async function settingsScreen(rl, ask) {
     `  ${dot(_stIsFast)} ${_stIsFast ? BOLD : DIM}Fast${RESET}   speed over caution`,
     `  ${dot(_stIsBal)}  ${_stIsBal ? BOLD : DIM}Balanced${RESET}   smart routing, reviews on important`,
     `  ${dot(_stIsFull)} ${_stIsFull ? BOLD : DIM}Full Power${RESET}   dual-brain everything, max quality`,
+  ];
+
+  // ── Conversation behavior ───────────────────────────────────────────────
+  const autoMark = automode ? chk : xmark;
+  const permMark = bypassPermissions ? `${RED}!${RESET}` : chk;
+  const permMode = bypassPermissions
+    ? `${RED}bypass approvals and sandbox${RESET}`
+    : `${GREEN}safe approvals + workspace sandbox${RESET}`;
+  const convLines = [
+    `  ${DIM}Auto mode${RESET}      ${autoMark} ${automode ? 'run safe tasks immediately' : 'ask before launching tasks'}`,
+    `  ${DIM}Permissions${RESET}    ${permMark} ${permMode}`,
+    `  ${DIM}Claude resume${RESET}  ${bypassPermissions ? '--dangerously-skip-permissions' : 'normal permissions'}`,
+    `  ${DIM}Codex resume${RESET}   ${bypassPermissions ? '--dangerously-bypass-approvals-and-sandbox' : 'workspace-write + on-request'}`,
   ];
 
   // ── System info ──────────────────────────────────────────────────────────
@@ -4341,10 +4366,16 @@ async function settingsScreen(rl, ask) {
     signalLine('info', `${DIM}[1-3] change${RESET}`),
   ];
 
+  const convContent = [
+    ...convLines.map(l => l.replace(/^  /, '')),
+    '',
+    signalLine('info', `${DIM}[o] auto mode  [v] permission mode${RESET}`),
+  ];
+
   const sysContent = [
     ...sysLines.map(l => l.replace(/^  /, '')),
     '',
-    signalLine('info', `${DIM}[d] run doctor  [x] diagnostics${RESET}`),
+    signalLine('info', `${DIM}[d] diagnostics${RESET}`),
   ];
 
   const navContent = [
@@ -4355,6 +4386,7 @@ async function settingsScreen(rl, ask) {
   process.stdout.write('\n');
   process.stdout.write(panel('Subscriptions', subsContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('Work style', wsContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
+  process.stdout.write(panel('Conversation', convContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('System', sysContent, { width: settingsPanelW, titleColor: CYAN }) + '\n\n');
   process.stdout.write(panel('Navigation', navContent, { width: settingsPanelW }) + '\n\n');
 
@@ -4377,6 +4409,40 @@ async function settingsScreen(rl, ask) {
       process.stdout.write(`\n  Work style set to ${wsDisp[choice]}\n\n`);
       await ask('  Press Enter to continue...');
     }
+    return { next: 'settings' };
+  }
+
+  // Conversation behavior toggles
+  if (choice === 'o') {
+    const nextAuto = !automode;
+    profile.automode = nextAuto;
+    profile.settings = { ...(profile.settings || {}), automode: nextAuto };
+    saveProfile(profile, { cwd });
+    process.stdout.write(`\n  Auto mode: ${nextAuto ? GREEN + 'ON' + RESET : DIM + 'OFF' + RESET}\n\n`);
+    await ask('  Press Enter to continue...');
+    return { next: 'settings' };
+  }
+
+  if (choice === 'v') {
+    if (bypassPermissions) {
+      profile.bypassPermissions = false;
+      saveProfile(profile, { cwd });
+      process.stdout.write(`\n  Permission mode: ${GREEN}safe approvals + workspace sandbox${RESET}\n\n`);
+      await ask('  Press Enter to continue...');
+      return { next: 'settings' };
+    }
+
+    process.stdout.write(`\n  ${RED}Bypass mode disables provider approval prompts and sandboxing.${RESET}\n`);
+    process.stdout.write('  Use it only in trusted workspaces where the user explicitly accepts the risk.\n');
+    const confirm = (await ask('  Type YES to enable bypass mode: ')).trim();
+    if (confirm === 'YES') {
+      profile.bypassPermissions = true;
+      saveProfile(profile, { cwd });
+      process.stdout.write(`\n  Permission mode: ${RED}bypass approvals and sandbox${RESET}\n\n`);
+    } else {
+      process.stdout.write('\n  Permission mode unchanged.\n\n');
+    }
+    await ask('  Press Enter to continue...');
     return { next: 'settings' };
   }
 
@@ -5209,7 +5275,7 @@ async function authScreen(rl, ask) {
     'Claude:',
     auth.claude.found
       ? `  logged in via ${auth.claude.source}`
-      : `  not logged in — run: claude auth login`,
+      : `  not logged in — run: claude login`,
     `  plan: ${claudePlanLabel}${claudeSub?.label ? ` [${claudeSub.label}]` : ''}`,
     '',
     'OpenAI:',
