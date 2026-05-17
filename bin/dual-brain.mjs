@@ -331,6 +331,38 @@ async function checkForUpdates(currentVersion) {
   } catch {}
   return null;
 }
+
+async function maybeAutoUpdateAndRelaunch(args, { cmd, isInteractive } = {}) {
+  if (!isInteractive) return false;
+  if (process.env.DUAL_BRAIN_NO_AUTO_UPDATE === '1') return false;
+  if (process.env.DUAL_BRAIN_AUTO_UPDATED === '1') return false;
+  const skip = new Set(['update', 'upgrade', 'install', 'uninstall', 'shell-hook', '--version', '-v', '--help', '-h']);
+  if (skip.has(cmd)) return false;
+
+  const current = readVersion();
+  const latest = await checkForUpdates(current);
+  if (!latest) return false;
+
+  const { spawnSync } = await import('node:child_process');
+  process.stdout.write(`\n  Updating dual-brain ${current} -> ${latest}...\n`);
+  const install = spawnSync('npm', ['install', '-g', `dual-brain@${latest}`], {
+    stdio: 'inherit',
+    cwd: process.cwd(),
+  });
+  if (install.status !== 0) {
+    process.stdout.write(`  Update failed; continuing with ${current}.\n\n`);
+    return false;
+  }
+
+  process.stdout.write(`  Updated to ${latest}. Restarting dual-brain...\n\n`);
+  const relaunched = spawnSync('dual-brain', args, {
+    stdio: 'inherit',
+    cwd: process.cwd(),
+    env: { ...process.env, DUAL_BRAIN_AUTO_UPDATED: '1' },
+  });
+  process.exit(relaunched.status ?? 0);
+}
+
 function flag(args, name) { const i = args.indexOf(name); return i !== -1 ? (args[i + 1] ?? true) : null; }
 function err(msg) { process.stderr.write(`Error: ${msg}\n`); process.exit(1); }
 function vtrace(msg) { process.stderr.write(`[verbose] ${msg}\n`); }
@@ -2501,6 +2533,41 @@ function applyIntelligenceCommand(cmd, cwd) {
   return { scope: 'this session', level: cmd.level };
 }
 
+function parseProviderSwitchCommand(input) {
+  const text = input.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!/\b(switchover|switch over|switch provider|other provider|continue in (gpt|codex|claude|other provider)|switch (to|into) (gpt|codex|claude|openai))\b/.test(text)) {
+    return null;
+  }
+  let provider = null;
+  if (/\b(gpt|codex|openai)\b/.test(text)) provider = 'codex';
+  if (/\bclaude\b/.test(text)) provider = 'claude';
+  return { provider };
+}
+
+function getActionSession(cwd, recentSessions = []) {
+  const active = readActiveConversation(cwd);
+  if (active) {
+    return recentSessions.find(s => s.id === active.sessionId) || {
+      id: active.sessionId,
+      tool: active.provider,
+      smartName: active.sessionName || active.conversationId || active.sessionId,
+    };
+  }
+  return recentSessions[0] || null;
+}
+
+async function switchProviderNow(cwd, session, target = null) {
+  if (!session) return false;
+  const currentTool = _sessionTool(session);
+  const targetTool = target || (currentTool === 'codex' ? 'claude' : 'codex');
+  const brief = _sessionBrief(session, targetTool);
+  setSessionResumeProvider(cwd, session, targetTool, 'head-provider-switch');
+  writeHandoffConversationLease(cwd, session, currentTool, targetTool, brief);
+  markSessionSuperseded(cwd, session, targetTool, 'head-provider-switch');
+  await cmdSwitch([targetTool, brief]);
+  return true;
+}
+
 async function offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, label = 'runtime settings') {
   const cyan = '\x1b[36m';
   const reset = '\x1b[0m';
@@ -3328,6 +3395,11 @@ function classifyInput(input) {
   const intelligenceCommand = parseIntelligenceCommand(trimmed);
   if (intelligenceCommand) {
     return { tier: 'free', command: 'intelligence', args: [], intelligenceCommand };
+  }
+
+  const providerSwitchCommand = parseProviderSwitchCommand(trimmed);
+  if (providerSwitchCommand) {
+    return { tier: 'free', command: 'provider-switch', args: [], providerSwitchCommand };
   }
 
   // Tier 0: SKILL — slash commands (checked first, deterministic)
@@ -4224,6 +4296,15 @@ async function mainScreen(rl, ask) {
         return await offerRuntimeReloadAfterModeChange(cwd, ask, recentSessions, `Intelligence ${result.level}`);
       }
 
+      if (cmd === 'provider-switch') {
+        const sess = getActionSession(cwd, recentSessions);
+        if (!sess) return { next: 'new-session' };
+        const target = classified.providerSwitchCommand.provider;
+        process.stdout.write(`\n  Switching HEAD to ${target === 'claude' ? 'Claude' : target === 'codex' ? 'Codex/GPT' : 'the other provider'}...\n\n`);
+        await switchProviderNow(cwd, sess, target);
+        return { next: 'main' };
+      }
+
       if (cmd === 'resume' || cmd === 'r') {
         if (recentSessions.length === 0) return { next: 'new-session' };
         return { next: 'sessions' };
@@ -4548,10 +4629,7 @@ async function switchProviderScreen(rl, ask, ctx = {}) {
   }
   if (choice === 'b' || choice === 'q') return { next: 'main' };
 
-  setSessionResumeProvider(cwd, session, target, 'user-switch-now');
-  writeHandoffConversationLease(cwd, session, currentTool, target, brief);
-  markSessionSuperseded(cwd, session, target, 'manual-provider-switch');
-  await cmdSwitch([target, brief]);
+  await switchProviderNow(cwd, session, target);
   return { next: 'main' };
 }
 
@@ -7756,6 +7834,9 @@ async function main() {
 
   const args = process.argv.slice(2);
   const cmd  = args[0];
+  const isInteractive = process.stdin.isTTY;
+
+  await maybeAutoUpdateAndRelaunch(args, { cmd, isInteractive });
 
   // Session start marker — feeds routing advisor with cross-session timing signals
   try {
@@ -7765,9 +7846,6 @@ async function main() {
 
   if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
   if (cmd === '--version' || cmd === '-v') { console.log(readVersion()); return; }
-
-  // Interactive-only commands: enter screen state machine (only when TTY)
-  const isInteractive = process.stdin.isTTY;
 
   if (cmd === 'menu') {
     if (!isInteractive) {
