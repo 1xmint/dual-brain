@@ -19,7 +19,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
-const SANDBOX = IS_REPLIT ? 'danger-full-access' : 'read-only';
+const SANDBOX = 'read-only';
 
 const REVIEW_PROMPT_R1 = `You are GPT-5.5 performing Round 1 of a dual-brain code review.
 Claude (Opus) will independently review the same changes, then send you their findings

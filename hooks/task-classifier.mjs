@@ -206,7 +206,7 @@ function selectModelEffort(taskProfile, options = {}) {
     webSearch: openaiCaps?.modes?.webSearch ?? false,
     sandbox: openaiCaps?.modes?.sandbox?.[
       thinkIntents.includes(intent) ? 'think' : searchIntents.includes(intent) ? 'search' : 'execute'
-    ] ?? 'danger-full-access',
+    ] ?? 'workspace-write',
   };
 
   // ── Outcome learning override ──

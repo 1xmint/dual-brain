@@ -28,6 +28,8 @@ interface SetupAnswers {
   subscription?: string;
   subscriptionCapacity?: SubscriptionCapacity;
   workStyle?: string;
+  automode?: boolean;
+  bypassPermissions?: boolean;
   advanced?: AdvancedOptions;
   setupMode?: string;
   shellDefault?: boolean;
@@ -62,6 +64,7 @@ interface SetupConfig {
   };
   models: Record<string, string>;
   budget: { sessionLimitTokens: number | null; warnAtPercent: number };
+  behavior: { automode: boolean; bypassPermissions: boolean };
   configuredAt: string;
   setupMode: string;
   shellDefault: boolean;
@@ -152,6 +155,8 @@ export function renderConfirmation(config: SetupConfig): string {
     row('Primary model:', config.models.execute),
     row('Think agent:', config.routing.thinkEnabled ? 'enabled' : 'disabled'),
     row('Learning:', config.routing.learningEnabled ? 'on' : 'off'),
+    row('Auto mode:', config.behavior.automode ? 'on' : 'off'),
+    row('Permissions:', config.behavior.bypassPermissions ? 'bypass approvals/sandbox' : 'safe approvals + sandbox'),
     row('Shell default:', config.shellDefault ? 'dual-brain' : 'leave current shell menu'),
     '',
   ].join('\n');
@@ -159,7 +164,7 @@ export function renderConfirmation(config: SetupConfig): string {
 
 // ── Config builder ────────────────────────────────────────────────────────────
 export function buildConfig(answers: SetupAnswers, detected: DetectedEnvironment): SetupConfig {
-  const { subscription = 'auto-detected', subscriptionCapacity, workStyle = 'balanced', advanced = {}, setupMode = 'quick', shellDefault = true } = answers;
+  const { subscription = 'auto-detected', subscriptionCapacity, workStyle = 'balanced', automode = workStyle === 'auto', bypassPermissions = false, advanced = {}, setupMode = 'quick', shellDefault = true } = answers;
   const dual = subscription.startsWith('dual-');
   const isMax = subscription.includes('max') || subscription === 'chatgpt-pro';
   const topModel = isMax ? 'opus' : 'sonnet';
@@ -179,6 +184,7 @@ export function buildConfig(answers: SetupAnswers, detected: DetectedEnvironment
     },
     models: advanced.models || { search: 'haiku', execute: 'sonnet', think: topModel, review: topModel },
     budget: { sessionLimitTokens: advanced.sessionLimitTokens ?? null, warnAtPercent: advanced.warnAtPercent ?? 80 },
+    behavior: { automode, bypassPermissions },
     configuredAt: new Date().toISOString(),
     setupMode,
     shellDefault,
@@ -328,6 +334,18 @@ export async function runSetup(cwd: string, options: SetupOptions = {}): Promise
       { label: 'Aggressive',   value: 'aggressive',   description: 'best model available, maximize quality' },
       { label: 'Full auto',    value: 'auto',         description: 'never ask, optimize silently' },
     ]) as string;
+    const automode = await askYN(
+      rl,
+      'Auto mode by default? (safe tasks launch without asking; high-risk work still gates)',
+      workStyle === 'auto'
+    );
+    const permissionMode = await ask(rl, 'Provider permission mode:', [
+      { label: 'Safe approvals + sandbox', value: 'safe',   description: 'recommended; enforced workspace sandbox and approval policy' },
+      { label: 'Bypass approvals/sandbox', value: 'bypass', description: 'advanced; trusted workspaces only' },
+    ]) as string;
+    const bypassPermissions = permissionMode === 'bypass'
+      ? await askYN(rl, 'Confirm bypass mode? This disables provider approval prompts/sandboxing.', false)
+      : false;
     const shellDefault = await askYN(rl, 'Make dual-brain the default shell menu on new terminals?', true);
     let advanced: AdvancedOptions = {};
     if (mode === 'advanced') {
@@ -341,7 +359,7 @@ export async function runSetup(cwd: string, options: SetupOptions = {}): Promise
       ]) as number;
       advanced = { thinkEnabled, cascadeEnabled, learningEnabled, explorationRate };
     }
-    const config = buildConfig({ subscription, subscriptionCapacity, workStyle, advanced, setupMode: mode, shellDefault }, detected);
+    const config = buildConfig({ subscription, subscriptionCapacity, workStyle, automode, bypassPermissions, advanced, setupMode: mode, shellDefault }, detected);
     console.log(renderConfirmation(config));
     if (!await askYN(rl, 'Save and start?', true)) {
       console.log('\n' + c.yellow('Setup cancelled.') + '\n');

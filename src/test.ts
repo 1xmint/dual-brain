@@ -828,7 +828,7 @@ describe('dispatch', () => {
     });
 
     it('openai provider returns codex CLI args', () => {
-      const decision = { provider: 'openai', model: 'gpt-4o', effort: null, sandbox: 'danger-full-access' };
+      const decision = { provider: 'openai', model: 'gpt-4o', effort: null, sandbox: 'workspace-write' };
       const cmd = buildCommand(decision, 'fix the bug');
       assert.equal(cmd[0], 'codex');
       assert.ok(cmd.includes('gpt-4o'));
@@ -844,7 +844,7 @@ describe('dispatch', () => {
     });
 
     it('buildCommand includes effort flag for openai when set', () => {
-      const decision = { provider: 'openai', model: 'gpt-4o', effort: 'high', sandbox: 'danger-full-access' };
+      const decision = { provider: 'openai', model: 'gpt-4o', effort: 'high', sandbox: 'workspace-write' };
       const cmd = buildCommand(decision, 'fix the bug');
       assert.ok(cmd.includes('-c'));
     });

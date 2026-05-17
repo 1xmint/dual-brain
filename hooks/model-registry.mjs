@@ -188,7 +188,7 @@ export const MODEL_CAPABILITIES = {
     modes: {
       webSearch: true,
       webSearchFlag: '--search',
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
@@ -224,11 +224,11 @@ export const MODEL_CAPABILITIES = {
     modes: {
       webSearch: true,
       webSearchFlag: '--search',
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
-      example: 'codex exec -m gpt-4.1 -s danger-full-access "..."',
+      example: 'codex exec -m gpt-4.1 -s workspace-write "..."',
     },
     latency: 'fast',
     quirks: [
@@ -260,11 +260,11 @@ export const MODEL_CAPABILITIES = {
     modes: {
       webSearch: true,
       webSearchFlag: '--search',
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
-      example: 'codex exec -m gpt-5.2 -s danger-full-access "..."',
+      example: 'codex exec -m gpt-5.2 -s workspace-write "..."',
     },
     latency: 'fast',
     quirks: [
@@ -298,11 +298,11 @@ export const MODEL_CAPABILITIES = {
     modes: {
       webSearch: true,
       webSearchFlag: '--search',
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
-      example: 'codex exec -m gpt-5.3-codex -s danger-full-access "..."',
+      example: 'codex exec -m gpt-5.3-codex -s workspace-write "..."',
     },
     latency: 'medium',
     quirks: [
@@ -334,11 +334,11 @@ export const MODEL_CAPABILITIES = {
     },
     modes: {
       webSearch: false,
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
-      example: 'codex exec -m gpt-5.3-codex-spark -s danger-full-access "..."',
+      example: 'codex exec -m gpt-5.3-codex-spark -s workspace-write "..."',
     },
     latency: 'fastest',
     quirks: [
@@ -372,11 +372,11 @@ export const MODEL_CAPABILITIES = {
     modes: {
       webSearch: true,
       webSearchFlag: '--search',
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
-      example: 'codex exec -m gpt-5.4-mini -s danger-full-access "..."',
+      example: 'codex exec -m gpt-5.4-mini -s workspace-write "..."',
     },
     latency: 'medium',
     quirks: [
@@ -411,11 +411,11 @@ export const MODEL_CAPABILITIES = {
       webSearchFlag: '--search',
       computerUse: true,
       toolSearch: true,
-      sandbox: { search: 'read-only', execute: 'danger-full-access' },
+      sandbox: { search: 'read-only', execute: 'workspace-write' },
     },
     dispatch: {
       method: 'codex-exec',
-      example: 'codex exec -m gpt-5.4 -s danger-full-access -c reasoning.effort="high" "..."',
+      example: 'codex exec -m gpt-5.4 -s workspace-write -c reasoning.effort="high" "..."',
     },
     latency: 'medium',
     quirks: [
@@ -453,7 +453,7 @@ export const MODEL_CAPABILITIES = {
     modes: {
       webSearch: true,
       webSearchFlag: '--search',
-      sandbox: { search: 'read-only', execute: 'danger-full-access', think: 'read-only' },
+      sandbox: { search: 'read-only', execute: 'workspace-write', think: 'read-only' },
     },
     dispatch: {
       method: 'codex-exec',

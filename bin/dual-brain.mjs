@@ -26,21 +26,27 @@ import { detectTask, primeAgentRegistry } from '../dist/src/detect.js';
 
 function _claudeResumeArgs(sessionId, cwd) {
   const args = ['--resume', sessionId];
-  if (getEffectiveBypassPermissions(cwd || process.cwd())) args.push('--dangerously-skip-permissions');
+  const workspace = cwd || process.cwd();
+  if (getEffectiveBypassPermissions(workspace)) args.push('--dangerously-skip-permissions');
+  else if (getEffectiveAutomode(loadProfile(workspace), workspace)) args.push('--permission-mode', 'auto');
   return args;
 }
 
 function _claudeNewArgs(cwd) {
   const args = [];
-  if (getEffectiveBypassPermissions(cwd || process.cwd())) args.push('--dangerously-skip-permissions');
+  const workspace = cwd || process.cwd();
+  if (getEffectiveBypassPermissions(workspace)) args.push('--dangerously-skip-permissions');
+  else if (getEffectiveAutomode(loadProfile(workspace), workspace)) args.push('--permission-mode', 'auto');
   return args;
 }
 
 function _codexResumeArgs(sessionId, cwd) {
-  if (getEffectiveBypassPermissions(cwd || process.cwd())) {
+  const workspace = cwd || process.cwd();
+  if (getEffectiveBypassPermissions(workspace)) {
     return ['--dangerously-bypass-approvals-and-sandbox', 'resume', sessionId];
   }
-  return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request', 'resume', sessionId];
+  const approvalMode = getEffectiveAutomode(loadProfile(workspace), workspace) ? 'never' : 'on-request';
+  return ['--sandbox', 'workspace-write', '--ask-for-approval', approvalMode, 'resume', sessionId];
 }
 
 function _sessionTool(session) {
@@ -4391,7 +4397,7 @@ async function settingsScreen(rl, ask) {
     `  ${DIM}Auto mode${RESET}      ${autoMark} ${automode ? 'run safe tasks immediately' : 'ask before launching tasks'}  ${DIM}[${autoScope}]${RESET}`,
     `  ${DIM}Permissions${RESET}    ${permMark} ${permMode}  ${DIM}[${permissionScope}]${RESET}`,
     `  ${DIM}Claude resume${RESET}  ${bypassPermissions ? '--dangerously-skip-permissions' : 'normal permissions'}`,
-    `  ${DIM}Codex resume${RESET}   ${bypassPermissions ? '--dangerously-bypass-approvals-and-sandbox' : 'workspace-write + on-request'}`,
+    `  ${DIM}Codex resume${RESET}   ${bypassPermissions ? '--dangerously-bypass-approvals-and-sandbox' : `workspace-write + ${automode ? 'never ask' : 'on-request'}`}`,
   ];
 
   // ── System info ──────────────────────────────────────────────────────────
@@ -5298,6 +5304,30 @@ async function runOnboardingWizard(_detection, cwd, rl) {
 
   process.stdout.write('\n');
 
+  // ─── Step 3: Behavior defaults ───────────────────────────────────────────
+  process.stdout.write(` ${BOLD}Conversation behavior:${RST}\n\n`);
+  process.stdout.write(`   ${GRAY}Auto mode lets safe tasks launch immediately. HEAD still gates risky work.${RST}\n`);
+  process.stdout.write(` ${GRAY}[Enter]${RST} auto mode on  ${GRAY}[n]${RST} ask before launching tasks\n\n`);
+  const autoKey = await singleKey(['n', '\r', 'y']);
+  const defaultAutomode = autoKey !== 'n';
+  process.stdout.write('\n');
+
+  process.stdout.write(` ${BOLD}Permission mode:${RST}\n\n`);
+  process.stdout.write(`   ${GREEN}●${RST} Safe approvals + workspace sandbox (recommended)\n`);
+  process.stdout.write(`   ${GRAY}○${RST} Bypass approvals/sandbox (advanced, trusted workspaces only)\n`);
+  process.stdout.write('\n');
+  process.stdout.write(` ${GRAY}[Enter]${RST} Safe  ${GRAY}[b]${RST} bypass\n\n`);
+  const permissionKey = await singleKey(['b', '\r']);
+  let defaultBypassPermissions = false;
+  if (permissionKey === 'b') {
+    process.stdout.write('\n');
+    process.stdout.write(` ${GRAY}Bypass mode disables provider approval prompts and sandboxing.${RST}\n`);
+    process.stdout.write(` ${GRAY}Type YES to confirm: ${RST}`);
+    const confirm = await new Promise(res => rl.question('', res));
+    defaultBypassPermissions = String(confirm).trim() === 'YES';
+    process.stdout.write('\n');
+  }
+
   // Init living docs (non-fatal)
   try {
     const ld = await getLivingDocs();
@@ -5328,6 +5358,9 @@ async function runOnboardingWizard(_detection, cwd, rl) {
   finalProfile.mode      = enabledCount >= 2 ? 'dual' : finalClaudeEnabled ? 'solo-claude' : 'solo-openai';
   finalProfile.bias      = chosenBias;
   finalProfile.workStyle = chosenBias;
+  finalProfile.automode = defaultAutomode;
+  finalProfile.settings = { ...(finalProfile.settings || {}), automode: defaultAutomode };
+  finalProfile.bypassPermissions = defaultBypassPermissions;
 
   // Ask about default shell (only on first wizard run)
   if (!finalProfile.defaultShellAsked) {

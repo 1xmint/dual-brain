@@ -41,9 +41,9 @@ export function buildProviderEnvelope(prompt: string, opts: ProviderEnvelopeOpts
   ].filter(Boolean).join('\n');
 }
 
-export function codexPolicyArgs(mode: 'interactive' | 'exec' = 'interactive'): string[] {
+export function codexPolicyArgs(mode: 'interactive' | 'exec' = 'interactive', opts: { automode?: boolean } = {}): string[] {
   if (mode === 'exec') {
     return ['--sandbox', 'workspace-write', '--ask-for-approval', 'never', 'exec'];
   }
-  return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request'];
+  return ['--sandbox', 'workspace-write', '--ask-for-approval', opts.automode ? 'never' : 'on-request'];
 }

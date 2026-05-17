@@ -694,7 +694,7 @@ function buildCommand(decision: Record<string, unknown>, prompt: string, files: 
       tier,
       cwd: _cwd,
     });
-    const cmd = ['claude', '--model', modelId, '--print', '--output-format', 'json', '-p', wrappedPrompt];
+    const cmd = ['claude', '--model', modelId, '--permission-mode', 'auto', '--print', '--output-format', 'json', '-p', wrappedPrompt];
     if (effort) cmd.push('--effort', effort);
     return cmd;
   }

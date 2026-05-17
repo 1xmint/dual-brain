@@ -390,7 +390,7 @@ function pickModes(model: string, detection: Record<string, unknown>): Record<st
 function pickSandbox(model: string, detection: Record<string, unknown>): string {
   const { tier = 'execute' } = detection as { tier?: string };
   if (tier === 'search') return 'read-only';
-  if (MODEL_CAPABILITIES[model]?.provider === 'openai') return 'danger-full-access';
+  if (MODEL_CAPABILITIES[model]?.provider === 'openai') return 'workspace-write';
   return 'workspace-write';
 }
 

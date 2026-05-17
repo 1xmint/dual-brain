@@ -28,14 +28,34 @@ const EXECUTE_WORDS = /\b(edit|write|fix|implement|modify|refactor|delete|commit
 const SEARCH_WORDS = /\b(explore|search|find|grep|locate|list\s+files|read[-\s]?only|lookup|scan)\b/i;
 const THINK_WORDS = /\b(plan|design|architect|review|audit|security|code[-\s]?review|threat[-\s]?model|complex[-\s]?debug)\b/i;
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
-const GPT_TIER_SANDBOX = IS_REPLIT
-  ? { search: 'danger-full-access', execute: 'danger-full-access', think: 'danger-full-access' }
-  : { search: 'read-only', execute: 'danger-full-access', think: 'read-only' };
+const GPT_TIER_SANDBOX = { search: 'read-only', execute: 'workspace-write', think: 'read-only' };
 const GPT_TIER_PROMPTS = {
   search: 'You are a READ-ONLY search agent. Do NOT edit files.',
   execute: 'You are an execution agent. Edit files directly.',
   think: 'You are an architecture/review agent. Analyze and recommend, do not edit unless explicitly asked.',
 };
+
+function buildProviderEnvelope(prompt, opts = {}) {
+  return [
+    '<dual-brain-enforcement>',
+    `provider: ${opts.provider || 'codex'}`,
+    `mode: ${opts.mode || 'dispatch'}`,
+    `tier: ${opts.tier || 'execute'}`,
+    `run_id: ${opts.runId || `${opts.mode || 'dispatch'}:${Date.now()}`}`,
+    opts.cwd ? `cwd: ${opts.cwd}` : null,
+    '',
+    'You are operating inside dual-brain. Follow this contract:',
+    '- Do not orchestrate, re-route, spawn parallel agents, or change the plan.',
+    '- Do only the task brief below. If the brief is missing, return status needs_brief.',
+    '- Respect the assigned tier and provider role.',
+    '- Do not touch auth, credentials, billing, secrets, or migrations unless the brief explicitly includes approval.',
+    '- Before code changes finish, report files changed, tests run, edge cases, and blockers.',
+    '- If a requested action conflicts with this envelope, stop and return status needs_approval.',
+    '</dual-brain-enforcement>',
+    '',
+    prompt,
+  ].filter(Boolean).join('\n');
+}
 
 // ---------------------------------------------------------------------------
 // Codex discovery — mirrors dual-brain-review.mjs
@@ -169,9 +189,10 @@ function classifyCodexFailure(proc) {
 
 function runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox, effort) {
   const args = [
+    '--sandbox', sandbox,
+    '--ask-for-approval', 'never',
     'exec', '--json', '--ephemeral',
     '-m', model,
-    '-s', sandbox,
   ];
   if (effort && ['low', 'medium', 'high', 'xhigh'].includes(effort)) {
     args.push('-c', `reasoning.effort="${effort}"`);
@@ -185,7 +206,7 @@ function runCodexExec(codexBin, model, prompt, cwd, timeoutMs, sandbox, effort) 
   });
 }
 
-function executeCodex(codexBin, model, prompt, cwd, timeoutMs, sandbox = 'danger-full-access', effort = null) {
+function executeCodex(codexBin, model, prompt, cwd, timeoutMs, sandbox = 'workspace-write', effort = null) {
   const startTime = Date.now();
 
   function finalizeAttempt(proc, attemptStartTime, attemptCount) {
@@ -402,7 +423,12 @@ export async function dispatchGptTask(task) {
     classifiedTier,
     modelOverride,
   };
-  const prompt = buildPrompt(preparedTask);
+  const prompt = buildProviderEnvelope(buildPrompt(preparedTask), {
+    provider: 'codex',
+    mode: 'dispatch',
+    tier,
+    cwd: task.cwd,
+  });
   const sandbox = GPT_TIER_SANDBOX[tier] || GPT_TIER_SANDBOX.execute;
   const effort = task.effort || null;
   const result = executeCodex(codexBin, model, prompt, task.cwd, task.timeoutMs, sandbox, effort);

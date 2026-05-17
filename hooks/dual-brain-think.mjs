@@ -26,7 +26,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_REPLIT = !!(process.env.REPL_ID || process.env.REPL_SLUG);
-const SANDBOX = IS_REPLIT ? 'danger-full-access' : 'read-only';
+const SANDBOX = 'read-only';
 
 const CODEX_TIMEOUT_MS = 120_000;
 const MODEL = 'gpt-5.5';

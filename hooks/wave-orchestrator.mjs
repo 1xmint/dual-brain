@@ -486,7 +486,7 @@ function inferAgentType(task) {
 }
 
 function inferSandbox(task) {
-  return task.tier === 'execute' ? 'danger-full-access' : 'read-only';
+  return task.tier === 'execute' ? 'workspace-write' : 'read-only';
 }
 
 function estimateDurationMs(task) {
