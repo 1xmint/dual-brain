@@ -10,7 +10,7 @@ import { detectTask } from './detect.mjs';
 import { decideRoute, getWorkStyle, WORK_STYLES } from './decide.mjs';
 import { dispatch } from './dispatch.mjs';
 import { loadProfile } from './profile.mjs';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildContextPack as buildContextPackIntel } from './context.mjs';
 import { compilePacket } from './context-intel.mjs';
@@ -708,6 +708,18 @@ async function preDispatchThink(prompt, files, decision, cwd, profile, opts = {}
     // profile unavailable — proceed
   }
 
+  // Auto-disable if ROI is bad (< 30% hit rate after 10+ observations)
+  {
+    const metricsPath = join(cwd, '.dualbrain', 'think-metrics.json');
+    let metrics = { hits: 0, misses: 0, totalTokens: 0 };
+    try { metrics = JSON.parse(readFileSync(metricsPath, 'utf8')); } catch {}
+    if (metrics.hits + metrics.misses >= 10 && metrics.hits / (metrics.hits + metrics.misses) < 0.3) {
+      const verbose = opts.verbose ?? false;
+      if (verbose) process.stderr.write('[dual-brain] pre-dispatch think disabled: hit rate below 30%\n');
+      return { refined: false, reason: 'think ROI too low, auto-disabled' };
+    }
+  }
+
   try {
     log('[dual-brain] pre-dispatch think: refining work spec...');
 
@@ -756,12 +768,14 @@ async function preDispatchThink(prompt, files, decision, cwd, profile, opts = {}
     if (!parsed || typeof parsed.confidence !== 'number' || parsed.confidence <= 0.7) {
       const reason = !parsed ? 'unparseable response' : `confidence ${parsed.confidence} <= 0.7`;
       log(`[dual-brain] pre-dispatch think: skipped (${reason})`);
+      _recordThinkMetrics(false, cwd);
       return { refined: false };
     }
 
     const ws = parsed.workSpec;
     if (!ws || !ws.objective) {
       log('[dual-brain] pre-dispatch think: skipped (no workSpec.objective)');
+      _recordThinkMetrics(false, cwd);
       return { refined: false };
     }
 
@@ -774,17 +788,42 @@ async function preDispatchThink(prompt, files, decision, cwd, profile, opts = {}
 
     log(`[dual-brain] think refined: "${newObjective.slice(0, 60)}..." (confidence: ${parsed.confidence})`);
 
+    _recordThinkMetrics(true, cwd);
     return {
-      refined:  true,
-      prompt:   newObjective,
-      files:    newFiles,
-      decision: newDecision,
+      refined:    true,
+      prompt:     newObjective,
+      files:      newFiles,
+      decision:   newDecision,
+      confidence: parsed.confidence,
     };
   } catch (err) {
     // Non-blocking on any failure
     log(`[dual-brain] pre-dispatch think: skipped (error: ${err.message})`);
+    _recordThinkMetrics(false, cwd);
     return { refined: false };
   }
+}
+
+/**
+ * Record a think hit or miss into think-metrics.json (non-blocking).
+ * @param {boolean} hit  — true if the think agent produced a usable refinement
+ * @param {string}  cwd
+ */
+function _recordThinkMetrics(hit, cwd) {
+  try {
+    const metricsPath = join(cwd, '.dualbrain', 'think-metrics.json');
+    let metrics = { hits: 0, misses: 0, totalTokens: 0 };
+    try { metrics = JSON.parse(readFileSync(metricsPath, 'utf8')); } catch {}
+    if (hit) {
+      metrics.hits++;
+    } else {
+      metrics.misses++;
+    }
+    metrics.totalTokens += 3000; // budget per think call
+    metrics.lastUpdated = new Date().toISOString();
+    mkdirSync(join(cwd, '.dualbrain'), { recursive: true });
+    writeFileSync(metricsPath, JSON.stringify(metrics, null, 2) + '\n');
+  } catch { /* non-blocking */ }
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -1230,6 +1269,22 @@ export async function runPipeline(trigger, prompt, options = {}) {
         run._thinkRefinedPrompt  = thinkRefinement.prompt;
         run._thinkRefinedFiles   = thinkRefinement.files;
         decision                 = thinkRefinement.decision;
+
+        // Cascade: if think agent is highly confident and task is simple, downgrade worker model
+        if (thinkRefinement.decision) {
+          const thinkConf = thinkRefinement.confidence || 0;
+          const currentModel = decision.model || 'sonnet';
+          if (thinkConf >= 0.9 && currentModel !== 'haiku') {
+            // High confidence from thinker = clear spec = cheaper model can execute
+            const prevModel = decision.model;
+            decision.model = 'haiku';
+            if (verbose || run?.verbose) process.stderr.write(`[dual-brain] cascade: think confidence ${thinkConf} → downgraded ${prevModel || 'sonnet'} to haiku\n`);
+          } else if (thinkConf >= 0.75 && currentModel === 'opus') {
+            // Moderate confidence but spec is clear enough for sonnet
+            decision.model = 'sonnet';
+            if (verbose || run?.verbose) process.stderr.write(`[dual-brain] cascade: think confidence ${thinkConf} → downgraded opus to sonnet\n`);
+          }
+        }
       }
     }
 

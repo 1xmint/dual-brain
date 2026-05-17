@@ -1,6 +1,7 @@
-import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdirSync, appendFileSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { execSync } from 'child_process';
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'to', 'from',
@@ -199,6 +200,77 @@ export async function getRelevantOutcomes(prompt, files = [], cwd, options = {})
         lessons: o.lessons,
         relevanceScore: score,
       }));
+  } catch {
+    return [];
+  }
+}
+
+export async function checkFileSurvival(cwd) {
+  try {
+    const dir = join(cwd, '.dualbrain', 'outcomes');
+    if (!existsSync(dir)) return [];
+
+    // Collect up to the last 20 individual outcome JSON files
+    let files;
+    try {
+      files = readdirSync(dir)
+        .filter(f => f.startsWith('outcome_') && f.endsWith('.json'))
+        .sort()
+        .slice(-20);
+    } catch {
+      return [];
+    }
+
+    // Get current git-modified files (best-effort)
+    let modifiedFiles = new Set();
+    try {
+      const gitOut = execSync('git diff --name-only', { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+      for (const f of gitOut.split('\n').map(l => l.trim()).filter(Boolean)) {
+        modifiedFiles.add(f);
+        modifiedFiles.add(join(cwd, f));
+      }
+    } catch {
+      // git unavailable — proceed without modified-file check
+    }
+
+    const scored = [];
+
+    for (const fname of files) {
+      const fpath = join(dir, fname);
+      let record;
+      try {
+        record = JSON.parse(readFileSync(fpath, 'utf8'));
+      } catch {
+        continue;
+      }
+
+      // Skip if already scored or no filesChanged list
+      if (record.survivalScore !== undefined) continue;
+      const changedFiles = record.result?.filesChanged;
+      if (!Array.isArray(changedFiles) || changedFiles.length === 0) continue;
+
+      let survived = 0;
+      for (const f of changedFiles) {
+        const absPath = f.startsWith('/') ? f : join(cwd, f);
+        const exists = existsSync(absPath);
+        const modified = modifiedFiles.has(f) || modifiedFiles.has(absPath);
+        if (exists && !modified) survived++;
+      }
+
+      const survivalScore = survived / changedFiles.length;
+      record.survivalScore = survivalScore;
+
+      try {
+        writeFileSync(fpath, JSON.stringify(record, null, 2), 'utf8');
+      } catch {
+        // write failed — skip
+        continue;
+      }
+
+      scored.push({ id: record.id, survivalScore });
+    }
+
+    return scored;
   } catch {
     return [];
   }
