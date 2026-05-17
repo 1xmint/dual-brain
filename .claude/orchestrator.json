@@ -275,12 +275,16 @@
     "dual_thinking_permission_threshold": {
       "estimated_tokens": 50000,
       "agent_count": 2
-    }
+    },
+    "thinkEnabled": true,
+    "cascadeEnabled": true,
+    "learningEnabled": true,
+    "explorationRate": 0.3
   },
   "providers": {
     "claude": {
       "enabled": true,
-      "subscription": "max-5x",
+      "subscription": "dual-max",
       "models": {
         "think": "opus",
         "execute": "sonnet",
