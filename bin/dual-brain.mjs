@@ -297,7 +297,9 @@ Commands:
   handoff                   Cross-provider switch (auto-detect limited provider)
     --to claude|codex       Force handoff to a specific provider
     --show                  Show current handoff context without switching
+    --task "brief"          Include an explicit task brief in the handoff
   switch claude|codex       Force switch to a provider
+    switch codex "brief"    Switch and include a task brief
   think "question"          Multi-round architecture decision with dual-brain
   pr                        Show PR status for current branch
   pr create                 Create PR from current branch with auto-generated description
@@ -1146,6 +1148,7 @@ async function cmdHandoff(args = []) {
   const cwd = process.cwd();
   const fxH = await getFx();
   const toProvider = flag(args, '--to');
+  const taskBrief = flag(args, '--task');
   const showOnly = args.includes('--show');
 
   let autoHandoff;
@@ -1189,7 +1192,14 @@ async function cmdHandoff(args = []) {
     console.log(`  ⚡ Switching to ${target}...`);
     console.log('');
     const { spawnHandoff } = autoHandoff;
-    const result = spawnHandoff({ fromProvider, cwd, auto: true, force: true, interactive: true });
+    const result = spawnHandoff({
+      fromProvider,
+      cwd,
+      auto: true,
+      force: true,
+      interactive: true,
+      taskBrief: typeof taskBrief === 'string' ? taskBrief : undefined,
+    });
     if (!result.success) {
       fxH.error(result.message);
     }
@@ -1223,9 +1233,12 @@ async function cmdHandoff(args = []) {
 async function cmdSwitch(args = []) {
   const target = args[0];
   if (!target || !['claude', 'codex'].includes(target.toLowerCase())) {
-    err('Usage: dual-brain switch <claude|codex>');
+    err('Usage: dual-brain switch <claude|codex> ["task brief"]');
   }
-  await cmdHandoff(['--to', target.toLowerCase()]);
+  const taskBrief = args.slice(1).join(' ').trim();
+  const handoffArgs = ['--to', target.toLowerCase()];
+  if (taskBrief) handoffArgs.push('--task', taskBrief);
+  await cmdHandoff(handoffArgs);
 }
 
 function cmdHot(providerArg) {

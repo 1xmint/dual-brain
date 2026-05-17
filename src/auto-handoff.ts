@@ -37,6 +37,7 @@ export interface HandoffOpts {
   cwd?: string;
   auto?: boolean;
   force?: boolean;
+  taskBrief?: string;
 }
 
 export interface HandoffResult {
@@ -302,6 +303,15 @@ export function executeHandoff(opts: HandoffOpts): HandoffResult {
 
     // Export session context
     const context = exportSessionContext(cwd);
+    if (opts.taskBrief?.trim()) {
+      context.objective = opts.taskBrief.trim();
+      context.conversationSummary = context.conversationSummary === '(no session context available)'
+        ? `Task brief: ${context.objective}`
+        : `${context.conversationSummary}. Task brief: ${context.objective}`;
+      context.currentPhase = context.currentPhase === 'unknown'
+        ? 'resume from explicit handoff task brief'
+        : context.currentPhase;
+    }
 
     // Build handoff prompt
     const prompt = buildHandoffPrompt(context);
