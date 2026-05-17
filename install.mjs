@@ -1042,10 +1042,17 @@ function installDefaultShellLauncher(workspace, actions) {
 
   const start = '# >>> dual-brain default launcher >>>';
   const end = '# <<< dual-brain default launcher <<<';
+  const suppressStart = '# >>> dual-brain suppress data-tools prompt >>>';
+  const suppressEnd = '# <<< dual-brain suppress data-tools prompt <<<';
+  const suppressBlock = [
+    suppressStart,
+    '# Added by dual-brain install when dual-brain is the default shell menu.',
+    'export CLAUDE_NO_PROMPT=true',
+    suppressEnd,
+  ].join('\n');
   const block = [
     start,
     '# Added by dual-brain install. Set DUAL_BRAIN_SKIP=1 to bypass.',
-    'export CLAUDE_NO_PROMPT=true',
     'if [ -t 1 ] && [ -z "${DUAL_BRAIN_LOADED}" ] && [ -z "${DUAL_BRAIN_SKIP}" ]; then',
     '  export DUAL_BRAIN_LOADED=1',
     '  command -v dual-brain >/dev/null 2>&1 && dual-brain',
@@ -1057,7 +1064,12 @@ function installDefaultShellLauncher(workspace, actions) {
     let src = readFileSync(bashrcPath, 'utf8');
     const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const existing = new RegExp(`${esc(start)}[\\s\\S]*?${esc(end)}\\n?`, 'm');
+    const existingSuppress = new RegExp(`${esc(suppressStart)}[\\s\\S]*?${esc(suppressEnd)}\\n?`, 'm');
     src = src.replace(existing, '');
+    src = src.replace(existingSuppress, '');
+    const sessionMarker = '# Session Manager (interactive menu)';
+    if (src.includes(sessionMarker)) src = src.replace(sessionMarker, `${suppressBlock}\n\n${sessionMarker}`);
+    else src = `${suppressBlock}\n\n${src.replace(/^\s*/, '')}`;
     const marker = '# Auto-show menu on shell start';
     if (src.includes(marker)) src = src.replace(marker, `${block}\n\n${marker}`);
     else src = `${src.replace(/\s*$/, '\n\n')}${block}\n`;
