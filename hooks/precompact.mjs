@@ -3,9 +3,9 @@
 // Ensures HEAD's running narrative, simmer buffer, and loop state survive
 // context window compression without loss.
 
-import { persist as persistNarrative, load as loadNarrative } from '../src/narrative.mjs';
-import { active as activeSimmer, prune as pruneSimmer } from '../src/simmer.mjs';
-import { getLoopStatus } from '../src/cognitive-loop.mjs';
+import { persist as persistNarrative, load as loadNarrative } from '../dist/src/narrative.js';
+import { active as activeSimmer, prune as pruneSimmer } from '../dist/src/simmer.js';
+import { getLoopStatus } from '../dist/src/cognitive-loop.js';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 

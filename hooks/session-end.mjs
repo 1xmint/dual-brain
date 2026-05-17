@@ -95,9 +95,9 @@ async function run() {
 
   // 6. Persist immersion state and release session lock
   try {
-    const { persist } = await import('../src/narrative.mjs');
-    const { prune } = await import('../src/simmer.mjs');
-    const { release } = await import('../src/session-lock.mjs');
+    const { persist } = await import('../dist/src/narrative.js');
+    const { prune } = await import('../dist/src/simmer.js');
+    const { release } = await import('../dist/src/session-lock.js');
     persist();
     prune();
     release();
