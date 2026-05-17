@@ -56,7 +56,26 @@ function _codexResumeArgs(sessionId, cwd) {
     return ['--dangerously-bypass-approvals-and-sandbox', 'resume', sessionId];
   }
   const approvalMode = getEffectiveAutomode(loadProfile(workspace), workspace) ? 'never' : 'on-request';
-  return ['--sandbox', 'workspace-write', '--ask-for-approval', approvalMode, 'resume', sessionId];
+  return [..._codexApprovalArgs(workspace, approvalMode), 'resume', sessionId];
+}
+
+function _isReplitWorkspace(cwd) {
+  const workspace = cwd || process.cwd();
+  return !!(
+    process.env.REPL_ID ||
+    process.env.REPL_SLUG ||
+    process.env.REPLIT_CLUSTER ||
+    existsSync(join(workspace, '.replit')) ||
+    existsSync(join(workspace, '.replit-tools'))
+  );
+}
+
+function _codexApprovalArgs(cwd, approvalMode = 'on-request') {
+  // Codex workspace-write depends on bubblewrap/user namespaces. Replit's
+  // container frequently blocks that, so use the Replit container boundary and
+  // Codex approvals instead of launching a HEAD that cannot run any command.
+  const sandboxMode = _isReplitWorkspace(cwd) ? 'danger-full-access' : 'workspace-write';
+  return ['--sandbox', sandboxMode, '--ask-for-approval', approvalMode];
 }
 
 function _sessionTool(session) {
@@ -2399,8 +2418,7 @@ function runtimeLaunchArgsForPending(session, cwd, pending) {
   if (tool === 'codex') {
     if (pending?.bypassPermissions) return ['--dangerously-bypass-approvals-and-sandbox', 'resume', session.id];
     return [
-      '--sandbox', 'workspace-write',
-      '--ask-for-approval', pending?.automode ? 'never' : 'on-request',
+      ..._codexApprovalArgs(cwd, pending?.automode ? 'never' : 'on-request'),
       'resume', session.id,
     ];
   }
@@ -2446,29 +2464,25 @@ async function processPendingRuntimeSwitch(cwd) {
   clearPendingRuntimeSwitch(cwd);
 
   if (targetTool !== currentTool) {
-    writeHandoffConversationLease(cwd, sess, currentTool, targetTool, pending.handoffBrief || _sessionBrief(sess, targetTool));
+    const brief = pending.handoffBrief || _sessionBrief(sess, targetTool);
+    writeHandoffConversationLease(cwd, sess, currentTool, targetTool, brief);
     markSessionSuperseded(cwd, sess, targetTool, pending.reason || 'runtime-switch');
-    await cmdSwitch([targetTool, pending.handoffBrief || _sessionBrief(sess, targetTool)]);
+    await launchSupervisedHandoff(sess, cwd, currentTool, targetTool, brief, pending);
     return true;
   }
 
-  const { spawnSync } = await import('node:child_process');
   const launchArgs = runtimeLaunchArgsForPending(sess, cwd, pending);
   process.stdout.write(`  Launching: ${targetTool} ${launchArgs.join(' ')}\n\n`);
   writeActiveConversation(cwd, sess, targetTool);
-  const env = targetTool === 'codex' && (!process.env.TERM || process.env.TERM === 'dumb')
-    ? { ...process.env, TERM: 'xterm-256color' }
-    : process.env;
   try {
-    spawnSync(targetTool, launchArgs, { stdio: 'inherit', cwd, env });
+    await launchSupervisedHead(targetTool, launchArgs, cwd, sess);
   } finally {
-    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || targetTool);
     clearActiveConversation(cwd, sess.id);
   }
   return true;
 }
 
-function writeActiveConversation(cwd, session, tool) {
+function writeActiveConversation(cwd, session, tool, extra = {}) {
   const dir = join(cwd, '.dualbrain');
   const terminalId = getTerminalId();
   const lease = {
@@ -2477,6 +2491,7 @@ function writeActiveConversation(cwd, session, tool) {
     provider: tool,
     terminalId,
     ownerPid: process.pid,
+    childPid: extra.childPid || null,
     startedAt: new Date().toISOString(),
     lastHeartbeat: new Date().toISOString(),
     mode: 'active-head',
@@ -2484,6 +2499,18 @@ function writeActiveConversation(cwd, session, tool) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(activeConversationPath(cwd), JSON.stringify(lease, null, 2) + '\n');
   return lease;
+}
+
+function updateActiveConversation(cwd, sessionId, updates = {}) {
+  try {
+    const lease = JSON.parse(readFileSync(activeConversationPath(cwd), 'utf8'));
+    if (sessionId && lease.sessionId !== sessionId) return;
+    writeFileSync(activeConversationPath(cwd), JSON.stringify({
+      ...lease,
+      ...updates,
+      lastHeartbeat: new Date().toISOString(),
+    }, null, 2) + '\n');
+  } catch {}
 }
 
 function writeHandoffConversationLease(cwd, session, fromTool, targetTool, taskBrief = '') {
@@ -2562,6 +2589,124 @@ function clearActiveConversation(cwd, sessionId) {
   } catch {}
 }
 
+function pendingSwitchMatchesSession(pending, session) {
+  if (!pending || pending.status !== 'confirmed' || pending.autoLaunch === false) return false;
+  if (!session?.id) return true;
+  return pending.sessionId === session.id;
+}
+
+async function launchSupervisedHead(tool, launchArgs, cwd, session) {
+  const { spawn } = await import('node:child_process');
+  const env = tool === 'codex' && (!process.env.TERM || process.env.TERM === 'dumb')
+    ? { ...process.env, TERM: 'xterm-256color' }
+    : process.env;
+  let switching = false;
+  let forceTimer = null;
+
+  return await new Promise((resolve) => {
+    const child = spawn(tool, launchArgs, { stdio: 'inherit', cwd, env });
+    updateActiveConversation(cwd, session?.id, { childPid: child.pid, provider: tool });
+
+    const stopChildForSwitch = () => {
+      if (switching) return;
+      switching = true;
+      process.stdout.write('\n  Switch confirmed — restarting HEAD with updated settings...\n');
+      try { child.kill('SIGTERM'); } catch {}
+      forceTimer = setTimeout(() => {
+        try {
+          if (!child.killed) child.kill('SIGKILL');
+        } catch {}
+      }, 2500);
+    };
+
+    const watcher = setInterval(() => {
+      const pending = readPendingRuntimeSwitch(cwd);
+      if (pendingSwitchMatchesSession(pending, session)) stopChildForSwitch();
+    }, 500);
+
+    child.on('exit', async (code, signal) => {
+      clearInterval(watcher);
+      if (forceTimer) clearTimeout(forceTimer);
+      saveTerminalState(cwd, getTerminalId(), session?.id, session?.tool || tool);
+
+      if (switching) {
+        const launched = await processPendingRuntimeSwitch(cwd);
+        resolve({ switched: launched, code, signal });
+        return;
+      }
+
+      clearActiveConversation(cwd, session?.id);
+      resolve({ switched: false, code, signal });
+    });
+
+    child.on('error', (err) => {
+      clearInterval(watcher);
+      if (forceTimer) clearTimeout(forceTimer);
+      process.stderr.write(`\n  Could not launch ${tool}: ${err.message}\n`);
+      clearActiveConversation(cwd, session?.id);
+      resolve({ switched: false, error: err });
+    });
+  });
+}
+
+async function launchSupervisedHandoff(session, cwd, currentTool, targetTool, brief, pending = {}) {
+  let autoHandoff;
+  try {
+    autoHandoff = await import('../dist/src/auto-handoff.js');
+  } catch (e) {
+    process.stderr.write(`\n  Could not load auto-handoff module: ${e.message}\n`);
+    return { switched: false };
+  }
+
+  const fromProvider = currentTool === 'codex' ? 'openai' : 'anthropic';
+  const result = autoHandoff.executeHandoff({
+    fromProvider,
+    cwd,
+    auto: !!pending.automode,
+    force: true,
+    taskBrief: brief,
+  });
+  if (!result.success || !result.contextFile) {
+    process.stderr.write(`\n  ${result.message || 'Handoff failed.'}\n`);
+    return { switched: false };
+  }
+
+  let prompt = '';
+  try {
+    const data = JSON.parse(readFileSync(result.contextFile, 'utf8'));
+    prompt = data?.prompt || '';
+  } catch {}
+  if (!prompt) {
+    process.stderr.write('\n  Handoff context was created, but no prompt was available to launch the target provider.\n');
+    return { switched: false };
+  }
+
+  let launchArgs;
+  if (targetTool === 'codex') {
+    launchArgs = pending?.bypassPermissions
+      ? ['--dangerously-bypass-approvals-and-sandbox', prompt.slice(0, 4000)]
+      : [
+          ..._codexApprovalArgs(cwd, pending?.automode ? 'never' : 'on-request'),
+          prompt.slice(0, 4000),
+        ];
+  } else {
+    const permissionArgs = pending?.bypassPermissions
+      ? ['--dangerously-skip-permissions']
+      : pending?.automode
+        ? ['--permission-mode', 'auto']
+        : [];
+    launchArgs = [...permissionArgs, prompt.slice(0, 4000)];
+  }
+
+  process.stdout.write(`  Launching: ${targetTool} ${launchArgs.slice(0, -1).join(' ')} [handoff context]\n\n`);
+  writeActiveConversation(cwd, session, targetTool);
+  try {
+    return await launchSupervisedHead(targetTool, launchArgs, cwd, { ...session, tool: targetTool });
+  } finally {
+    clearActiveConversation(cwd, session?.id);
+  }
+}
+
 async function confirmConversationTakeover(sess, cwd, ask) {
   const active = readActiveConversation(cwd);
   if (!active || active.sessionId !== sess.id || active.ownerPid === process.pid) return 'launch';
@@ -2602,9 +2747,8 @@ async function launchSessionWithLease(sess, cwd, ask = null) {
   writeActiveConversation(cwd, sess, tool);
   process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
   try {
-    spawnSync(tool, launchArgs, { stdio: 'inherit' });
+    await launchSupervisedHead(tool, launchArgs, cwd, sess);
   } finally {
-    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || tool);
     clearActiveConversation(cwd, sess.id);
   }
   return { next: 'main' };
@@ -6232,16 +6376,7 @@ async function sessionDetailScreen(rl, ask, ctx = {}) {
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
 
   if (choice === 'c' || choice === 'r') {
-    const tool = _sessionTool(sess);
-    const launchArgs = _sessionLaunchArgs(sess, cwd);
-    console.log(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n`);
-    try {
-      const { spawnSync } = await import('node:child_process');
-      spawnSync(tool, launchArgs, { stdio: 'inherit' });
-    } catch {
-      console.log(`  Could not launch ${tool} CLI.`);
-    }
-    return { next: 'dashboard' };
+    return await launchSessionWithLease(sess, cwd, ask);
   }
 
   if (choice === 'g') {
@@ -6542,12 +6677,7 @@ async function sessionManageScreen(rl, ask, ctx = {}) {
   }
 
   if (choice === 'o') {
-    const { spawnSync } = await import('node:child_process');
-    const tool = _sessionTool(sess);
-    const launchArgs = _sessionLaunchArgs(sess, cwd);
-    console.log(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n`);
-    spawnSync(tool, launchArgs, { stdio: 'inherit' });
-    return { next: 'sessions' };
+    return await launchSessionWithLease(sess, cwd, ask);
   }
 
   if (choice === 'g') {
