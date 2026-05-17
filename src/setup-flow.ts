@@ -26,9 +26,16 @@ interface DetectedEnvironment {
 
 interface SetupAnswers {
   subscription?: string;
+  subscriptionCapacity?: SubscriptionCapacity;
   workStyle?: string;
   advanced?: AdvancedOptions;
   setupMode?: string;
+  shellDefault?: boolean;
+}
+
+interface SubscriptionCapacity {
+  raw: string;
+  counts: Record<string, number>;
 }
 
 interface AdvancedOptions {
@@ -44,6 +51,7 @@ interface AdvancedOptions {
 interface SetupConfig {
   version: number;
   subscription: string;
+  subscriptionCapacity?: SubscriptionCapacity;
   workStyle: string;
   providers: { claude: boolean; openai: boolean };
   routing: {
@@ -56,6 +64,7 @@ interface SetupConfig {
   budget: { sessionLimitTokens: number | null; warnAtPercent: number };
   configuredAt: string;
   setupMode: string;
+  shellDefault: boolean;
   detectedEnv: { claude: boolean; codex: boolean; language: string };
 }
 
@@ -120,6 +129,16 @@ const SUB_LABELS: Record<string, string> = {
   'claude-pro': 'Claude Pro', 'claude-max-5x': 'Claude Max 5x',
   'claude-max-20x': 'Claude Max 20x', 'chatgpt-plus': 'ChatGPT Plus',
   'chatgpt-pro': 'ChatGPT Pro', 'dual-pro': 'Both Pro tiers', 'dual-max': 'Max + Pro tiers',
+  'auto-detected': 'Auto-detected providers',
+  'declared-capacity': 'Declared subscription capacity',
+};
+
+const CAPACITY_LABELS: Record<string, string> = {
+  claudePro: 'Claude Pro $20',
+  claudeMax5x: 'Claude Max $100',
+  claudeMax20x: 'Claude Max $200',
+  chatgptPlus: 'ChatGPT Plus $20',
+  chatgptPro: 'ChatGPT Pro $200',
 };
 
 // ── Confirmation display ──────────────────────────────────────────────────────
@@ -128,24 +147,30 @@ export function renderConfirmation(config: SetupConfig): string {
   return [
     '', c.bold('  Configuration:'), '',
     row('Subscription:', SUB_LABELS[config.subscription] || config.subscription),
+    config.subscriptionCapacity ? row('Capacity:', formatCapacity(config.subscriptionCapacity)) : '',
     row('Work style:', config.workStyle),
     row('Primary model:', config.models.execute),
     row('Think agent:', config.routing.thinkEnabled ? 'enabled' : 'disabled'),
     row('Learning:', config.routing.learningEnabled ? 'on' : 'off'),
+    row('Shell default:', config.shellDefault ? 'dual-brain' : 'leave current shell menu'),
     '',
   ].join('\n');
 }
 
 // ── Config builder ────────────────────────────────────────────────────────────
 export function buildConfig(answers: SetupAnswers, detected: DetectedEnvironment): SetupConfig {
-  const { subscription = 'claude-pro', workStyle = 'balanced', advanced = {}, setupMode = 'quick' } = answers;
+  const { subscription = 'auto-detected', subscriptionCapacity, workStyle = 'balanced', advanced = {}, setupMode = 'quick', shellDefault = true } = answers;
   const dual = subscription.startsWith('dual-');
   const isMax = subscription.includes('max') || subscription === 'chatgpt-pro';
   const topModel = isMax ? 'opus' : 'sonnet';
   const exploreRate = ({ aggressive: 0.3, conservative: 0.1, auto: 0.25 } as Record<string, number>)[workStyle] ?? 0.2;
+  const capacityProviders = providersFromCapacity(subscriptionCapacity);
   return {
-    version: 1, subscription, workStyle,
-    providers: { claude: subscription.startsWith('claude-') || dual, openai: subscription.startsWith('chatgpt-') || dual },
+    version: 1, subscription, subscriptionCapacity, workStyle,
+    providers: {
+      claude: capacityProviders.claude || subscription.startsWith('claude-') || dual || (subscription === 'auto-detected' && detected.claude),
+      openai: capacityProviders.openai || subscription.startsWith('chatgpt-') || dual || (subscription === 'auto-detected' && detected.codex),
+    },
     routing: {
       thinkEnabled:    advanced.thinkEnabled    ?? true,
       cascadeEnabled:  advanced.cascadeEnabled  ?? true,
@@ -156,6 +181,7 @@ export function buildConfig(answers: SetupAnswers, detected: DetectedEnvironment
     budget: { sessionLimitTokens: advanced.sessionLimitTokens ?? null, warnAtPercent: advanced.warnAtPercent ?? 80 },
     configuredAt: new Date().toISOString(),
     setupMode,
+    shellDefault,
     detectedEnv: { claude: detected.claude, codex: detected.codex, language: detected.language },
   };
 }
@@ -165,6 +191,11 @@ export function saveConfig(config: SetupConfig, cwd: string): void {
   const dir = join(cwd, '.dualbrain');
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
+  writeFileSync(join(dir, 'subscription.json'), JSON.stringify({
+    subscription: config.subscription,
+    capacity: config.subscriptionCapacity || null,
+    configuredAt: config.configuredAt,
+  }, null, 2), 'utf8');
   const orchPath = join(cwd, '.claude', 'orchestrator.json');
   if (existsSync(orchPath)) {
     try {
@@ -200,6 +231,49 @@ async function askYN(rl: Interface, question: string, defaultYes = true): Promis
       else resolve(t === 'y' || t === 'yes');
     });
   });
+}
+
+async function askLine(rl: Interface, question: string, hint: string): Promise<string> {
+  return new Promise(resolve => {
+    rl.question(`\n${c.bold(question)}\n${c.dim(hint)}\n${c.dim('> ')}`, answer => resolve(answer.trim()));
+  });
+}
+
+function parseCapacity(input: string): SubscriptionCapacity | undefined {
+  const raw = input.trim();
+  if (!raw) return undefined;
+  const counts: Record<string, number> = {};
+  const aliases: Record<string, string> = {
+    'claude-pro': 'claudePro', 'claude20': 'claudePro', 'c20': 'claudePro', 'cp': 'claudePro',
+    'claude-max': 'claudeMax5x', 'claude-max-5x': 'claudeMax5x', 'claude100': 'claudeMax5x', 'c100': 'claudeMax5x', 'cm5': 'claudeMax5x',
+    'claude-max-20x': 'claudeMax20x', 'claude200': 'claudeMax20x', 'c200': 'claudeMax20x', 'cm20': 'claudeMax20x',
+    'chatgpt-plus': 'chatgptPlus', 'gpt-plus': 'chatgptPlus', 'openai20': 'chatgptPlus', 'gpt20': 'chatgptPlus', 'g20': 'chatgptPlus',
+    'chatgpt-pro': 'chatgptPro', 'gpt-pro': 'chatgptPro', 'openai200': 'chatgptPro', 'gpt200': 'chatgptPro', 'g200': 'chatgptPro',
+  };
+
+  for (const match of raw.matchAll(/([a-z0-9$-]+)\s*(?:=|x|\*)\s*(\d+)/gi)) {
+    const key = match[1].toLowerCase();
+    const count = Math.max(0, parseInt(match[2], 10) || 0);
+    const mapped = aliases[key] || (key === '$100' ? 'claudeMax5x' : key === '$200' ? 'chatgptPro' : key === '$20' ? 'chatgptPlus' : '');
+    if (mapped && count) counts[mapped] = (counts[mapped] || 0) + count;
+  }
+
+  return { raw, counts };
+}
+
+function formatCapacity(capacity: SubscriptionCapacity): string {
+  const parts = Object.entries(capacity.counts)
+    .filter(([, count]) => count > 0)
+    .map(([key, count]) => `${CAPACITY_LABELS[key] || key} x${count}`);
+  return parts.length ? parts.join(', ') : capacity.raw;
+}
+
+function providersFromCapacity(capacity?: SubscriptionCapacity): { claude: boolean; openai: boolean } {
+  const counts = capacity?.counts || {};
+  return {
+    claude: !!(counts.claudePro || counts.claudeMax5x || counts.claudeMax20x),
+    openai: !!(counts.chatgptPlus || counts.chatgptPro),
+  };
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -241,21 +315,20 @@ export async function runSetup(cwd: string, options: SetupOptions = {}): Promise
       { label: 'Quick setup', value: 'quick',    description: '3 questions, ~20 seconds' },
       { label: 'Advanced',    value: 'advanced', description: 'full control over routing, budgets, models' },
     ]) as string;
-    const subscription = await ask(rl, 'Your AI subscription:', [
-      { label: 'Claude Pro ($20/mo)',        value: 'claude-pro' },
-      { label: 'Claude Max 5x ($100/mo)',    value: 'claude-max-5x' },
-      { label: 'Claude Max 20x ($200/mo)',   value: 'claude-max-20x' },
-      { label: 'ChatGPT Plus ($20/mo)',      value: 'chatgpt-plus' },
-      { label: 'ChatGPT Pro ($200/mo)',      value: 'chatgpt-pro' },
-      { label: 'Both providers (Pro tiers)', value: 'dual-pro' },
-      { label: 'Both providers (Max tiers)', value: 'dual-max' },
-    ]) as string;
+    const capacityRaw = await askLine(
+      rl,
+      'Subscription capacity (optional):',
+      'Press Enter for auto-detected providers, or enter counts like: claude100x3 gpt20x2 gpt200x1'
+    );
+    const subscriptionCapacity = parseCapacity(capacityRaw);
+    const subscription = subscriptionCapacity ? 'declared-capacity' : 'auto-detected';
     const workStyle = await ask(rl, 'How should dual-brain route your work?', [
       { label: 'Balanced',     value: 'balanced',     description: 'smart defaults, asks before expensive ops' },
       { label: 'Conservative', value: 'conservative', description: 'minimize tokens, prefer cheaper models' },
       { label: 'Aggressive',   value: 'aggressive',   description: 'best model available, maximize quality' },
       { label: 'Full auto',    value: 'auto',         description: 'never ask, optimize silently' },
     ]) as string;
+    const shellDefault = await askYN(rl, 'Make dual-brain the default shell menu on new terminals?', true);
     let advanced: AdvancedOptions = {};
     if (mode === 'advanced') {
       const thinkEnabled    = await askYN(rl, 'Enable think agent?', true);
@@ -268,7 +341,7 @@ export async function runSetup(cwd: string, options: SetupOptions = {}): Promise
       ]) as number;
       advanced = { thinkEnabled, cascadeEnabled, learningEnabled, explorationRate };
     }
-    const config = buildConfig({ subscription, workStyle, advanced, setupMode: mode }, detected);
+    const config = buildConfig({ subscription, subscriptionCapacity, workStyle, advanced, setupMode: mode, shellDefault }, detected);
     console.log(renderConfirmation(config));
     if (!await askYN(rl, 'Save and start?', true)) {
       console.log('\n' + c.yellow('Setup cancelled.') + '\n');
