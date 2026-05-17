@@ -16,9 +16,9 @@ import {
   saveSubscription, listSubscriptions,
   autoSetup,
   loadCredentials, saveCredentials, getCredentialSummary, detectCredentials, addCredential, removeCredential, checkCredentialHealth,
-} from '../src/profile.mjs';
+} from '../dist/src/profile.js';
 
-import { detectTask, primeAgentRegistry } from '../src/detect.mjs';
+import { detectTask, primeAgentRegistry } from '../dist/src/detect.js';
 
 // ─── Claude launch helper ────────────────────────────────────────────────────
 // Builds launch args respecting user's bypass preference from profile.
@@ -46,7 +46,7 @@ let _cachedSkillToTaskBrief = null;
 
 async function _primeRegistryCache() {
   try {
-    const reg = await import('../src/agents/registry.mjs');
+    const reg = await import('../dist/src/agents/registry.js');
     _cachedMatchSkill = reg.matchSkill;
     _cachedSkillToTaskBrief = reg.skillToTaskBrief;
   } catch {}
@@ -54,28 +54,28 @@ async function _primeRegistryCache() {
 
 import {
   decideRoute, getAvailableModels,
-} from '../src/decide.mjs';
+} from '../dist/src/decide.js';
 
 import {
   getHealth, markHot, markHealthy, remainingCooldownMinutes, getSessionStats,
-} from '../src/health.mjs';
+} from '../dist/src/health.js';
 
-import { dispatch, detectRuntime, dispatchDualBrain } from '../src/dispatch.mjs';
+import { dispatch, detectRuntime, dispatchDualBrain } from '../dist/src/dispatch.js';
 
-import { runPipeline, buildExecutionPlan, formatExecutionPlan } from '../src/pipeline.mjs';
+import { runPipeline, buildExecutionPlan, formatExecutionPlan } from '../dist/src/pipeline.js';
 
-import { loadRepoCache } from '../src/repo.mjs';
-import { loadSession, saveSession, formatSessionCard, importReplitSessions, getSessionMeta, saveSessionMeta, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions, archiveSession, getArchivedSessions } from '../src/session.mjs';
+import { loadRepoCache } from '../dist/src/repo.js';
+import { loadSession, saveSession, formatSessionCard, importReplitSessions, getSessionMeta, saveSessionMeta, renameSession, pinSession, unpinSession, categorizeSession, enrichSessions, archiveSession, getArchivedSessions } from '../dist/src/session.js';
 
-import { box, bar, badge, menu, separator, panel, divider, statusChip, headerBar, prompt as tuiPrompt, signalLine } from '../src/tui.mjs';
-import { checkBudget } from '../src/governance.mjs';
+import { box, bar, badge, menu, separator, panel, divider, statusChip, headerBar, prompt as tuiPrompt, signalLine } from '../dist/src/tui.js';
+import { checkBudget } from '../dist/src/governance.js';
 
 // ─── Dynamic imports for receipts + failure memory ───────────────────────────
 
 let _receipt = null;
 async function getReceipt() {
   if (!_receipt) {
-    try { _receipt = await import('../src/receipt.mjs'); } catch { _receipt = {}; }
+    try { _receipt = await import('../dist/src/receipt.js'); } catch { _receipt = {}; }
   }
   return _receipt;
 }
@@ -83,7 +83,7 @@ async function getReceipt() {
 let _failureMem = null;
 async function getFailureMem() {
   if (!_failureMem) {
-    try { _failureMem = await import('../src/failure-memory.mjs'); } catch { _failureMem = {}; }
+    try { _failureMem = await import('../dist/src/failure-memory.js'); } catch { _failureMem = {}; }
   }
   return _failureMem;
 }
@@ -91,7 +91,7 @@ async function getFailureMem() {
 let _livingDocs = null;
 async function getLivingDocs() {
   if (!_livingDocs) {
-    try { _livingDocs = await import('../src/living-docs.mjs'); } catch { _livingDocs = {}; }
+    try { _livingDocs = await import('../dist/src/living-docs.js'); } catch { _livingDocs = {}; }
   }
   return _livingDocs;
 }
@@ -100,7 +100,7 @@ let _cognitiveLoopCache = null;
 async function _getCognitiveLoop() {
   if (!_cognitiveLoopCache) {
     try {
-      _cognitiveLoopCache = await import('../src/cognitive-loop.mjs');
+      _cognitiveLoopCache = await import('../dist/src/cognitive-loop.js');
     } catch {
       _cognitiveLoopCache = null;
     }
@@ -112,7 +112,7 @@ let _fx = null;
 async function getFx() {
   if (_fx !== null) return _fx;
   try {
-    _fx = await import('../src/fx.mjs');
+    _fx = await import('../dist/src/fx.js');
   } catch {
     // Fallback stubs when fx.mjs is not yet present
     const _noop = () => {};
@@ -658,7 +658,7 @@ async function cmdGo(args, opts = {}) {
 
     // ── Next steps suggestions (dual-brain consensus path) ──────────────────
     try {
-      const { suggestNextSteps, formatNextSteps } = await import('../src/nextstep.mjs');
+      const { suggestNextSteps, formatNextSteps } = await import('../dist/src/nextstep.js');
       const steps = await suggestNextSteps(
         { prompt, tier: plan?._decision?.tier ?? 'think', files, trigger: 'go' },
         { success: true, filesChanged: files, error: null, duration: null },
@@ -735,7 +735,7 @@ async function cmdGo(args, opts = {}) {
     await offerAutoCommit(cwd);
     // ── Next steps suggestions ──────────────────────────────────────────────
     try {
-      const { suggestNextSteps, formatNextSteps } = await import('../src/nextstep.mjs');
+      const { suggestNextSteps, formatNextSteps } = await import('../dist/src/nextstep.js');
       const steps = await suggestNextSteps(
         {
           prompt,
@@ -1061,7 +1061,7 @@ async function cmdStatus(args = []) {
 
   // Replit section
   try {
-    const replit = await import('../src/replit.mjs');
+    const replit = await import('../dist/src/replit.js');
     const env = replit.detectReplitEnvironment(cwd);
     if (env.isReplit) {
       console.log('\nReplit:');
@@ -1097,7 +1097,7 @@ async function cmdStatus(args = []) {
 
   // Show top recommendation if available
   try {
-    const { getTopRecommendation } = await import('../src/recommendations.mjs');
+    const { getTopRecommendation } = await import('../dist/src/recommendations.js');
     const rec = getTopRecommendation(process.cwd());
     if (rec) {
       console.log('');
@@ -1109,8 +1109,8 @@ async function cmdStatus(args = []) {
 
   // Intelligence layer status
   try {
-    const { getRoutingStats } = await import('../src/routing-advisor.mjs');
-    const { getThinkingStats } = await import('../src/think-engine.mjs');
+    const { getRoutingStats } = await import('../dist/src/routing-advisor.js');
+    const { getThinkingStats } = await import('../dist/src/think-engine.js');
     const stats = getRoutingStats(cwd);
     const thinkStats = getThinkingStats(cwd);
 
@@ -1167,7 +1167,7 @@ async function cmdInstall(cwd) {
   if (result.status !== 0) { process.exit(result.status || 1); }
 
   // Additionally merge enforcement hooks into .claude/settings.json
-  const { installHooks } = await import('../src/install-hooks.mjs');
+  const { installHooks } = await import('../dist/src/install-hooks.js');
   const { installed, skipped } = installHooks(cwd);
 
   if (installed.length > 0) {
@@ -1403,7 +1403,7 @@ async function cmdPR(args) {
   // Lazy import — only loaded when 'pr' is invoked
   let prAgent;
   try {
-    prAgent = await import('../src/pr-agent.mjs');
+    prAgent = await import('../dist/src/pr-agent.js');
   } catch (e) {
     console.error('pr-agent module not available:', e.message);
     process.exit(1);
@@ -1775,7 +1775,7 @@ async function welcomeScreen(rl, ask) {
       saveProfile(existing, { cwd });
     }
     try {
-      const { ensurePersistence } = await import('../src/session.mjs');
+      const { ensurePersistence } = await import('../dist/src/session.js');
       const persisted = ensurePersistence(cwd);
       if (persisted.length > 0) {
         persisted.forEach(msg => console.log(`  ✅ ${msg}`));
@@ -2207,7 +2207,7 @@ let _headModuleCache = null;
 async function _getHeadModule() {
   if (!_headModuleCache) {
     try {
-      _headModuleCache = await import('../src/head.mjs');
+      _headModuleCache = await import('../dist/src/head.js');
     } catch {
       _headModuleCache = null;
     }
@@ -2398,7 +2398,7 @@ async function detectResumeState(cwd) {
 
   // Check for recent receipt (< 24h)
   try {
-    const { getLatestReceipt } = await import('../src/receipt.mjs');
+    const { getLatestReceipt } = await import('../dist/src/receipt.js');
     const receipt = getLatestReceipt(cwd);
     if (receipt) {
       const ageMs = Date.now() - Date.parse(receipt.timestamp);
@@ -2423,7 +2423,7 @@ async function detectResumeState(cwd) {
 
   // Check for open tasks in ledger
   try {
-    const { getOpenTasks } = await import('../src/ledger.mjs');
+    const { getOpenTasks } = await import('../dist/src/ledger.js');
     const open = getOpenTasks(cwd);
     if (open.length > 0) {
       result.type       = 'resumable';
@@ -2498,13 +2498,13 @@ async function mainScreen(rl, ask) {
 
   // Silent OAuth token auto-refresh (3s timeout — never block dashboard)
   try {
-    const { autoRefreshToken } = await import('../src/profile.mjs');
+    const { autoRefreshToken } = await import('../dist/src/profile.js');
     await Promise.race([autoRefreshToken(cwd), new Promise(r => setTimeout(r, 3000))]);
   } catch {}
 
   // Append-only session archive sync
   try {
-    const { syncSessionMirror } = await import('../src/session.mjs');
+    const { syncSessionMirror } = await import('../dist/src/session.js');
     syncSessionMirror(cwd);
   } catch {}
 
@@ -2526,7 +2526,7 @@ async function mainScreen(rl, ask) {
 
   // Build session index in background (powers search + smart resume)
   try {
-    const { buildSessionIndex } = await import('../src/session.mjs');
+    const { buildSessionIndex } = await import('../dist/src/session.js');
     buildSessionIndex(cwd);
   } catch {}
 
@@ -2627,7 +2627,7 @@ async function mainScreen(rl, ask) {
   // ── Environment awareness (powers Box 1 dots + Box 3) ────────────────────
   let envReport = null;
   try {
-    const { scanEnvironment } = await import('../src/awareness.mjs');
+    const { scanEnvironment } = await import('../dist/src/awareness.js');
     envReport = scanEnvironment(cwd);
   } catch { /* non-fatal */ }
 
@@ -2693,7 +2693,7 @@ async function mainScreen(rl, ask) {
   // Line 1: observer data first; fall back to envReport-derived observations
   let quickObservations = [];
   try {
-    const observerMod = await import('../src/observer.mjs');
+    const observerMod = await import('../dist/src/observer.js');
     const quickState = await observerMod.getQuickState(cwd);
     if (quickState?.observations?.length > 0) {
       const PRIO = { high: 0, medium: 1, low: 2 };
@@ -2750,7 +2750,7 @@ async function mainScreen(rl, ask) {
 
   if (awarenessLine2 === '\x1b[2m📋 No roadmap yet\x1b[0m') {
     try {
-      const { getOpenTasks } = await import('../src/ledger.mjs');
+      const { getOpenTasks } = await import('../dist/src/ledger.js');
       const open = getOpenTasks(cwd);
       if (open.length > 0) {
         awarenessLine2 = '📋 Next: ' + open[0].intent.slice(0, 45);
@@ -2760,7 +2760,7 @@ async function mainScreen(rl, ask) {
 
   // Line 3: model registry age warning
   try {
-    const { getRegistryAge } = await import('../src/models.mjs');
+    const { getRegistryAge } = await import('../dist/src/models.js');
     const age = getRegistryAge();
     if (age > 30 && awarenessLine3 === '\x1b[32m✓\x1b[0m No risk flags') {
       awarenessLine3 = `\x1b[33m⚠\x1b[0m  Model registry ${age} days old`;
@@ -2770,7 +2770,7 @@ async function mainScreen(rl, ask) {
   // Replit awareness rows (shown only when running in Replit, max 2-3 lines)
   const replitAwarenessRows = [];
   try {
-    const replitMod = await import('../src/replit.mjs');
+    const replitMod = await import('../dist/src/replit.js');
     const replitEnv = replitMod.detectReplitEnvironment(cwd);
     if (replitEnv.isReplit) {
       const rtInfo    = replitMod.inspectReplitTools(cwd);
@@ -2886,7 +2886,7 @@ async function mainScreen(rl, ask) {
   } else if (isReturning) {
     const openTasks = [];
     try {
-      const { getOpenTasks } = await import('../src/ledger.mjs');
+      const { getOpenTasks } = await import('../dist/src/ledger.js');
       const open = getOpenTasks(cwd);
       if (open.length > 0) openTasks.push(`continue: ${open[0].intent.slice(0, 30)}`);
     } catch {}
@@ -3243,7 +3243,7 @@ async function mainScreen(rl, ask) {
           if (!q2) return { next: 'main' };
           args.push(q2);
         }
-        const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
+        const { searchSessions, buildSessionIndex } = await import('../dist/src/session.js');
         try { buildSessionIndex(cwd); } catch {}
         const results = searchSessions(args.join(' '), cwd);
         if (results.length === 0) {
@@ -3418,7 +3418,7 @@ async function mainScreen(rl, ask) {
   if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= recentSessions.length) {
     const sess = recentSessions[numChoice - 1];
     try {
-      const { getSessionContext } = await import('../src/session.mjs');
+      const { getSessionContext } = await import('../dist/src/session.js');
       const ctx = getSessionContext(sess.id, cwd);
       if (ctx) {
         if (ctx.lastPrompt) process.stdout.write(`\n  Last working on: ${ctx.lastPrompt}\n`);
@@ -3440,7 +3440,7 @@ async function mainScreen(rl, ask) {
     const query = (await ask('  Search: ')).trim();
     if (!query) return { next: 'main' };
 
-    const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
+    const { searchSessions, buildSessionIndex } = await import('../dist/src/session.js');
     try { buildSessionIndex(cwd); } catch {}
 
     const results = searchSessions(query, cwd);
@@ -4253,7 +4253,7 @@ async function settingsScreen(rl, ask) {
   // Intelligence settings (routing, think, strategies)
   if (choice === 'i') {
     try {
-      const { runSettings } = await import('../src/settings-tui.mjs');
+      const { runSettings } = await import('../dist/src/settings-tui.js');
       await runSettings(cwd);
     } catch (e) {
       process.stdout.write(`  Intelligence settings unavailable: ${e.message}\n`);
@@ -4265,7 +4265,7 @@ async function settingsScreen(rl, ask) {
   // Revert recent changes
   if (choice === 'u') {
     try {
-      const { runRevert } = await import('../src/revert.mjs');
+      const { runRevert } = await import('../dist/src/revert.js');
       await runRevert(cwd);
     } catch (e) {
       process.stdout.write(`  Revert unavailable: ${e.message}\n`);
@@ -4299,7 +4299,7 @@ async function teamScreen(rl, ask) {
   let sharedSessions = 0;
   let teamDecisions = 0;
   try {
-    const _tmLd = await import('../src/living-docs.mjs');
+    const _tmLd = await import('../dist/src/living-docs.js');
     const _tmPs = _tmLd.getProjectState(cwd);
     if (Array.isArray(_tmPs?.project?.team)) {
       team = _tmPs.project.team;
@@ -4356,7 +4356,7 @@ async function teamScreen(rl, ask) {
     const name = (await ask('  Member name: ')).trim();
     if (name) {
       try {
-        const _tmLdAdd = await import('../src/living-docs.mjs');
+        const _tmLdAdd = await import('../dist/src/living-docs.js');
         const _tmCur   = _tmLdAdd.getProjectState(cwd);
         const _tmTeam  = Array.isArray(_tmCur?.project?.team) ? [..._tmCur.project.team] : [];
         _tmTeam.push({ name, role: 'member', addedAt: new Date().toISOString() });
@@ -6034,7 +6034,7 @@ async function runScreens(startScreen = 'dashboard') {
       if (ctx.model === 'haiku') {
         process.stdout.write('\n');
         try {
-          const { runPipeline: rp } = await import('../src/pipeline.mjs');
+          const { runPipeline: rp } = await import('../dist/src/pipeline.js');
           const { result } = await rp('go', prompt, { cwd: process.cwd(), dryRun, forceDepth: 'shallow' });
           if (result?.output) process.stdout.write('\n' + String(result.output).trim() + '\n\n');
           else process.stdout.write('  (no output)\n\n');
@@ -6535,7 +6535,7 @@ async function main() {
 
   // Session start marker — feeds routing advisor with cross-session timing signals
   try {
-    const { markSessionStart } = await import('../src/routing-advisor.mjs');
+    const { markSessionStart } = await import('../dist/src/routing-advisor.js');
     markSessionStart(process.cwd());
   } catch { /* non-blocking */ }
 
@@ -6600,7 +6600,7 @@ async function main() {
     // init --reconfigure: run setup-flow reconfiguration
     if (args.includes('--reconfigure')) {
       try {
-        const { runSetup } = await import('../src/setup-flow.mjs');
+        const { runSetup } = await import('../dist/src/setup-flow.js');
         await runSetup(process.cwd(), { reconfigure: true });
       } catch (e) {
         console.error('setup-flow.mjs not available — skipping reconfigure');
@@ -6638,7 +6638,7 @@ async function main() {
       const cwd = process.cwd();
       const dryRun = args.includes('--dry-run');
       try {
-        const replit = await import('../src/replit.mjs');
+        const replit = await import('../dist/src/replit.js');
         const report = await replit.initReplitIntegration({ dryRun, cwd });
         console.log(replit.formatReplitReport(report));
       } catch (e) {
@@ -6671,19 +6671,19 @@ async function main() {
   }
 
   if (cmd === 'setup') {
-    const { runSetup } = await import('../src/setup-flow.mjs');
+    const { runSetup } = await import('../dist/src/setup-flow.js');
     await runSetup(process.cwd(), { reconfigure: args.includes('--reconfigure') });
     return;
   }
 
   if (cmd === 'advice' || cmd === 'recommend') {
-    const { generateRecommendations, formatRecommendations } = await import('../src/recommendations.mjs');
+    const { generateRecommendations, formatRecommendations } = await import('../dist/src/recommendations.js');
     const recs = generateRecommendations(process.cwd());
     if (recs.length === 0) {
       console.log('');
       console.log('  \x1b[2m─── HEAD Analysis ───\x1b[0m');
       console.log('');
-      const { getRoutingStats } = await import('../src/routing-advisor.mjs');
+      const { getRoutingStats } = await import('../dist/src/routing-advisor.js');
       const stats = getRoutingStats(process.cwd());
       if (stats.totalObservations < 20) {
         console.log(`  Need more data: ${stats.totalObservations}/20 observations before recommendations.`);
@@ -6699,8 +6699,8 @@ async function main() {
   }
 
   if (cmd === 'stats' || cmd === 'intelligence') {
-    const { getRoutingStats } = await import('../src/routing-advisor.mjs');
-    const { getThinkingStats } = await import('../src/think-engine.mjs');
+    const { getRoutingStats } = await import('../dist/src/routing-advisor.js');
+    const { getThinkingStats } = await import('../dist/src/think-engine.js');
     const stats = getRoutingStats(process.cwd());
     const thinkStats = getThinkingStats(process.cwd());
 
@@ -6730,13 +6730,13 @@ async function main() {
   }
 
   if (cmd === 'revert' || cmd === 'undo') {
-    const { runRevert } = await import('../src/revert.mjs');
+    const { runRevert } = await import('../dist/src/revert.js');
     await runRevert(process.cwd());
     return;
   }
 
   if (cmd === 'strategies') {
-    const { listStrategies } = await import('../src/strategy.mjs');
+    const { listStrategies } = await import('../dist/src/strategy.js');
     const strats = listStrategies();
     console.log('\n  Available dispatch strategies:\n');
     for (const s of strats) {
@@ -6787,7 +6787,7 @@ async function main() {
       process.exit(1);
     }
 
-    const { searchSessions, buildSessionIndex } = await import('../src/session.mjs');
+    const { searchSessions, buildSessionIndex } = await import('../dist/src/session.js');
     const cwd = process.cwd();
     try { buildSessionIndex(cwd); } catch {}
 
