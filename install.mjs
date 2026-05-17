@@ -1067,8 +1067,10 @@ function installDefaultShellLauncher(workspace, actions) {
     const existingSuppress = new RegExp(`${esc(suppressStart)}[\\s\\S]*?${esc(suppressEnd)}\\n?`, 'm');
     src = src.replace(existing, '');
     src = src.replace(existingSuppress, '');
+    const earlyMarker = '# Claude Code Setup';
     const sessionMarker = '# Session Manager (interactive menu)';
-    if (src.includes(sessionMarker)) src = src.replace(sessionMarker, `${suppressBlock}\n\n${sessionMarker}`);
+    if (src.includes(earlyMarker)) src = src.replace(earlyMarker, `${suppressBlock}\n\n${earlyMarker}`);
+    else if (src.includes(sessionMarker)) src = src.replace(sessionMarker, `${suppressBlock}\n\n${sessionMarker}`);
     else src = `${suppressBlock}\n\n${src.replace(/^\s*/, '')}`;
     const marker = '# Auto-show menu on shell start';
     if (src.includes(marker)) src = src.replace(marker, `${block}\n\n${marker}`);
