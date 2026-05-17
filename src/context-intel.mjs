@@ -3,7 +3,8 @@ import { join, resolve } from 'node:path';
 
 export const MODEL_FORMAT = {
   claude: 'xml', sonnet: 'xml', haiku: 'xml', opus: 'xml',
-  gpt: 'markdown', o3: 'markdown', 'o4-mini': 'markdown',
+  gpt: 'markdown', 'o4-mini': 'markdown',
+  o3: 'prose',
 };
 
 function detectFormat(targetModel, role) {
@@ -14,6 +15,7 @@ function detectFormat(targetModel, role) {
 }
 
 export function selectRelevant(pack, role) {
+  if (!pack) return { intent: '', constraints: [], acceptanceCriteria: [] };
   const { intent, constraints, priorAttempts, repoState, fileSummaries,
           acceptanceCriteria, files } = pack;
   if (role === 'thinker') {
@@ -134,7 +136,7 @@ export function attachOutputSchema(role) {
   return 'Return JSON: { pass: boolean, findings: [{ severity, file, line, issue, fix }] }';
 }
 
-export function shapeForRole(pack, role, targetModel, tokenBudget) {
+export function shapeForRole(pack, role, targetModel = 'sonnet', tokenBudget = 8000) {
   const sections = selectRelevant(pack, role);
 
   if (role === 'worker' && sections.inScope?.length) {

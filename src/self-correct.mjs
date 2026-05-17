@@ -78,6 +78,7 @@ export function selectStrategy(failure, originalDecision, attemptNumber) {
         case 'specification':
           return { strategy: 'give-up', reason: 'ambiguous specification; user clarification needed' };
         default: // unknown
+          if (tier >= 3) return { strategy: 'split', newDecision: originalDecision, reason: 'unknown failure at max tier; decomposing' };
           return { strategy: 'escalate', newDecision: originalDecision, reason: 'unknown failure; escalating as precaution' };
       }
     }

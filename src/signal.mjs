@@ -71,7 +71,7 @@ export function scoreOutcome(outcome, context = {}) {
     // Signal 3: token efficiency (weight 0.25)
     let effVal = null;
     const filesChanged = outcome.filesChanged ?? 0;
-    const fileCount = typeof filesChanged === 'number' ? filesChanged : filesChanged.length;
+    const fileCount = Array.isArray(filesChanged) ? filesChanged.length : (typeof filesChanged === 'number' ? filesChanged : 0);
     if (!(fileCount === 0 && tier === 'think')) {
       const tokensUsed =
         outcome.tokensUsed?.output ??

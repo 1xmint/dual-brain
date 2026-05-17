@@ -267,7 +267,7 @@ export function formatRecommendations(recs) {
   const line = (content) => `│ ${pad(content)} │`;
 
   const lines = [
-    '╭─ Recommendations ' + '─'.repeat(WIDTH - 19) + '╮',
+    '╭─ Recommendations ' + '─'.repeat(WIDTH - 20) + '╮',
     line(''),
   ];
 
