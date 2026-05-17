@@ -361,14 +361,18 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
 
     // Build the command based on which CLI we're launching
     let spawnArgs: string[];
+    const codexNonTty = cli === 'codex' && !process.stdin.isTTY;
     if (cli === 'codex') {
       // Codex accepts the initial prompt as a positional argument.
       // `-p` is the config profile flag, so do not use it here.
       // In non-TTY contexts like Claude Code's shell tool, the interactive TUI
       // cannot start, so use non-interactive exec instead.
-      spawnArgs = process.stdin.isTTY
-        ? [prompt.slice(0, 4000)]
-        : ['exec', prompt.slice(0, 4000)];
+      // Replit's bubblewrap setup can reject Codex's workspace sandbox, so the
+      // non-TTY fallback uses Codex's no-sandbox mode and relies on Replit's
+      // outer workspace isolation.
+      spawnArgs = codexNonTty
+        ? ['exec', '--sandbox', 'danger-full-access', '--ask-for-approval', 'never', prompt.slice(0, 4000)]
+        : [prompt.slice(0, 4000)];
     } else {
       // Claude: use -p flag with prompt
       spawnArgs = ['-p', prompt.slice(0, 4000), '--no-input'];
@@ -377,7 +381,7 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
     if (opts.interactive !== false) {
       // Spawn with inherited stdio — user stays in same terminal
       const child = spawn(cli, spawnArgs, {
-        stdio: 'inherit',
+        stdio: codexNonTty ? ['ignore', 'inherit', 'inherit'] : 'inherit',
         cwd: opts.cwd || process.cwd(),
       });
 
