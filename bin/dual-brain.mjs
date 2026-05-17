@@ -2721,6 +2721,8 @@ async function mainScreen(rl, ask) {
 
   // ── Continuation card (interrupted work) ─────────────────────────────────
   if (interrupted) {
+    if (_spinnerTimeout) clearTimeout(_spinnerTimeout);
+    if (dashSpinner) { try { dashSpinner.stop(); } catch {} dashSpinner = null; }
     const DIM = '\x1b[2m', RST = '\x1b[0m', YLW = '\x1b[33m';
     process.stdout.write(`\n ${YLW}Continue:${RST} ${interrupted.sessionName}\n`);
     if (interrupted.lastState) {
