@@ -364,7 +364,11 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
     if (cli === 'codex') {
       // Codex accepts the initial prompt as a positional argument.
       // `-p` is the config profile flag, so do not use it here.
-      spawnArgs = [prompt.slice(0, 4000)];
+      // In non-TTY contexts like Claude Code's shell tool, the interactive TUI
+      // cannot start, so use non-interactive exec instead.
+      spawnArgs = process.stdin.isTTY
+        ? [prompt.slice(0, 4000)]
+        : ['exec', prompt.slice(0, 4000)];
     } else {
       // Claude: use -p flag with prompt
       spawnArgs = ['-p', prompt.slice(0, 4000), '--no-input'];
