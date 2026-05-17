@@ -2719,81 +2719,8 @@ async function mainScreen(rl, ask) {
   const termW = process.stdout.columns || 80;
   const W     = Math.min(termW - 2, 78); // usable content width
 
-  // ── Continuation card (interrupted work) ─────────────────────────────────
-  if (interrupted) {
-    if (_spinnerTimeout) clearTimeout(_spinnerTimeout);
-    if (dashSpinner) { try { dashSpinner.stop(); } catch {} dashSpinner = null; }
-    const DIM = '\x1b[2m', RST = '\x1b[0m', YLW = '\x1b[33m';
-    process.stdout.write(`\n ${YLW}Continue:${RST} ${interrupted.sessionName}\n`);
-    if (interrupted.lastState) {
-      process.stdout.write(` ${DIM}Last: ${interrupted.lastState} · ${interrupted.ageLabel}${RST}\n`);
-    } else {
-      process.stdout.write(` ${DIM}${interrupted.reason} · ${interrupted.ageLabel}${RST}\n`);
-    }
-    process.stdout.write(` \x1b[36mEnter\x1b[0m resume  \x1b[36mn\x1b[0m new  \x1b[36ms\x1b[0m skip\n\n`);
-
-    // Wait for a keypress to decide what to do with the card
-    const readline2 = await import('node:readline');
-    readline2.emitKeypressEvents(process.stdin, rl);
-
-    const cardChoice = await new Promise((resolve) => {
-      const wasRaw2 = process.stdin.isRaw;
-      const canRaw2 = process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
-      if (canRaw2) process.stdin.setRawMode(true);
-
-      const cleanup2 = () => {
-        process.stdin.removeListener('keypress', onCardKey);
-        if (canRaw2) {
-          try { process.stdin.setRawMode(wasRaw2 || false); } catch {}
-        }
-      };
-
-      const onCardKey = (str, key) => {
-        if (!key) return;
-        const name = key.name || '';
-        const seq  = key.sequence || str || '';
-
-        if (key.ctrl && (name === 'c' || name === 'd')) {
-          cleanup2();
-          process.stdout.write('\n');
-          resolve('q');
-          return;
-        }
-
-        if (name === 'return' || name === 'enter' || seq === '\r' || seq === '\n') {
-          cleanup2();
-          process.stdout.write('\n');
-          resolve('resume');
-          return;
-        }
-
-        if (!str || str.length === 0) return;
-        const lower = str.toLowerCase();
-        if (lower === 'n' || lower === 's' || lower === 'q') {
-          cleanup2();
-          process.stdout.write('\n');
-          resolve(lower);
-          return;
-        }
-      };
-
-      process.stdin.on('keypress', onCardKey);
-    });
-
-    if (cardChoice === 'q') return { next: 'exit' };
-
-    if (cardChoice === 'resume') {
-      const { spawnSync } = await import('node:child_process');
-      process.stdout.write(`  Launching: claude --resume ${interrupted.sessionId}\n\n`);
-      spawnSync('claude', _claudeResumeArgs(interrupted.sessionId, cwd), { stdio: 'inherit' });
-      saveTerminalState(cwd, getTerminalId(), interrupted.sessionId, 'claude');
-      return { next: 'main' };
-    }
-
-    if (cardChoice === 'n') return { next: 'new-session' };
-
-    // 's' → fall through to normal dashboard
-  }
+  // Interrupted work is rendered as a dashboard signal below. New shells should
+  // always land in the full menu instead of blocking on a pre-dashboard prompt.
 
   // ── Environment awareness (powers Box 1 dots + Box 3) ────────────────────
   let envReport = null;
@@ -3195,7 +3122,12 @@ async function mainScreen(rl, ask) {
     }
 
     // Resume / continuation hint
-    if (isReturning) {
+    if (interrupted) {
+      const labelTrunc = (interrupted.sessionName || 'last session').slice(0, 40);
+      const agePart = interrupted.ageLabel ? `  ${DIM}${interrupted.ageLabel}${RST}` : '';
+      const statePart = interrupted.lastState ? `  ${DIM}→ ${interrupted.lastState.slice(0, 48)}${RST}` : '';
+      signalLines.push(`${CYAN}↩${RST} Resume: ${BOLD}${labelTrunc}${RST}${agePart}${statePart}`);
+    } else if (isReturning) {
       const labelTrunc = (resumeState.label || 'last session').slice(0, 40);
       const agePart    = resumeState.ageLabel ? `  ${DIM}${resumeState.ageLabel}${RST}` : '';
       const nextPart   = resumeState.nextAction ? `  ${DIM}→ ${resumeState.nextAction}${RST}` : '';
