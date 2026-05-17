@@ -15,6 +15,8 @@ import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
+import { spinner, success as fxSuccess, warn as fxWarn, error as fxError, info as fxInfo, banner, celebrate, colors, sleep, nl, getMode } from './src/fx.mjs';
+import { panel, signalLine, headerBar } from './src/tui.mjs';
 
 // Skip hook installation during global npm install — hooks are installed
 // when the user runs 'dual-brain install' in their project directory.
@@ -103,14 +105,14 @@ if (subcommand && !SUBCOMMANDS.includes(subcommand)) {
   process.exit(1);
 }
 
-// ─── Box Drawing ────────────────────────────────────────────────────────────
+// ─── Box Drawing (legacy compat — prefer panel() from tui.mjs) ─────────────
 
 const W = 54;
-const pad = (s, len = W - 2) => {
+const pad_legacy = (s, len = W - 2) => {
   s = String(s);
   return s.length >= len ? s.slice(0, len) : s + ' '.repeat(len - s.length);
 };
-const ln = (s) => `║ ${pad(s)} ║`;
+const ln = (s) => `║ ${pad_legacy(s)} ║`;
 const br = (l, r) => l + '═'.repeat(W) + r;
 const sep = () => '╠' + '═'.repeat(W) + '╣';
 
@@ -421,10 +423,8 @@ async function authGuidance(env) {
   if (env.claude.authed && env.codex.authed) return env;
   if (!process.stdin.isTTY || !process.stdout.isTTY) return env;
 
-  console.log('');
-  console.log('  ┌────────────────────────────────────────────┐');
-  console.log('  │  🔑 Auth Setup                             │');
-  console.log('  └────────────────────────────────────────────┘');
+  nl();
+  console.log(panel('Auth Setup', ['Checking provider authentication...'], { width: 50 }));
 
   if (!env.claude.authed) {
     console.log('');
@@ -654,27 +654,24 @@ function getAuthState() {
 }
 
 function printAuthStatusBox(state) {
-  const c = state.claude;
+  const cl = state.claude;
   const x = state.codex;
-  const cIcon = c.authed ? '✅' : c.installed ? '⚠️' : '❌';
-  const xIcon = x.authed ? '✅' : x.installed ? '⚠️' : '❌';
 
-  console.log('');
-  console.log(`  ${br('╔', '╗')}`);
-  console.log(`  ${ln(`🔑 Auth Status`)}`);
-  console.log(`  ${sep()}`);
-  console.log(`  ${ln(`🟠 Claude ${cIcon}  ${c.authed ? 'authenticated' : c.installed ? 'not authenticated' : 'not installed'}`)}`);
-  console.log(`  ${ln(`   Method:   ${c.method}`)}`);
-  console.log(`  ${ln(`   Expiry:   ${c.expiryText}`)}`);
-  console.log(`  ${ln(`   Storage:  ${c.storageText}`)}`);
-  console.log(`  ${sep()}`);
-  console.log(`  ${ln(`🟢 Codex  ${xIcon}  ${x.authed ? 'authenticated' : x.installed ? 'not authenticated' : 'not installed'}`)}`);
-  console.log(`  ${ln(`   Method:   ${x.method}`)}`);
-  console.log(`  ${ln(`   Expiry:   ${x.expiryText}`)}`);
-  console.log(`  ${ln(`   Storage:  ${x.storageText}`)}`);
-  if (x.lastRefresh) console.log(`  ${ln(`   Refreshed:${x.lastRefreshText}`)}`);
-  console.log(`  ${br('╚', '╝')}`);
-  console.log('');
+  const lines = [];
+  lines.push(signalLine(cl.authed ? 'success' : 'warning', `Claude  ${cl.authed ? 'authenticated' : cl.installed ? 'not authenticated' : 'not installed'}`));
+  lines.push(`   Method:   ${cl.method}`);
+  lines.push(`   Expiry:   ${cl.expiryText}`);
+  lines.push(`   Storage:  ${cl.storageText}`);
+  lines.push('');
+  lines.push(signalLine(x.authed ? 'success' : 'warning', `Codex   ${x.authed ? 'authenticated' : x.installed ? 'not authenticated' : 'not installed'}`));
+  lines.push(`   Method:   ${x.method}`);
+  lines.push(`   Expiry:   ${x.expiryText}`);
+  lines.push(`   Storage:  ${x.storageText}`);
+  if (x.lastRefresh) lines.push(`   Refreshed:${x.lastRefreshText}`);
+
+  nl();
+  console.log(panel('Auth Status', lines, { width: 60 }));
+  nl();
 }
 
 function runCodexDeviceAuth(codexPath) {
@@ -981,36 +978,38 @@ function install(workspace, env, mode) {
 
 // ─── Status Report ──────────────────────────────────────────────────────────
 
-function printReport(env, mode, actions, isDryRun) {
-  const lines = [];
+function printReport(env, mode, actions, isDryRun, { skipBanner = false } = {}) {
+  const m = getMode();
+  nl();
 
-  lines.push(br('╔', '╗'));
-  lines.push(ln(`🧠 Data Tools — Dual Brain v${VERSION}`));
-  lines.push(sep());
+  // Gradient banner (skip if already shown in animated detection)
+  if (!skipBanner) banner(`v${VERSION}`);
 
-  const cAuth = env.claude.authed ? '✅' : env.claude.installed ? '⚠️' : '❌';
-  const xAuth = env.codex.authed ? '✅' : env.codex.installed ? '⚠️' : '❌';
-  lines.push(ln(`  🟠 Claude ${cAuth}   🟢 Codex ${xAuth}`));
+  // Provider status
+  const cAuth = env.claude.authed ? 'authenticated' : env.claude.installed ? 'installed · not authed' : 'not installed';
+  const xAuth = env.codex.authed ? 'authenticated' : env.codex.installed ? 'installed · not authed' : 'not installed';
+  const cHealthy = env.claude.authed;
+  const xHealthy = env.codex.authed;
 
+  const statusLines = [];
+  statusLines.push(signalLine(cHealthy ? 'success' : 'warning', `Claude  ${cAuth}`));
+  statusLines.push(signalLine(xHealthy ? 'success' : 'warning', `Codex   ${xAuth}`));
   if (env.isReplit) {
-    lines.push(ln(`  🌀 Replit${env.hasReplitTools ? ' + replit-tools' : ''}`));
+    statusLines.push(signalLine('info', `Replit${env.hasReplitTools ? ' + replit-tools' : ''}`));
   }
 
   if (actions) {
-    lines.push(sep());
-    for (const a of actions) lines.push(ln(`  ${a}`));
-    lines.push(sep());
-    lines.push(ln('✅ Installed — launching session manager...'));
+    statusLines.push('');
+    for (const a of actions) statusLines.push(`  ${a}`);
+    statusLines.push('');
+    statusLines.push(signalLine('success', 'Installed — launching session manager...'));
   } else if (isDryRun) {
-    lines.push(sep());
-    lines.push(ln('Dry run — no files written'));
+    statusLines.push('');
+    statusLines.push(signalLine('info', 'Dry run — no files written'));
   }
 
-  lines.push(br('╚', '╝'));
-
-  console.log('');
-  for (const l of lines) console.log(`  ${l}`);
-  console.log('');
+  console.log(panel('dual-brain status', statusLines, { width: 64 }));
+  nl();
 }
 
 // ─── Profile System ────────────────────────────────────────────────────────
@@ -1223,17 +1222,19 @@ function cmdMode() {
     const current = loadProfile(workspace);
     const PEMOJIS = { auto: '🤖', balanced: '⚖️ ', 'cost-saver': '🛡️', 'quality-first': '🚀' };
     const UI_NAMES = { auto: 'Auto (default)', balanced: 'Balanced', 'cost-saver': 'Conservative', 'quality-first': 'Aggressive' };
-    console.log('');
-    console.log('  🎛️  Routing modes:');
-    console.log('');
+    nl();
+    console.log(`  ${colors.bold}${colors.cyan}Routing modes:${colors.reset}`);
+    nl();
     for (const [name, p] of Object.entries(PROFILES)) {
-      const active = name === current.name ? ' ✅ active' : '';
+      const isActive = name === current.name;
       const label = UI_NAMES[name] || name;
-      console.log(`    ${PEMOJIS[name] || '  '} ${label.padEnd(15)} ${p.description}${active}`);
+      const activeMarker = isActive ? ` ${colors.green}● active${colors.reset}` : '';
+      const style = isActive ? `${colors.cyan}${colors.bold}` : colors.dim;
+      console.log(`    ${PEMOJIS[name] || '  '} ${style}${label.padEnd(15)}${colors.reset} ${p.description}${activeMarker}`);
     }
-    console.log('');
+    nl();
     console.log(`  Switch: ${cmd('npx dual-brain mode <name>')}`);
-    console.log('');
+    nl();
     return;
   }
 
@@ -1434,7 +1435,85 @@ async function main() {
   if (subcommand === 'budget')  { cmdBudget();  return; }
   if (subcommand === 'explain') { cmdExplain(); return; }
 
-  let env = detectEnvironment();
+  const mode_fx = getMode();
+  const animate = mode_fx === 'full' || mode_fx === 'subtle';
+
+  // Animated detection phase
+  nl();
+  banner(`v${VERSION}`);
+
+  let env;
+  if (animate) {
+    const sp1 = spinner('Detecting environment...').start();
+    await sleep(300);
+    env = detectEnvironment();
+
+    // Workspace detection
+    if (env.isReplit) {
+      sp1.succeed(`Replit workspace detected${env.hasReplitTools ? ' + replit-tools' : ''}`);
+    } else {
+      sp1.succeed('Local workspace detected');
+    }
+
+    // Node version
+    const sp2 = spinner('Checking Node.js...').start();
+    await sleep(200);
+    sp2.succeed(`Node ${process.version} found`);
+
+    // Git repo
+    const sp3 = spinner('Checking git...').start();
+    await sleep(200);
+    const gitResult = run('git', ['rev-parse', '--show-toplevel']);
+    const gitBranch = run('git', ['branch', '--show-current']);
+    if (gitResult.status === 0) {
+      const repoName = gitResult.stdout.trim().split('/').pop();
+      const branch = gitBranch.stdout?.trim() || 'unknown';
+      sp3.succeed(`Git repository: ${repoName} (${branch})`);
+    } else {
+      sp3.warn('Not a git repository');
+    }
+
+    // Claude CLI
+    const sp4 = spinner('Checking Claude CLI...').start();
+    await sleep(300);
+    if (env.claude.installed) {
+      const authLabel = env.claude.authed ? 'CLI OAuth' : 'not authenticated';
+      sp4.succeed(`Claude CLI found · ${authLabel}`);
+    } else {
+      sp4.warn('Claude CLI not found');
+    }
+
+    // Codex CLI
+    const sp5 = spinner('Checking Codex CLI...').start();
+    await sleep(300);
+    if (env.codex.installed) {
+      const authLabel = env.codex.authed ? 'authenticated' : 'not authenticated';
+      sp5.succeed(`OpenAI Codex CLI found · ${authLabel}`);
+    } else {
+      sp5.warn('Codex CLI not found');
+    }
+
+    // Sessions
+    const sp6 = spinner('Checking sessions...').start();
+    await sleep(200);
+    const sessionsDir = resolve(process.cwd(), '.replit-tools', '.claude-persistent');
+    if (existsSync(sessionsDir)) {
+      sp6.succeed('Session persistence via replit-tools');
+    } else {
+      sp6.succeed('Standard session management');
+    }
+
+    nl();
+  } else {
+    // Non-animated fallback for CI/plain
+    env = detectEnvironment();
+    fxInfo(`Workspace: ${env.isReplit ? 'Replit' : 'local'}`);
+    fxInfo(`Node ${process.version}`);
+    fxInfo(`Claude: ${env.claude.installed ? (env.claude.authed ? 'authed' : 'installed') : 'missing'}`);
+    fxInfo(`Codex: ${env.codex.installed ? (env.codex.authed ? 'authed' : 'installed') : 'missing'}`);
+    nl();
+  }
+
   const startupUpdateInfo = (subcommand === 'update' || dryRun || jsonOut)
     ? null
     : checkForUpdate(env.workspace);
@@ -1445,9 +1524,9 @@ async function main() {
     process.stdout.isTTY &&
     !process.env.CI
   ) {
-    console.log('');
+    nl();
     const shouldUpdate = await promptForUpdate(startupUpdateInfo);
-    console.log('');
+    nl();
     if (shouldUpdate) {
       env = healClaudeAuth(env);
       env = healCodexAuth(env);
@@ -1477,29 +1556,38 @@ async function main() {
     if (jsonOut) {
       console.log(JSON.stringify({ version: VERSION, env, mode }, null, 2));
     } else {
-      printReport(env, mode, null, true);
+      printReport(env, mode, null, true, { skipBanner: true });
     }
     process.exit(0);
   }
 
   if (subcommand === 'update') {
     const actions = performUpdate(env.workspace, env, mode);
-    printReport(env, mode, actions);
+    printReport(env, mode, actions, false, { skipBanner: true });
     process.exit(0);
   }
 
   // Check for replit-tools on Replit
   if (env.isReplit && !env.hasReplitTools) {
-    console.log('');
-    console.log('  ⚠️  replit-tools not found — recommended for Replit environments.');
-    console.log('  Dual-brain works best alongside replit-tools for persistent auth,');
-    console.log('  session management, and shell integration.');
-    console.log('');
-    console.log(`  Install: ${cmd('npx -y data-tools')}`);
-    console.log('');
+    nl();
+    fxWarn('replit-tools not found — recommended for Replit environments.');
+    fxInfo('Dual-brain works best alongside replit-tools for persistent auth,');
+    fxInfo('session management, and shell integration.');
+    nl();
+    fxInfo(`Install: ${cmd('npx -y data-tools')}`);
+    nl();
   }
 
-  const actions = install(env.workspace, env, mode);
+  // Install hooks and config
+  let actions;
+  if (animate) {
+    const spInstall = spinner('Installing dual-brain hooks...').start();
+    await sleep(400);
+    actions = install(env.workspace, env, mode);
+    spInstall.succeed(`Installed ${actions.length} components`);
+  } else {
+    actions = install(env.workspace, env, mode);
+  }
 
   // Write a standalone shell-hook.sh so users can source it from .bashrc.
   // Non-interactive installs (npm postinstall) just print the hint; interactive
@@ -1530,7 +1618,10 @@ async function main() {
     }
   }
 
-  printReport(env, mode, actions);
+  nl();
+  await celebrate('Setup complete');
+  nl();
+  printReport(env, mode, actions, false, { skipBanner: true });
 
   // After install, launch the session manager (interactive TTY only)
   if (process.stdin.isTTY && process.stdout.isTTY && !process.env.CI) {
