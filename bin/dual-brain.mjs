@@ -1199,33 +1199,28 @@ async function cmdHandoff(args = []) {
     if (target !== 'claude' && target !== 'codex') {
       err('--to must be "claude" or "codex"');
     }
-    const result = executeHandoff(cwd, target);
-    if (result.success) {
-      fxH.success(`Handed off to ${target}.`);
-      if (result.command) {
-        console.log('');
-        fxH.info(`Resume with: ${result.command}`);
-      }
-    } else {
-      fxH.error(result.error || `Handoff to ${target} failed.`);
+    const fromProvider = target === 'codex' ? 'anthropic' : 'openai';
+    console.log(`  ⚡ Switching to ${target}...`);
+    console.log('');
+    const { spawnHandoff } = autoHandoff;
+    const result = spawnHandoff({ fromProvider, cwd, auto: true, interactive: true });
+    if (!result.success) {
+      fxH.error(result.message);
     }
+    // If spawn succeeded, the child process takes over — we don't return
     return;
   }
 
   // Auto-detect: if a provider is limited, switch to the other
   if (limitStatus.limited) {
     const target = limitStatus.switchTo;
-    fxH.warn(`${limitStatus.provider} is limited — switching to ${target}`);
+    const fromProvider = limitStatus.provider;
+    console.log(`  ⚡ ${fromProvider} limit reached → switching to ${target}...`);
     console.log('');
-    const result = executeHandoff(cwd, target);
-    if (result.success) {
-      fxH.success(`Handed off to ${target}.`);
-      if (result.command) {
-        console.log('');
-        fxH.info(`Resume with: ${result.command}`);
-      }
-    } else {
-      fxH.error(result.error || `Handoff to ${target} failed.`);
+    const { spawnHandoff } = autoHandoff;
+    const result = spawnHandoff({ fromProvider, cwd, auto: true, interactive: true });
+    if (!result.success) {
+      fxH.error(result.message);
     }
   } else {
     fxH.success('No provider is currently limited. No handoff needed.');

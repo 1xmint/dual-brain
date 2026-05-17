@@ -5,8 +5,9 @@
  * context and switches to the other provider seamlessly.
  */
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { atomicWriteJson, readJsonSafe } from './integrity.js';
 import { getProviderState, getAllProviderStates } from './provider-manager.js';
 import { loadSession } from './session.js';
@@ -333,6 +334,61 @@ export function executeHandoff(opts: HandoffOpts): HandoffResult {
     return {
       success: false,
       message: `Handoff failed: ${message}`,
+    };
+  }
+}
+
+/**
+ * Seamlessly spawn the other provider CLI with handoff context.
+ * Replaces the current process — user stays in the same terminal,
+ * conversation continues with the new provider.
+ */
+export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean }): HandoffResult {
+  try {
+    const result = executeHandoff(opts);
+    if (!result.success || !result.command || !result.contextFile) return result;
+
+    const [cli, ...cliArgs] = result.command;
+    const contextData = readJsonSafe(result.contextFile) as { prompt?: string } | null;
+    const prompt = contextData?.prompt || '';
+
+    // Write the prompt to a temp file the CLI can read
+    const promptFile = join(opts.cwd || process.cwd(), '.dual-brain/handoff/prompt.md');
+    writeFileSync(promptFile, prompt, 'utf8');
+
+    // Build the command based on which CLI we're launching
+    let spawnArgs: string[];
+    if (cli === 'codex') {
+      // Codex: pass prompt directly
+      spawnArgs = ['-p', prompt.slice(0, 4000)];
+    } else {
+      // Claude: use -p flag with prompt
+      spawnArgs = ['-p', prompt.slice(0, 4000), '--no-input'];
+    }
+
+    if (opts.interactive !== false) {
+      // Spawn with inherited stdio — user stays in same terminal
+      const child = spawn(cli, spawnArgs, {
+        stdio: 'inherit',
+        cwd: opts.cwd || process.cwd(),
+      });
+
+      child.on('exit', (code) => {
+        process.exit(code ?? 0);
+      });
+    }
+
+    return {
+      success: true,
+      command: [cli, ...spawnArgs],
+      contextFile: result.contextFile,
+      message: `⚡ Switching to ${cli}...`,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      message: `Auto-spawn failed: ${message}. Run manually: dual-brain handoff --show`,
     };
   }
 }
