@@ -355,6 +355,7 @@ Commands:
     --files a,b             (specialist commands) Provide file context
   watch [dir]               Monitor file changes and suggest actions
     --auto                  Auto-execute safe suggestions (tests, install)
+  menu                      Open the dual-brain shell menu
   shell-hook                Output bash snippet to add dual-brain to your shell
                             Usage: dual-brain shell-hook >> ~/.bashrc
 
@@ -6846,6 +6847,35 @@ async function main() {
   // Interactive-only commands: enter screen state machine (only when TTY)
   const isInteractive = process.stdin.isTTY;
 
+  if (cmd === 'menu') {
+    if (!isInteractive) {
+      process.stderr.write('dual-brain menu requires an interactive terminal.\n');
+      process.exit(1);
+    }
+    const cwd = process.cwd();
+    cleanStaleMarkers(cwd);
+    if (!process.argv.includes('--force') && checkLoopMarker(cwd)) {
+      process.exit(0);
+    }
+    setLoopMarker(cwd);
+    if (profileExists(cwd)) {
+      await runScreens('main');
+    } else {
+      const auth  = await detectAuth();
+      const plans = detectPlans();
+      const existingSessions = importReplitSessions(cwd);
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const wizardProfile = await runOnboardingWizard({ auth, plans, existingSessions }, cwd, rl);
+      if (wizardProfile) {
+        saveProfile(wizardProfile, { cwd });
+        await cmdInstall(cwd);
+      }
+      rl.close();
+      await runScreens('main');
+    }
+    return;
+  }
+
   if (!cmd) {
     if (isInteractive) {
       const cwd = process.cwd();
@@ -7136,7 +7166,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'hot', 'cool',
+    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch', 'update', 'upgrade',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),
