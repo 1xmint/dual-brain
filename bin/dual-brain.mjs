@@ -38,6 +38,34 @@ function _claudeNewArgs(cwd) {
   return args;
 }
 
+function _codexResumeArgs(sessionId) {
+  return ['resume', sessionId];
+}
+
+function _sessionTool(session) {
+  return session?.tool === 'codex' ? 'codex' : 'claude';
+}
+
+function _sessionLaunchArgs(session, cwd) {
+  return _sessionTool(session) === 'codex'
+    ? _codexResumeArgs(session.id)
+    : _claudeResumeArgs(session.id, cwd);
+}
+
+function _sessionBrief(session, targetProvider = 'codex') {
+  const name = session?.smartName || session?.name || session?.prompts?.first || session?.firstPrompt || session?.id || 'previous session';
+  const tool = _sessionTool(session);
+  const parts = [
+    `Continue the ${tool} session "${String(name).replace(/\s+/g, ' ').slice(0, 120)}" in ${targetProvider}.`,
+  ];
+  if (session?.id) parts.push(`Original session id: ${session.id}.`);
+  if (session?.project) parts.push(`Project: ${session.project}.`);
+  if (session?.lastActive) parts.push(`Last active: ${session.lastActive}.`);
+  if (session?.prompts?.last) parts.push(`Last prompt: ${String(session.prompts.last).replace(/\s+/g, ' ').slice(0, 500)}`);
+  else if (session?.prompts?.first) parts.push(`First prompt: ${String(session.prompts.first).replace(/\s+/g, ' ').slice(0, 500)}`);
+  return parts.join(' ');
+}
+
 // ─── Agent/skill registry cache (populated at startup) ───────────────────────
 // These are set by _primeRegistryCache() so classifyInput can use them
 // synchronously without async overhead on each keystroke.
@@ -1241,6 +1269,27 @@ async function cmdSwitch(args = []) {
   await cmdHandoff(handoffArgs);
 }
 
+async function cmdUpdate() {
+  const cwd = process.cwd();
+  console.log('  Updating Dual Brain...');
+  const install = _spawnSyncTop('npm', ['install', '-g', 'dual-brain@latest'], {
+    stdio: 'inherit',
+    cwd,
+  });
+  if (install.status !== 0) {
+    process.exitCode = install.status || 1;
+    return;
+  }
+
+  const refresh = _spawnSyncTop('dual-brain', ['install'], {
+    stdio: 'inherit',
+    cwd,
+  });
+  if (refresh.status !== 0) {
+    process.exitCode = refresh.status || 1;
+  }
+}
+
 function cmdHot(providerArg) {
   if (!providerArg) err('Usage: dual-brain hot <provider>  (claude | openai)');
   const provider = providerArg.toLowerCase();
@@ -1854,6 +1903,17 @@ async function welcomeScreen(rl, ask) {
     if (existingSessions.length > 5) {
       console.log(`  ... and ${existingSessions.length - 5} more`);
     }
+    const meta = getSessionMeta(cwd);
+    const now = new Date().toISOString();
+    for (const sess of existingSessions) {
+      meta[sess.id] = {
+        ...meta[sess.id],
+        source: 'data-tools',
+        importedAt: meta[sess.id]?.importedAt || now,
+        createdAt: meta[sess.id]?.createdAt || now,
+      };
+    }
+    saveSessionMeta(meta, cwd);
     console.log('\n  Sessions imported! They\'ll appear in your Recent list.\n');
     await ask('  Press Enter to continue...');
     // Fall through to auto-save
@@ -3158,7 +3218,9 @@ async function mainScreen(rl, ask) {
   const shortcuts = [
     [`Enter`, isReturning ? 'resume last session' : 'start working  (or type a task)'],
     [`n`,     'new session'],
+    [`g`,     isReturning ? 'continue in other provider' : 'switch provider'],
     [`/`,     'search sessions'],
+    [`i`,     'import sessions'],
     [`s`,     'settings & profiles'],
     [`d`,     'doctor — diagnose issues'],
     [`a`,     profile.automode ? 'auto mode  (on)' : 'auto mode  (off)'],
@@ -3262,7 +3324,7 @@ async function mainScreen(rl, ask) {
       // Single-key commands only fire when buffer is empty
       if (taskBuffer.length === 0) {
         const lower = str.toLowerCase();
-        const singleKeySet = new Set(['n', 's', 't', 'q', '/', 'i', '?', 'h', 'd']);
+        const singleKeySet = new Set(['n', 'g', 's', 't', 'q', '/', 'i', '?', 'h', 'd', 'a']);
         if (singleKeySet.has(lower)) {
           cleanup();
           process.stdout.write('\n');
@@ -3367,8 +3429,9 @@ async function mainScreen(rl, ask) {
           const sess = results[num - 1];
           const { spawnSync: sp2 } = await import('node:child_process');
           const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-          process.stdout.write(`\n  Launching: ${tool} --resume ${sess.id}\n\n`);
-          sp2(tool, ['--resume', sess.id], { stdio: 'inherit' });
+          const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id) : _claudeResumeArgs(sess.id, cwd);
+          process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
+          sp2(tool, launchArgs, { stdio: 'inherit' });
         }
         return { next: 'main' };
       }
@@ -3510,8 +3573,10 @@ async function mainScreen(rl, ask) {
     }
     const sess = recentSessions[0];
     const { spawnSync } = await import('node:child_process');
-    process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
-    spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
+    const tool = _sessionTool(sess);
+    const launchArgs = _sessionLaunchArgs(sess, cwd);
+    process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
+    spawnSync(tool, launchArgs, { stdio: 'inherit' });
     saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
     return { next: 'main' };
   }
@@ -3529,13 +3594,19 @@ async function mainScreen(rl, ask) {
       }
     } catch {}
     const { spawnSync } = await import('node:child_process');
-    process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
-    spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
+    const tool = _sessionTool(sess);
+    const launchArgs = _sessionLaunchArgs(sess, cwd);
+    process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
+    spawnSync(tool, launchArgs, { stdio: 'inherit' });
     saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
     return { next: 'main' };
   }
 
   if (choice === 'n') { return { next: 'new-session' }; }
+  if (choice === 'g') {
+    if (recentSessions.length === 0) return { next: 'new-session' };
+    return { next: 'switch-provider', session: recentSessions[0] };
+  }
   if (choice === '?' || choice === 'h') { return { next: 'palette-help' }; }
   if (choice === 'd') { return { next: 'diagnostics' }; }
 
@@ -3569,8 +3640,9 @@ async function mainScreen(rl, ask) {
       const sess = results[num - 1];
       const { spawnSync } = await import('node:child_process');
       const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-      process.stdout.write(`\n  Launching: ${tool} --resume ${sess.id}\n\n`);
-      spawnSync(tool, ['--resume', sess.id], { stdio: 'inherit' });
+      const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id) : _claudeResumeArgs(sess.id, cwd);
+      process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
+      spawnSync(tool, launchArgs, { stdio: 'inherit' });
     }
     return { next: 'main' };
   }
@@ -3578,6 +3650,14 @@ async function mainScreen(rl, ask) {
   if (choice === 's') { return { next: 'settings' }; }
   if (choice === 't') { return { next: 'team' }; }
   if (choice === 'i') { return { next: 'import-picker' }; }
+  if (choice === 'a') {
+    const prof = loadProfile(cwd);
+    prof.automode = !(prof.automode ?? prof.settings?.automode ?? false);
+    saveProfile(prof, { cwd });
+    process.stdout.write(`\n  Automode: ${prof.automode ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m'}\n\n`);
+    await ask('  Press Enter to continue...');
+    return { next: 'main' };
+  }
   if (choice === 'q' || choice === 'exit') { return { next: 'exit' }; }
 
   return { next: 'main' };
@@ -3593,6 +3673,30 @@ async function newSessionScreen(rl, ask) {
   // All work routes through pipeline — detect → decide → dispatch with mandatory gates.
   await cmdGo([input], { cwd });
 
+  return { next: 'main' };
+}
+
+// ─── Screen: switchProviderScreen ────────────────────────────────────────────
+
+async function switchProviderScreen(rl, ask, ctx = {}) {
+  const cwd = process.cwd();
+  const session = ctx.session;
+  if (!session) return { next: 'main' };
+
+  const currentTool = _sessionTool(session);
+  const target = currentTool === 'codex' ? 'claude' : 'codex';
+  const label = session.smartName || session.name || session.prompts?.first || session.id;
+  const brief = _sessionBrief(session, target);
+
+  process.stdout.write('\n');
+  process.stdout.write(`  Continue in ${target === 'codex' ? 'Codex/GPT' : 'Claude'}\n`);
+  process.stdout.write(`  From: ${currentTool} · ${String(label || '').replace(/\s+/g, ' ').slice(0, 80)}\n\n`);
+  process.stdout.write(`  \x1b[36mEnter\x1b[0m switch now  \x1b[36mb\x1b[0m back\n\n`);
+
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+  if (choice === 'b' || choice === 'q' || choice === 'n') return { next: 'main' };
+
+  await cmdSwitch([target, brief]);
   return { next: 'main' };
 }
 
@@ -3616,12 +3720,14 @@ async function paletteHelpScreen(rl, ask) {
     sep,
     row(`${CYAN}Enter${RESET}   Resume last session`),
     row(`${CYAN}n${RESET}       New coding session`),
+    row(`${CYAN}g${RESET}       Continue selected work in other provider`),
     row(`${CYAN}1-9${RESET}     Resume session by number`),
     row(`${CYAN}/${RESET}       Search session history`),
+    row(`${CYAN}i${RESET}       Import/sync sessions`),
     row(`${CYAN}s${RESET}       Settings`),
     row(`${CYAN}d${RESET}       Doctor (repo diagnostics)`),
     row(`${CYAN}t${RESET}       Team`),
-    row(`${CYAN}i${RESET}       Import sessions`),
+    row(`${CYAN}a${RESET}       Toggle auto mode`),
     row(`${CYAN}q${RESET}       Quit`),
     row(`${CYAN}?${RESET}       This help`),
     sep,
@@ -5497,6 +5603,7 @@ async function replScreen(rl, ask) {
 // ─── Screen: sessionDetailScreen ─────────────────────────────────────────────
 
 async function sessionDetailScreen(rl, ask, ctx = {}) {
+  const cwd = process.cwd();
   const sess = ctx.session;
   if (!sess) return { next: 'dashboard' };
 
@@ -5529,25 +5636,31 @@ async function sessionDetailScreen(rl, ask, ctx = {}) {
   console.log('');
 
   if (sess.isActive) {
-    console.log('  [c] Continue this session (claude --continue)');
+    console.log(`  [c] Continue this session (${_sessionTool(sess)})`);
   } else {
-    console.log('  [r] Resume this session (claude --resume)');
+    console.log(`  [r] Resume this session (${_sessionTool(sess)})`);
   }
+  console.log('  [g] Continue in other provider');
   console.log('  [b] Back to dashboard');
   console.log('');
 
   const choice = (await ask('  Choice: ')).trim().toLowerCase();
 
   if (choice === 'c' || choice === 'r') {
-    console.log(`\n  Launching: claude --resume ${sess.id}\n`);
+    const tool = _sessionTool(sess);
+    const launchArgs = _sessionLaunchArgs(sess, cwd);
+    console.log(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n`);
     try {
       const { spawnSync } = await import('node:child_process');
-      spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
+      spawnSync(tool, launchArgs, { stdio: 'inherit' });
     } catch {
-      console.log('  Could not launch claude CLI. Run manually:');
-      console.log(`    claude --resume ${sess.id}`);
+      console.log(`  Could not launch ${tool} CLI.`);
     }
     return { next: 'dashboard' };
+  }
+
+  if (choice === 'g') {
+    return { next: 'switch-provider', session: sess };
   }
 
   return { next: 'dashboard' };
@@ -5629,8 +5742,8 @@ async function sessionsScreen(rl, ask) {
       process.stdout.write(formatRow(sessions[i], i === cursor) + '\n');
     }
     process.stdout.write(sep + '\n');
-    process.stdout.write(makeBoxRow('↑↓ Navigate  Enter Resume  x Archive  r Rename', W) + '\n');
-    process.stdout.write(makeBoxRow('q Back', W) + '\n');
+    process.stdout.write(makeBoxRow('↑↓ Navigate  Enter Resume  g Switch Provider', W) + '\n');
+    process.stdout.write(makeBoxRow('x Archive  r Rename  q Back', W) + '\n');
     process.stdout.write(bot + '\n');
   }
 
@@ -5690,9 +5803,11 @@ async function sessionsScreen(rl, ask) {
         const sess = sessions[cursor];
         cleanup();
         process.stdout.write('\n');
-        process.stdout.write(`\n  Launching: claude --resume ${sess.id}\n\n`);
+        const tool = _sessionTool(sess);
+        const launchArgs = _sessionLaunchArgs(sess, cwd);
+        process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
         const { spawnSync } = await import('node:child_process');
-        spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
+        spawnSync(tool, launchArgs, { stdio: 'inherit' });
         saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
         resolve({ next: 'main' });
         return;
@@ -5711,6 +5826,15 @@ async function sessionsScreen(rl, ask) {
         }
         cursor = Math.min(cursor, sessions.length - 1);
         render();
+        return;
+      }
+
+      // g → continue highlighted session in the other provider
+      if (str === 'g' || str === 'G') {
+        const sess = sessions[cursor];
+        cleanup();
+        process.stdout.write('\n');
+        resolve({ next: 'switch-provider', session: sess });
         return;
       }
 
@@ -5788,6 +5912,7 @@ async function sessionManageScreen(rl, ask, ctx = {}) {
     { key: 'p', label: pinLabel,           section: '' },
     { key: 'c', label: 'Set category',     section: '' },
     { key: 'o', label: 'Open (resume)',    section: '' },
+    { key: 'g', label: 'Continue in other provider', section: '' },
     { key: 'b', label: 'Back',             section: '' },
   ]));
   console.log('');
@@ -5839,9 +5964,15 @@ async function sessionManageScreen(rl, ask, ctx = {}) {
 
   if (choice === 'o') {
     const { spawnSync } = await import('node:child_process');
-    console.log(`\n  Launching: claude --resume ${sess.id}\n`);
-    spawnSync('claude', _claudeResumeArgs(sess.id, cwd), { stdio: 'inherit' });
+    const tool = _sessionTool(sess);
+    const launchArgs = _sessionLaunchArgs(sess, cwd);
+    console.log(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n`);
+    spawnSync(tool, launchArgs, { stdio: 'inherit' });
     return { next: 'sessions' };
+  }
+
+  if (choice === 'g') {
+    return { next: 'switch-provider', session: sess };
   }
 
   if (choice === 'b' || choice === 'back') return { next: 'sessions' };
@@ -6110,6 +6241,7 @@ const SCREENS = {
   settings:         settingsScreen,
   team:             teamScreen,
   'import-picker':  importPickerScreen,
+  'switch-provider': switchProviderScreen,
   'pr-triage':      prTriageScreen,
   subscriptions:    subscriptionsScreen,
   dashboard:        dashboardScreen,
@@ -6874,6 +7006,7 @@ async function main() {
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'handoff')  { await cmdHandoff(args.slice(1)); return; }
   if (cmd === 'switch')   { await cmdSwitch(args.slice(1)); return; }
+  if (cmd === 'update' || cmd === 'upgrade') { await cmdUpdate(); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
   if (cmd === 'remember')    { cmdRemember(args[1]); return; }
@@ -6938,7 +7071,7 @@ fi
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
     'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'hot', 'cool',
-    'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch',
+    'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch', 'update', 'upgrade',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),
   ]);

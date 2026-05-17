@@ -331,9 +331,11 @@ export function executeHandoff(opts: HandoffOpts): HandoffResult {
 
     atomicWriteJson(contextFilePath, handoffData);
 
-    // Build the CLI command
+    // Build a provider-specific starter command for display/API consumers.
     const cli = PROVIDER_CLI[other] || other;
-    const command = [cli, '--resume', contextFilePath];
+    const command = cli === 'codex'
+      ? [cli, prompt.slice(0, 4000)]
+      : [cli, prompt.slice(0, 4000)];
 
     const autoLabel = auto ? ' (auto)' : '';
     return {
@@ -384,8 +386,11 @@ export function spawnHandoff(opts: HandoffOpts & { interactive?: boolean; force?
         ? ['exec', '--sandbox', 'danger-full-access', prompt.slice(0, 4000)]
         : [prompt.slice(0, 4000)];
     } else {
-      // Claude: use -p flag with prompt
-      spawnArgs = ['-p', prompt.slice(0, 4000), '--no-input'];
+      // Claude accepts an initial prompt as a positional argument in interactive mode.
+      // Use print mode only for non-TTY callers.
+      spawnArgs = process.stdin.isTTY
+        ? [prompt.slice(0, 4000)]
+        : ['-p', prompt.slice(0, 4000), '--no-input'];
     }
 
     if (opts.interactive !== false) {
