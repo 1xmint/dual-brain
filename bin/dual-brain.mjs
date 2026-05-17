@@ -26,21 +26,18 @@ import { detectTask, primeAgentRegistry } from '../dist/src/detect.js';
 
 function _claudeResumeArgs(sessionId, cwd) {
   const args = ['--resume', sessionId];
-  const prof = loadProfile(cwd || process.cwd());
-  if (prof.bypassPermissions) args.push('--dangerously-skip-permissions');
+  if (getEffectiveBypassPermissions(cwd || process.cwd())) args.push('--dangerously-skip-permissions');
   return args;
 }
 
 function _claudeNewArgs(cwd) {
   const args = [];
-  const prof = loadProfile(cwd || process.cwd());
-  if (prof.bypassPermissions) args.push('--dangerously-skip-permissions');
+  if (getEffectiveBypassPermissions(cwd || process.cwd())) args.push('--dangerously-skip-permissions');
   return args;
 }
 
 function _codexResumeArgs(sessionId, cwd) {
-  const prof = loadProfile(cwd || process.cwd());
-  if (prof.bypassPermissions) {
+  if (getEffectiveBypassPermissions(cwd || process.cwd())) {
     return ['--dangerously-bypass-approvals-and-sandbox', 'resume', sessionId];
   }
   return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request', 'resume', sessionId];
@@ -2084,6 +2081,168 @@ function loadTerminalState(cwd, terminalId) {
   } catch { return null; }
 }
 
+function sessionSettingsPath(cwd, terminalId = getTerminalId()) {
+  return join(cwd, '.dualbrain', `session-settings-${terminalId}.json`);
+}
+
+function loadSessionSettings(cwd, terminalId = getTerminalId()) {
+  try {
+    return JSON.parse(readFileSync(sessionSettingsPath(cwd, terminalId), 'utf8'));
+  } catch { return {}; }
+}
+
+function saveSessionSettings(cwd, settings, terminalId = getTerminalId()) {
+  const dir = join(cwd, '.dualbrain');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(sessionSettingsPath(cwd, terminalId), JSON.stringify({
+    ...settings,
+    terminalId,
+    updatedAt: new Date().toISOString(),
+  }, null, 2) + '\n');
+}
+
+function getEffectiveAutomode(profile, cwd) {
+  const session = loadSessionSettings(cwd || process.cwd());
+  if (typeof session.automode === 'boolean') return session.automode;
+  return profile.automode ?? profile.settings?.automode ?? false;
+}
+
+function getEffectiveBypassPermissions(cwd) {
+  const workspace = cwd || process.cwd();
+  const session = loadSessionSettings(workspace);
+  if (typeof session.bypassPermissions === 'boolean') return session.bypassPermissions;
+  const profile = loadProfile(workspace);
+  return !!profile.bypassPermissions;
+}
+
+function parseModeCommand(input) {
+  const text = input.trim().toLowerCase().replace(/\s+/g, ' ');
+  const wantsSession = /\b(this|current)\s+(session|conversation|terminal|chat)\b|\bfor this\b|\bfor current\b/.test(text);
+  const wantsGlobal = /\b(default|global|profile|always|future sessions|all sessions)\b/.test(text);
+  const scope = wantsGlobal && !wantsSession ? 'profile' : 'session';
+
+  let key = null;
+  if (/\b(auto|automode|auto mode)\b/.test(text)) key = 'automode';
+  if (/\b(bypass|permission|permissions|approval|approvals|sandbox|safe mode)\b/.test(text)) key = 'bypassPermissions';
+  if (!key) return null;
+
+  let value = null;
+  if (/\b(on|enable|enabled|yes|true)\b/.test(text)) value = true;
+  if (/\b(off|disable|disabled|no|false)\b/.test(text)) value = false;
+  if (key === 'bypassPermissions' && /\b(safe|sandbox|approval|approvals)\b/.test(text) && /\bmode\b/.test(text) && !/\bbypass\b/.test(text)) {
+    value = false;
+  }
+  if (value === null) return null;
+
+  return { key, value, scope };
+}
+
+function applyModeCommand(cmd, cwd) {
+  if (cmd.scope === 'profile') {
+    const profile = loadProfile(cwd);
+    if (cmd.key === 'automode') {
+      profile.automode = cmd.value;
+      profile.settings = { ...(profile.settings || {}), automode: cmd.value };
+    } else {
+      profile.bypassPermissions = cmd.value;
+    }
+    saveProfile(profile, { cwd });
+    return { scope: 'default', value: cmd.value };
+  }
+
+  const settings = loadSessionSettings(cwd);
+  settings[cmd.key] = cmd.value;
+  saveSessionSettings(cwd, settings);
+  return { scope: 'this session', value: cmd.value };
+}
+
+function pidAlive(pid) {
+  if (!pid || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch { return false; }
+}
+
+function activeConversationPath(cwd) {
+  return join(cwd, '.dualbrain', 'active-conversation.json');
+}
+
+function readActiveConversation(cwd) {
+  try {
+    const lease = JSON.parse(readFileSync(activeConversationPath(cwd), 'utf8'));
+    if (!lease?.sessionId) return null;
+    if (!pidAlive(lease.ownerPid)) return null;
+    return lease;
+  } catch { return null; }
+}
+
+function writeActiveConversation(cwd, session, tool) {
+  const dir = join(cwd, '.dualbrain');
+  const terminalId = getTerminalId();
+  const lease = {
+    conversationId: session.id,
+    sessionId: session.id,
+    provider: tool,
+    terminalId,
+    ownerPid: process.pid,
+    startedAt: new Date().toISOString(),
+    lastHeartbeat: new Date().toISOString(),
+    mode: 'active-head',
+  };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(activeConversationPath(cwd), JSON.stringify(lease, null, 2) + '\n');
+  return lease;
+}
+
+function clearActiveConversation(cwd, sessionId) {
+  try {
+    const lease = JSON.parse(readFileSync(activeConversationPath(cwd), 'utf8'));
+    if (!sessionId || lease.sessionId === sessionId || lease.ownerPid === process.pid) {
+      unlinkSync(activeConversationPath(cwd));
+    }
+  } catch {}
+}
+
+async function confirmConversationTakeover(sess, cwd, ask) {
+  const active = readActiveConversation(cwd);
+  if (!active || active.sessionId !== sess.id || active.ownerPid === process.pid) return 'launch';
+  const label = sess.smartName || sess.name || sess.prompts?.first || sess.firstPrompt || sess.id;
+  process.stdout.write('\n');
+  process.stdout.write(`  Session already active: ${String(label).replace(/\s+/g, ' ').slice(0, 80)}\n`);
+  process.stdout.write(`  Owner: ${active.terminalId || 'unknown terminal'} · pid ${active.ownerPid} · ${active.provider || 'provider'}\n\n`);
+  process.stdout.write('  Enter back  t take over  n new session\n\n');
+  if (!ask) return 'cancel';
+  const choice = (await ask('  Choice: ')).trim().toLowerCase();
+  if (choice === 't' || choice === 'takeover' || choice === 'take over') {
+    return 'takeover';
+  }
+  if (choice === 'n') return 'new';
+  return 'cancel';
+}
+
+async function launchSessionWithLease(sess, cwd, ask = null) {
+  const decision = await confirmConversationTakeover(sess, cwd, ask);
+  if (decision === 'new') return { next: 'new-session' };
+  if (decision === 'cancel') return { next: 'main' };
+
+  const { spawnSync } = await import('node:child_process');
+  const tool = _sessionTool(sess);
+  const launchArgs = _sessionLaunchArgs(sess, cwd);
+  if (decision === 'takeover') {
+    process.stdout.write('  Taking over active conversation in this terminal.\n');
+  }
+  writeActiveConversation(cwd, sess, tool);
+  process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
+  try {
+    spawnSync(tool, launchArgs, { stdio: 'inherit' });
+  } finally {
+    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || tool);
+    clearActiveConversation(cwd, sess.id);
+  }
+  return { next: 'main' };
+}
+
 // ─── PR Detection ─────────────────────────────────────────────────────────────
 
 /**
@@ -2426,6 +2585,11 @@ function classifyInput(input) {
   const parts   = trimmed.split(/\s+/);
   const cmd     = parts[0].toLowerCase();
   const args    = parts.slice(1);
+
+  const modeCommand = parseModeCommand(trimmed);
+  if (modeCommand) {
+    return { tier: 'free', command: 'mode', args: [], modeCommand };
+  }
 
   // Tier 0: SKILL — slash commands (checked first, deterministic)
   if (trimmed.startsWith('/')) {
@@ -2988,7 +3152,11 @@ async function mainScreen(rl, ask) {
       const open = getOpenTasks(cwd);
       if (open.length > 0) {
         const intent = String(open[0].intent || '').replace(/\s+/g, ' ').trim();
-        if (intent.length >= 5) openTasks.push(`continue: ${intent.slice(0, 30)}`);
+        const words = intent.split(' ').filter(Boolean);
+        const looksLikeAccidentalKeys = words.length > 0 && words.every(w => w.length === 1);
+        if (intent.length >= 5 && !looksLikeAccidentalKeys) {
+          openTasks.push(`continue: ${intent.slice(0, 30)}`);
+        }
       }
     } catch {}
     suggestions = openTasks.length > 0
@@ -3167,7 +3335,7 @@ async function mainScreen(rl, ask) {
     [`s`,     'settings & profiles'],
     [`d`,     'doctor — diagnose issues'],
     [`t`,     'team settings'],
-    [`a`,     profile.automode ? 'auto mode  (on)' : 'auto mode  (off)'],
+    [`a`,     getEffectiveAutomode(profile, cwd) ? 'auto mode  (on)' : 'auto mode  (off)'],
     [`q`,     'quit'],
   ];
   for (const [key, label] of shortcuts) {
@@ -3306,6 +3474,15 @@ async function mainScreen(rl, ask) {
       const cmd  = classified.command;
       const args = classified.args;
 
+      if (cmd === 'mode') {
+        const result = applyModeCommand(classified.modeCommand, cwd);
+        const keyLabel = classified.modeCommand.key === 'automode' ? 'Auto mode' : 'Bypass permissions';
+        const state = result.value ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
+        process.stdout.write(`\n  ${keyLabel}: ${state}  \x1b[2m(${result.scope})\x1b[0m\n\n`);
+        await ask('  Press Enter to continue...');
+        return { next: 'main' };
+      }
+
       if (cmd === 'resume' || cmd === 'r') {
         if (recentSessions.length === 0) return { next: 'new-session' };
         return { next: 'sessions' };
@@ -3371,11 +3548,7 @@ async function mainScreen(rl, ask) {
         const num  = parseInt(pick, 10);
         if (!isNaN(num) && num >= 1 && num <= Math.min(results.length, 9)) {
           const sess = results[num - 1];
-          const { spawnSync: sp2 } = await import('node:child_process');
-          const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-          const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id, cwd) : _claudeResumeArgs(sess.id, cwd);
-          process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
-          sp2(tool, launchArgs, { stdio: 'inherit' });
+          return await launchSessionWithLease(sess, cwd, ask);
         }
         return { next: 'main' };
       }
@@ -3387,13 +3560,13 @@ async function mainScreen(rl, ask) {
       if (cmd === 'auto') {
         const cwd2 = process.cwd();
         const prof = loadProfile(cwd2);
-        const nextAuto = !(prof.automode ?? prof.settings?.automode ?? false);
-        prof.automode = nextAuto;
-        prof.settings = { ...(prof.settings || {}), automode: nextAuto };
-        saveProfile(prof, { cwd: cwd2 });
-        const state = prof.automode ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
-        process.stdout.write(`\n  Automode: ${state}\n`);
-        process.stdout.write(`  ${prof.automode ? 'Tasks dispatch immediately (HEAD still gates dangerous ops)' : 'Tasks require Enter to confirm'}\n\n`);
+        const nextAuto = !getEffectiveAutomode(prof, cwd2);
+        const settings = loadSessionSettings(cwd2);
+        settings.automode = nextAuto;
+        saveSessionSettings(cwd2, settings);
+        const state = nextAuto ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m';
+        process.stdout.write(`\n  Automode: ${state}  \x1b[2m(this session)\x1b[0m\n`);
+        process.stdout.write(`  ${nextAuto ? 'Tasks dispatch immediately (HEAD still gates dangerous ops)' : 'Tasks require Enter to confirm'}\n\n`);
         await ask('  Press Enter to continue...');
         return { next: 'main' };
       }
@@ -3491,7 +3664,7 @@ async function mainScreen(rl, ask) {
       }
 
       // Automode: if HEAD says it's safe, just go — no confirmation needed
-      const automode = profile.automode ?? profile.settings?.automode ?? false;
+      const automode = getEffectiveAutomode(profile, cwd);
       if (automode) {
         process.stdout.write(`\n  \x1b[36m⚡\x1b[0m ${summary}  (${model}, depth: ${hj?.depth || '?'})\n`);
         return { next: 'go', prompt: input, model, _loopResult: hj._loopResult };
@@ -3518,13 +3691,7 @@ async function mainScreen(rl, ask) {
       return { next: 'new-session' };
     }
     const sess = recentSessions[0];
-    const { spawnSync } = await import('node:child_process');
-    const tool = _sessionTool(sess);
-    const launchArgs = _sessionLaunchArgs(sess, cwd);
-    process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
-    spawnSync(tool, launchArgs, { stdio: 'inherit' });
-    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
-    return { next: 'main' };
+    return await launchSessionWithLease(sess, cwd, ask);
   }
 
   // Number 1-9 → resume that session
@@ -3539,13 +3706,7 @@ async function mainScreen(rl, ask) {
         if (ctx.filesTouched.length > 0) process.stdout.write(`  Files touched: ${ctx.filesTouched.join(', ')}\n`);
       }
     } catch {}
-    const { spawnSync } = await import('node:child_process');
-    const tool = _sessionTool(sess);
-    const launchArgs = _sessionLaunchArgs(sess, cwd);
-    process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
-    spawnSync(tool, launchArgs, { stdio: 'inherit' });
-    saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
-    return { next: 'main' };
+    return await launchSessionWithLease(sess, cwd, ask);
   }
 
   if (choice === 'n') { return { next: 'new-session' }; }
@@ -3584,11 +3745,7 @@ async function mainScreen(rl, ask) {
     const num  = parseInt(pick, 10);
     if (!isNaN(num) && num >= 1 && num <= Math.min(results.length, 9)) {
       const sess = results[num - 1];
-      const { spawnSync } = await import('node:child_process');
-      const tool = sess.tool === 'codex' ? 'codex' : 'claude';
-      const launchArgs = tool === 'codex' ? _codexResumeArgs(sess.id, cwd) : _claudeResumeArgs(sess.id, cwd);
-      process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
-      spawnSync(tool, launchArgs, { stdio: 'inherit' });
+      return await launchSessionWithLease(sess, cwd, ask);
     }
     return { next: 'main' };
   }
@@ -3598,11 +3755,11 @@ async function mainScreen(rl, ask) {
   if (choice === 'i') { return { next: 'import-picker' }; }
   if (choice === 'a') {
     const prof = loadProfile(cwd);
-    const nextAuto = !(prof.automode ?? prof.settings?.automode ?? false);
-    prof.automode = nextAuto;
-    prof.settings = { ...(prof.settings || {}), automode: nextAuto };
-    saveProfile(prof, { cwd });
-    process.stdout.write(`\n  Automode: ${prof.automode ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m'}\n\n`);
+    const nextAuto = !getEffectiveAutomode(prof, cwd);
+    const settings = loadSessionSettings(cwd);
+    settings.automode = nextAuto;
+    saveSessionSettings(cwd, settings);
+    process.stdout.write(`\n  Automode: ${nextAuto ? '\x1b[32mON\x1b[0m' : '\x1b[2mOFF\x1b[0m'}  \x1b[2m(this session)\x1b[0m\n\n`);
     await ask('  Press Enter to continue...');
     return { next: 'main' };
   }
@@ -4179,8 +4336,11 @@ async function settingsScreen(rl, ask) {
   // Load current work style
   const profile = loadProfile(cwd);
   const currentBias = profile?.bias || profile?.mode || 'balanced';
-  const automode = profile.automode ?? profile.settings?.automode ?? false;
-  const bypassPermissions = !!profile.bypassPermissions;
+  const automode = getEffectiveAutomode(profile, cwd);
+  const sessionSettings = loadSessionSettings(cwd);
+  const bypassPermissions = getEffectiveBypassPermissions(cwd);
+  const autoScope = typeof sessionSettings.automode === 'boolean' ? 'session' : 'default';
+  const permissionScope = typeof sessionSettings.bypassPermissions === 'boolean' ? 'session' : 'default';
 
   // Work style current markers
   const _stIsFast = ['cost-saver', 'auto', 'solo-claude', 'solo-openai'].includes(currentBias);
@@ -4228,8 +4388,8 @@ async function settingsScreen(rl, ask) {
     ? `${RED}bypass approvals and sandbox${RESET}`
     : `${GREEN}safe approvals + workspace sandbox${RESET}`;
   const convLines = [
-    `  ${DIM}Auto mode${RESET}      ${autoMark} ${automode ? 'run safe tasks immediately' : 'ask before launching tasks'}`,
-    `  ${DIM}Permissions${RESET}    ${permMark} ${permMode}`,
+    `  ${DIM}Auto mode${RESET}      ${autoMark} ${automode ? 'run safe tasks immediately' : 'ask before launching tasks'}  ${DIM}[${autoScope}]${RESET}`,
+    `  ${DIM}Permissions${RESET}    ${permMark} ${permMode}  ${DIM}[${permissionScope}]${RESET}`,
     `  ${DIM}Claude resume${RESET}  ${bypassPermissions ? '--dangerously-skip-permissions' : 'normal permissions'}`,
     `  ${DIM}Codex resume${RESET}   ${bypassPermissions ? '--dangerously-bypass-approvals-and-sandbox' : 'workspace-write + on-request'}`,
   ];
@@ -4353,19 +4513,20 @@ async function settingsScreen(rl, ask) {
   // Conversation behavior toggles
   if (choice === 'o') {
     const nextAuto = !automode;
-    profile.automode = nextAuto;
-    profile.settings = { ...(profile.settings || {}), automode: nextAuto };
-    saveProfile(profile, { cwd });
-    process.stdout.write(`\n  Auto mode: ${nextAuto ? GREEN + 'ON' + RESET : DIM + 'OFF' + RESET}\n\n`);
+    const settings = loadSessionSettings(cwd);
+    settings.automode = nextAuto;
+    saveSessionSettings(cwd, settings);
+    process.stdout.write(`\n  Auto mode: ${nextAuto ? GREEN + 'ON' + RESET : DIM + 'OFF' + RESET} ${DIM}(this session)${RESET}\n\n`);
     await ask('  Press Enter to continue...');
     return { next: 'settings' };
   }
 
   if (choice === 'v') {
     if (bypassPermissions) {
-      profile.bypassPermissions = false;
-      saveProfile(profile, { cwd });
-      process.stdout.write(`\n  Permission mode: ${GREEN}safe approvals + workspace sandbox${RESET}\n\n`);
+      const settings = loadSessionSettings(cwd);
+      settings.bypassPermissions = false;
+      saveSessionSettings(cwd, settings);
+      process.stdout.write(`\n  Permission mode: ${GREEN}safe approvals + workspace sandbox${RESET} ${DIM}(this session)${RESET}\n\n`);
       await ask('  Press Enter to continue...');
       return { next: 'settings' };
     }
@@ -4374,9 +4535,10 @@ async function settingsScreen(rl, ask) {
     process.stdout.write('  Use it only in trusted workspaces where the user explicitly accepts the risk.\n');
     const confirm = (await ask('  Type YES to enable bypass mode: ')).trim();
     if (confirm === 'YES') {
-      profile.bypassPermissions = true;
-      saveProfile(profile, { cwd });
-      process.stdout.write(`\n  Permission mode: ${RED}bypass approvals and sandbox${RESET}\n\n`);
+      const settings = loadSessionSettings(cwd);
+      settings.bypassPermissions = true;
+      saveSessionSettings(cwd, settings);
+      process.stdout.write(`\n  Permission mode: ${RED}bypass approvals and sandbox${RESET} ${DIM}(this session)${RESET}\n\n`);
     } else {
       process.stdout.write('\n  Permission mode unchanged.\n\n');
     }
@@ -5807,13 +5969,7 @@ async function sessionsScreen(rl, ask) {
         const sess = sessions[cursor];
         cleanup();
         process.stdout.write('\n');
-        const tool = _sessionTool(sess);
-        const launchArgs = _sessionLaunchArgs(sess, cwd);
-        process.stdout.write(`\n  Launching: ${tool} ${launchArgs.join(' ')}\n\n`);
-        const { spawnSync } = await import('node:child_process');
-        spawnSync(tool, launchArgs, { stdio: 'inherit' });
-        saveTerminalState(cwd, getTerminalId(), sess.id, sess.tool || 'claude');
-        resolve({ next: 'main' });
+        resolve(await launchSessionWithLease(sess, cwd, null));
         return;
       }
 
