@@ -1064,12 +1064,25 @@ function installDefaultShellLauncher(workspace, actions) {
     'fi',
     quietSetupEnd,
   ].join('\n');
+  const quietSessionStart = '# >>> dual-brain quiet data-tools session manager >>>';
+  const quietSessionEnd = '# <<< dual-brain quiet data-tools session manager <<<';
+  const quietSessionBlock = [
+    quietSessionStart,
+    'if [ -f "${SESSION_MANAGER}" ]; then',
+    '  if [ "${DUAL_BRAIN_DEFAULT_SHELL}" = "true" ]; then',
+    '    source "${SESSION_MANAGER}" >/dev/null 2>&1',
+    '  else',
+    '    source "${SESSION_MANAGER}"',
+    '  fi',
+    'fi',
+    quietSessionEnd,
+  ].join('\n');
   const block = [
     start,
     '# Added by dual-brain install. Set DUAL_BRAIN_SKIP=1 to bypass.',
     'if [ -t 1 ] && [ -z "${DUAL_BRAIN_LOADED}" ] && [ -z "${DUAL_BRAIN_SKIP}" ]; then',
     '  export DUAL_BRAIN_LOADED=1',
-    '  command -v dual-brain >/dev/null 2>&1 && dual-brain',
+    '  command -v dual-brain >/dev/null 2>&1 && dual-brain menu',
     'fi',
     end,
   ].join('\n');
@@ -1080,10 +1093,13 @@ function installDefaultShellLauncher(workspace, actions) {
     const existing = new RegExp(`${esc(start)}[\\s\\S]*?${esc(end)}\\n?`, 'm');
     const existingSuppress = new RegExp(`${esc(suppressStart)}[\\s\\S]*?${esc(suppressEnd)}\\n?`, 'm');
     const existingQuietSetup = new RegExp(`${esc(quietSetupStart)}[\\s\\S]*?${esc(quietSetupEnd)}\\n?`, 'm');
+    const existingQuietSession = new RegExp(`${esc(quietSessionStart)}[\\s\\S]*?${esc(quietSessionEnd)}\\n?`, 'm');
     src = src.replace(existing, '');
     src = src.replace(existingSuppress, '');
     src = src.replace(existingQuietSetup, '');
+    src = src.replace(existingQuietSession, '');
     src = src.replace(/\[ -f "\$\{SETUP_SCRIPT\}" \] && source "\$\{SETUP_SCRIPT\}"\n?/g, '');
+    src = src.replace(/\[ -f "\$\{SESSION_MANAGER\}" \] && source "\$\{SESSION_MANAGER\}"\n?/g, '');
     const earlyMarker = '# Claude Code Setup';
     const sessionMarker = '# Session Manager (interactive menu)';
     if (src.includes(earlyMarker)) src = src.replace(earlyMarker, `${suppressBlock}\n\n${earlyMarker}`);
@@ -1091,6 +1107,8 @@ function installDefaultShellLauncher(workspace, actions) {
     else src = `${suppressBlock}\n\n${src.replace(/^\s*/, '')}`;
     const setupMarker = 'SETUP_SCRIPT="/home/runner/workspace/.replit-tools/scripts/setup-claude-code.sh"';
     if (src.includes(setupMarker)) src = src.replace(setupMarker, `${setupMarker}\n${quietSetupBlock}`);
+    const sessionMgrMarker = 'SESSION_MANAGER="/home/runner/workspace/.replit-tools/scripts/claude-session-manager.sh"';
+    if (src.includes(sessionMgrMarker)) src = src.replace(sessionMgrMarker, `${sessionMgrMarker}\n${quietSessionBlock}`);
     const marker = '# Auto-show menu on shell start';
     if (src.includes(marker)) src = src.replace(marker, `${block}\n\n${marker}`);
     else src = `${src.replace(/\s*$/, '\n\n')}${block}\n`;

@@ -21,6 +21,6 @@ if [ -t 1 ] \
   && [ -z "$CLAUDE_MENU_LOADED" ]; then
   export DUAL_BRAIN_LOADED=1
   if command -v dual-brain &>/dev/null; then
-    dual-brain
+    dual-brain menu
   fi
 fi
