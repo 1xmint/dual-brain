@@ -1020,6 +1020,54 @@ function printReport(env, mode, actions, isDryRun, { skipBanner = false } = {}) 
   nl();
 }
 
+function loadDualBrainConfig(workspace) {
+  try {
+    const p = join(workspace, '.dualbrain', 'config.json');
+    if (!existsSync(p)) return null;
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function installDefaultShellLauncher(workspace, actions) {
+  const cfg = loadDualBrainConfig(workspace);
+  if (!cfg?.shellDefault) return;
+
+  const bashrcPath = join(workspace, '.config', 'bashrc');
+  if (!existsSync(bashrcPath)) {
+    actions.push('⊘ default shell launcher (.config/bashrc not found)');
+    return;
+  }
+
+  const start = '# >>> dual-brain default launcher >>>';
+  const end = '# <<< dual-brain default launcher <<<';
+  const block = [
+    start,
+    '# Added by dual-brain install. Set DUAL_BRAIN_SKIP=1 to bypass.',
+    'export CLAUDE_NO_PROMPT=true',
+    'if [ -t 1 ] && [ -z "${DUAL_BRAIN_LOADED}" ] && [ -z "${DUAL_BRAIN_SKIP}" ]; then',
+    '  export DUAL_BRAIN_LOADED=1',
+    '  command -v dual-brain >/dev/null 2>&1 && dual-brain',
+    'fi',
+    end,
+  ].join('\n');
+
+  try {
+    let src = readFileSync(bashrcPath, 'utf8');
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const existing = new RegExp(`${esc(start)}[\\s\\S]*?${esc(end)}\\n?`, 'm');
+    src = src.replace(existing, '');
+    const marker = '# Auto-show menu on shell start';
+    if (src.includes(marker)) src = src.replace(marker, `${block}\n\n${marker}`);
+    else src = `${src.replace(/\s*$/, '\n\n')}${block}\n`;
+    writeFileSync(bashrcPath, src, 'utf8');
+    actions.push('✓ dual-brain default shell launcher (.config/bashrc)');
+  } catch {
+    actions.push('⊘ default shell launcher (could not update .config/bashrc)');
+  }
+}
+
 // ─── Profile System ────────────────────────────────────────────────────────
 
 const PROFILE_FILE_REL = '.claude/dual-brain.profile.json';
@@ -1625,6 +1673,8 @@ async function main() {
       actions.push('  # or: source .dualbrain/shell-hook.sh');
     }
   }
+
+  installDefaultShellLauncher(env.workspace, actions);
 
   nl();
   await celebrate('Setup complete');
