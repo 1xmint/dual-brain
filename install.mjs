@@ -913,9 +913,9 @@ function install(workspace, env, mode) {
     'gpt-work-dispatcher.mjs', 'profiles.mjs',
     'summary-checkpoint.mjs', 'decision-ledger.mjs', 'control-panel.mjs',
     'risk-classifier.mjs', 'failure-detector.mjs',
-    'vibe-router.mjs', 'plan-generator.mjs', 'vibe-memory.mjs',
+    'plan-generator.mjs', 'vibe-memory.mjs',
     'wave-orchestrator.mjs',
-    'task-classifier.mjs', 'model-registry.mjs',
+    'model-registry.mjs',
     'auto-update-wrapper.mjs',
     'head-guard.mjs',
   ];
