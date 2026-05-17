@@ -1,6 +1,6 @@
 {
   "name": "dual-brain",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "AI orchestration across Claude + OpenAI subscriptions — smart routing, budget awareness, and dual-brain collaboration",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
     "./model-profiles": { "types": "./dist/src/model-profiles.d.ts", "default": "./dist/src/model-profiles.js" },
     "./signal": { "types": "./dist/src/signal.d.ts", "default": "./dist/src/signal.js" },
     "./routing-advisor": { "types": "./dist/src/routing-advisor.d.ts", "default": "./dist/src/routing-advisor.js" },
-    "./types": { "types": "./dist/src/types.d.ts", "default": "./dist/src/types.js" }
+    "./types": { "types": "./dist/src/types.d.ts", "default": "./dist/src/types.js" },
+    "./auto-handoff": { "types": "./dist/src/auto-handoff.d.ts", "default": "./dist/src/auto-handoff.js" }
   },
   "keywords": [
     "claude-code",

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// dual-brain — CLI entry point. Commands: init, go, think, review, status, remember, forget
+// dual-brain — CLI entry point. Commands: init, go, think, review, status, handoff, remember, forget
 
 import { appendFileSync, existsSync, readFileSync, mkdirSync, writeFileSync, statSync, readdirSync, unlinkSync, watch as fsWatch } from 'node:fs';
 import { join, dirname, basename, extname } from 'node:path';
@@ -294,6 +294,9 @@ Commands:
     --dry-run               Show routing decision without executing
     --files a.mjs,b.mjs     Provide file context for risk classification
     --verbose, -v           Print routing trace (intent, risk, health, model selection)
+  handoff                   Cross-provider switch (auto-detect limited provider)
+    --to claude|codex       Force handoff to a specific provider
+    --show                  Show current handoff context without switching
   think "question"          Multi-round architecture decision with dual-brain
   pr                        Show PR status for current branch
   pr create                 Create PR from current branch with auto-generated description
@@ -1137,6 +1140,98 @@ const PROVIDER_MODEL_CLASSES = {
   claude: ['haiku', 'sonnet', 'opus'],
   openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.2', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.4', 'gpt-5.5'],
 };
+
+async function cmdHandoff(args = []) {
+  const cwd = process.cwd();
+  const fxH = await getFx();
+  const toProvider = flag(args, '--to');
+  const showOnly = args.includes('--show');
+
+  let autoHandoff;
+  try {
+    autoHandoff = await import('../dist/src/auto-handoff.js');
+  } catch (e) {
+    err(`Could not load auto-handoff module: ${e.message}`);
+  }
+
+  const { executeHandoff, detectLimitReached, exportSessionContext, getHandoffUX } = autoHandoff;
+
+  // --show: display current handoff context without switching
+  if (showOnly) {
+    const context = exportSessionContext(cwd);
+    console.log(box('Handoff Context'));
+    console.log('');
+    if (context) {
+      console.log(JSON.stringify(context, null, 2));
+    } else {
+      fxH.info('No active session context to export.');
+    }
+    return;
+  }
+
+  const profile = loadProfile(cwd);
+  const providers = getAvailableProviders(profile);
+
+  if (providers.length < 2 && !toProvider) {
+    fxH.warn('Only one provider configured — nothing to hand off to.');
+    fxH.info('Run: dual-brain init  to configure a second provider.');
+    return;
+  }
+
+  // Detect which provider is limited
+  const limitStatus = detectLimitReached(cwd);
+  const ux = getHandoffUX(limitStatus, toProvider || null);
+
+  // Display UX message
+  if (ux.title) console.log(box(ux.title));
+  if (ux.message) {
+    console.log('');
+    fxH.info(ux.message);
+  }
+  if (ux.detail) {
+    fxH.dim(ux.detail);
+  }
+  console.log('');
+
+  // If --to is specified, force handoff regardless of limit status
+  if (toProvider) {
+    const target = toProvider.toLowerCase();
+    if (target !== 'claude' && target !== 'codex') {
+      err('--to must be "claude" or "codex"');
+    }
+    const result = executeHandoff(cwd, target);
+    if (result.success) {
+      fxH.success(`Handed off to ${target}.`);
+      if (result.command) {
+        console.log('');
+        fxH.info(`Resume with: ${result.command}`);
+      }
+    } else {
+      fxH.error(result.error || `Handoff to ${target} failed.`);
+    }
+    return;
+  }
+
+  // Auto-detect: if a provider is limited, switch to the other
+  if (limitStatus.limited) {
+    const target = limitStatus.switchTo;
+    fxH.warn(`${limitStatus.provider} is limited — switching to ${target}`);
+    console.log('');
+    const result = executeHandoff(cwd, target);
+    if (result.success) {
+      fxH.success(`Handed off to ${target}.`);
+      if (result.command) {
+        console.log('');
+        fxH.info(`Resume with: ${result.command}`);
+      }
+    } else {
+      fxH.error(result.error || `Handoff to ${target} failed.`);
+    }
+  } else {
+    fxH.success('No provider is currently limited. No handoff needed.');
+    fxH.dim('Use --to claude or --to codex to force a switch.');
+  }
+}
 
 function cmdHot(providerArg) {
   if (!providerArg) err('Usage: dual-brain hot <provider>  (claude | openai)');
@@ -6769,6 +6864,7 @@ async function main() {
   if (cmd === 'ship')     { await cmdShip(); return; }
   if (cmd === 'pr')       { await cmdPR(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
+  if (cmd === 'handoff')  { await cmdHandoff(args.slice(1)); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
   if (cmd === 'remember')    { cmdRemember(args[1]); return; }
@@ -6832,7 +6928,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'hot', 'cool',
+    'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),
