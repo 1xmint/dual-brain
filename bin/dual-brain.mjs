@@ -1564,10 +1564,36 @@ async function cmdRuntimeSwitch(args = []) {
 }
 
 async function cmdAuto(args = []) {
-  const switchArgs = ['--automode', '--confirm'];
+  const switchArgs = ['--automode', '--confirm', '--apply'];
   const levelIdx = args.findIndex(a => a === '--level' || a === '--intelligence' || a === '--intelligence-level');
   if (levelIdx !== -1 && args[levelIdx + 1]) switchArgs.push('--level', args[levelIdx + 1]);
   await cmdRuntimeSwitch(switchArgs);
+}
+
+async function cmdSwitchover(args = []) {
+  const cwd = process.cwd();
+  let sessions = [];
+  try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
+  const active = readActiveConversation(cwd);
+  const sess = active
+    ? (sessions.find(s => s.id === active.sessionId) || {
+        id: active.sessionId,
+        tool: active.provider,
+        smartName: active.sessionName || active.conversationId || active.sessionId,
+      })
+    : sessions[0];
+  if (!sess) {
+    console.log('No resumable session found.');
+    return;
+  }
+
+  let target = null;
+  const joined = args.join(' ').toLowerCase();
+  if (/\b(gpt|codex|openai)\b/.test(joined)) target = 'codex';
+  if (/\bclaude\b/.test(joined)) target = 'claude';
+  target ||= _sessionTool(sess) === 'codex' ? 'claude' : 'codex';
+
+  await cmdRuntimeSwitch(['--to', target, '--automode', '--confirm', '--apply', '--reason', 'head-switchover']);
 }
 
 async function cmdUpdate() {
@@ -2535,6 +2561,9 @@ function applyIntelligenceCommand(cmd, cwd) {
 
 function parseProviderSwitchCommand(input) {
   const text = input.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (/\b(switch over|switchover|switch)\b.*\b(auto|automode|auto mode|smart auto)\b/.test(text)) {
+    return { provider: null, automode: true };
+  }
   if (!/\b(switchover|switch over|switch provider|other provider|continue in (gpt|codex|claude|other provider)|switch (to|into) (gpt|codex|claude|openai))\b/.test(text)) {
     return null;
   }
@@ -4297,6 +4326,10 @@ async function mainScreen(rl, ask) {
       }
 
       if (cmd === 'provider-switch') {
+        if (classified.providerSwitchCommand.automode) {
+          await cmdAuto(['--level', String(_getIntelligenceLevel(loadProfile(cwd), loadSessionSettings(cwd)))]);
+          return { next: 'main' };
+        }
         const sess = getActionSession(cwd, recentSessions);
         if (!sess) return { next: 'new-session' };
         const target = classified.providerSwitchCommand.provider;
@@ -8101,9 +8134,11 @@ async function main() {
   if (cmd === 'pr')       { await cmdPR(args.slice(1)); return; }
   if (cmd === 'status')   { await cmdStatus(args.slice(1)); return; }
   if (cmd === 'handoff')  { await cmdHandoff(args.slice(1)); return; }
+  if (cmd === 'switch' && /\b(auto|automode|auto mode|smart auto)\b/i.test(args.join(' '))) { await cmdAuto(args.slice(1)); return; }
   if (cmd === 'switch')   { await cmdSwitch(args.slice(1)); return; }
   if (cmd === 'runtime-switch') { await cmdRuntimeSwitch(args.slice(1)); return; }
   if (cmd === 'auto' || cmd === 'automode' || cmd === 'smart-auto') { await cmdAuto(args.slice(1)); return; }
+  if (cmd === 'switchover' || cmd === 'switch-over') { await cmdSwitchover(args.slice(1)); return; }
   if (cmd === 'update' || cmd === 'upgrade') { await cmdUpdate(); return; }
   if (cmd === 'hot')      { cmdHot(args[1]); return; }
   if (cmd === 'cool')     { cmdCool(args[1]); return; }
@@ -8168,7 +8203,7 @@ fi
   // If cmd is not a recognized subcommand, treat the entire arg list as a task.
   // e.g. `dual-brain fix failing tests` → same as `dual-brain go "fix failing tests"`
   const KNOWN_COMMANDS = new Set([
-    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'runtime-switch', 'auto', 'automode', 'smart-auto', 'hot', 'cool',
+    'menu', 'init', 'install', 'uninstall', 'auth', 'go', 'do', 'plan', 'ship', 'think', 'review', 'pr', 'status', 'handoff', 'switch', 'switchover', 'switch-over', 'runtime-switch', 'auto', 'automode', 'smart-auto', 'hot', 'cool',
     'remember', 'forget', 'break-glass', 'specialists', 'search', 'shell-hook', 'watch', 'update', 'upgrade',
     '--help', '-h', '--version', '-v',
     ...Object.keys(loadSpecialistRegistry()),
