@@ -1564,6 +1564,7 @@ async function cmdRuntimeSwitch(args = []) {
     const activeForSwitch = readActiveConversation(cwd);
     if (activeForSwitch?.sessionId === sess.id) {
       console.log('Active supervisor detected: HEAD will restart with these settings.');
+      signalActiveConversation(cwd, sess.id);
     } else if (!args.includes('--apply')) {
       console.log('No active supervisor detected: saved for the next dual-brain resume/switch, not live yet.');
     }
@@ -2851,6 +2852,18 @@ function updateActiveConversation(cwd, sessionId, updates = {}) {
   } catch {}
 }
 
+function signalActiveConversation(cwd, sessionId) {
+  try {
+    const lease = JSON.parse(readFileSync(activeConversationPath(cwd), 'utf8'));
+    if (sessionId && lease.sessionId !== sessionId) return false;
+    if (!pidAlive(lease.ownerPid)) return false;
+    process.kill(lease.ownerPid, 'SIGUSR1');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function writeHandoffConversationLease(cwd, session, fromTool, targetTool, taskBrief = '') {
   const dir = join(cwd, '.dualbrain');
   const terminalId = getTerminalId();
@@ -2957,6 +2970,12 @@ async function launchSupervisedHead(tool, launchArgs, cwd, session) {
       }, 2500);
     };
 
+    const onSignalSwitch = () => {
+      const pending = readPendingRuntimeSwitch(cwd);
+      if (pendingSwitchMatchesSession(pending, session)) stopChildForSwitch();
+    };
+    process.on('SIGUSR1', onSignalSwitch);
+
     const watcher = setInterval(() => {
       const pending = readPendingRuntimeSwitch(cwd);
       if (pendingSwitchMatchesSession(pending, session)) stopChildForSwitch();
@@ -2964,6 +2983,7 @@ async function launchSupervisedHead(tool, launchArgs, cwd, session) {
 
     child.on('exit', async (code, signal) => {
       clearInterval(watcher);
+      process.off('SIGUSR1', onSignalSwitch);
       if (forceTimer) clearTimeout(forceTimer);
       saveTerminalState(cwd, getTerminalId(), session?.id, session?.tool || tool);
 
@@ -2979,6 +2999,7 @@ async function launchSupervisedHead(tool, launchArgs, cwd, session) {
 
     child.on('error', (err) => {
       clearInterval(watcher);
+      process.off('SIGUSR1', onSignalSwitch);
       if (forceTimer) clearTimeout(forceTimer);
       process.stderr.write(`\n  Could not launch ${tool}: ${err.message}\n`);
       clearActiveConversation(cwd, session?.id);
