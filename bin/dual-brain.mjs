@@ -4839,15 +4839,18 @@ async function newSessionScreen(rl, ask) {
     process.stdout.write(`  Model:       ${settings.headModel || policy.model} (${settings.effort || policy.effort || 'default'})\n`);
     process.stdout.write('  Mode:        Smart Auto\n');
     process.stdout.write(`  Permissions: ${provider === 'codex' ? 'never ask + Replit sandbox boundary' : 'auto'}\n\n`);
-    process.stdout.write('  Enter start recommended  p start with pasted prompt  b back\n\n');
+    process.stdout.write('  Enter start recommended  paste prompt here to start  b back\n\n');
   };
 
   renderStart();
-  let choice = (await ask('  Choice: ')).trim().toLowerCase();
+  const rawChoice = (await ask('  Choice or prompt: ')).trim();
+  let choice = rawChoice.toLowerCase();
   let initialPrompt = '';
   if (choice === 'b' || choice === 'q') return { next: 'main' };
   if (choice === 'p' || choice === 'prompt') {
     initialPrompt = (await ask('  Initial prompt: ')).trim();
+  } else if (rawChoice) {
+    initialPrompt = rawChoice;
   }
 
   const policy = _headPolicyFor(provider, profile, settings);
