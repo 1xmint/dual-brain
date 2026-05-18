@@ -1462,21 +1462,16 @@ async function cmdRuntimeSwitch(args = []) {
   const cwd = process.cwd();
   let sessions = [];
   try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
-  const active = readActiveConversation(cwd);
-  const sess = active
-    ? (sessions.find(s => s.id === active.sessionId) || {
-        id: active.sessionId,
-        tool: active.provider,
-        smartName: active.sessionName || active.conversationId || active.sessionId,
-      })
-    : sessions[0];
+  const resolved = resolveCurrentConversationSession(cwd, sessions);
+  const active = resolved.active;
+  const sess = resolved.session;
   if (!sess) {
-    console.log('No resumable session found.');
+    console.log('No current logical conversation found. Resume the intended chat through dual-brain first.');
     return;
   }
 
   const profile = loadProfile(cwd);
-  const settingsTerminalId = active?.terminalId || getTerminalId();
+  const settingsTerminalId = resolved.terminalId || getTerminalId();
   const settings = loadSessionSettings(cwd, settingsTerminalId);
   let provider = _sessionTool(sess);
   let reason = 'head-runtime-switch';
@@ -1522,6 +1517,11 @@ async function cmdRuntimeSwitch(args = []) {
     settings.headModel = existingPending.model;
     if (!explicitEffort && existingPending.effort) settings.effort = existingPending.effort;
   }
+  const runningHead = inferRunningHeadConfig(cwd, sess.id, provider);
+  if (!explicitModel && !explicitLevel && _modelMatchesProvider(runningHead.model, provider)) {
+    settings.headModel = runningHead.model;
+    if (!explicitEffort && runningHead.effort) settings.effort = runningHead.effort;
+  }
 
   const headPolicy = _headPolicyFor(provider, profile, settings);
   if (!settings.headModel || !_modelMatchesProvider(settings.headModel, provider)) {
@@ -1549,7 +1549,7 @@ async function cmdRuntimeSwitch(args = []) {
   });
 
   const launchArgs = provider === _sessionTool(sess)
-    ? _sessionLaunchArgs(sess, cwd)
+    ? runtimeLaunchArgsForPending(sess, cwd, pending)
     : ['handoff', '--to', provider];
 
   console.log('');
@@ -1598,16 +1598,10 @@ async function cmdSwitchover(args = []) {
   const cwd = process.cwd();
   let sessions = [];
   try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
-  const active = readActiveConversation(cwd);
-  const sess = active
-    ? (sessions.find(s => s.id === active.sessionId) || {
-        id: active.sessionId,
-        tool: active.provider,
-        smartName: active.sessionName || active.conversationId || active.sessionId,
-      })
-    : sessions[0];
+  const resolved = resolveCurrentConversationSession(cwd, sessions);
+  const sess = resolved.session;
   if (!sess) {
-    console.log('No resumable session found.');
+    console.log('No current logical conversation found. Resume the intended chat through dual-brain first.');
     return;
   }
 
@@ -2428,6 +2422,87 @@ function loadTerminalState(cwd, terminalId) {
   } catch { return null; }
 }
 
+function loadLatestTerminalState(cwd) {
+  try {
+    const dir = join(cwd, '.dualbrain');
+    const files = readdirSync(dir)
+      .filter(f => /^terminal-.*\.json$/.test(f))
+      .map(f => {
+        const full = join(dir, f);
+        const state = JSON.parse(readFileSync(full, 'utf8'));
+        return { state, mtime: statSync(full).mtimeMs };
+      })
+      .filter(x => x.state?.sessionId)
+      .sort((a, b) => (b.state.timestamp || b.mtime || 0) - (a.state.timestamp || a.mtime || 0));
+    return files[0]?.state || null;
+  } catch { return null; }
+}
+
+function sessionFromState(state, sessions = []) {
+  if (!state?.sessionId) return null;
+  return sessions.find(s => s.id === state.sessionId) || {
+    id: state.sessionId,
+    tool: state.tool || state.provider || 'claude',
+    smartName: state.sessionName || state.conversationId || state.sessionId,
+  };
+}
+
+function resolveCurrentConversationSession(cwd, sessions = [], { allowLatestTerminal = true } = {}) {
+  const terminalId = getTerminalId();
+  const active = readActiveConversation(cwd);
+  if (active?.terminalId === terminalId) {
+    return {
+      session: sessionFromState({
+        sessionId: active.sessionId,
+        tool: active.provider,
+        sessionName: active.sessionName,
+        conversationId: active.conversationId,
+      }, sessions),
+      terminalId,
+      source: 'active-terminal',
+      active,
+    };
+  }
+
+  const terminalState = loadTerminalState(cwd, terminalId);
+  if (terminalState?.sessionId) {
+    return {
+      session: sessionFromState(terminalState, sessions),
+      terminalId,
+      source: 'terminal-state',
+      active: null,
+    };
+  }
+
+  if (allowLatestTerminal) {
+    const latestState = loadLatestTerminalState(cwd);
+    if (latestState?.sessionId) {
+      return {
+        session: sessionFromState(latestState, sessions),
+        terminalId: latestState.terminalId || null,
+        source: 'latest-terminal-state',
+        active: null,
+      };
+    }
+  }
+
+  if (active?.sessionId) {
+    return {
+      session: sessionFromState({
+        sessionId: active.sessionId,
+        tool: active.provider,
+        sessionName: active.sessionName,
+        conversationId: active.conversationId,
+      }, sessions),
+      terminalId: active.terminalId || null,
+      source: 'active-other-terminal',
+      active,
+    };
+  }
+
+  return { session: null, terminalId, source: 'none', active: null };
+}
+
 function sessionSettingsPath(cwd, terminalId = getTerminalId()) {
   return join(cwd, '.dualbrain', `session-settings-${terminalId}.json`);
 }
@@ -2597,15 +2672,7 @@ function parseProviderSwitchCommand(input) {
 }
 
 function getActionSession(cwd, recentSessions = []) {
-  const active = readActiveConversation(cwd);
-  if (active) {
-    return recentSessions.find(s => s.id === active.sessionId) || {
-      id: active.sessionId,
-      tool: active.provider,
-      smartName: active.sessionName || active.conversationId || active.sessionId,
-    };
-  }
-  return recentSessions[0] || null;
+  return resolveCurrentConversationSession(cwd, recentSessions).session;
 }
 
 async function switchProviderNow(cwd, session, target = null) {
@@ -2781,13 +2848,46 @@ function readActiveConversation(cwd) {
   } catch { return null; }
 }
 
+function inferRunningHeadConfig(cwd, sessionId, provider) {
+  const active = readActiveConversation(cwd);
+  if (!active?.childPid || (sessionId && active.sessionId !== sessionId)) return {};
+  const fallback = {
+    provider: active.provider || provider,
+    model: _modelMatchesProvider(active.model, provider) ? active.model : null,
+    effort: active.effort || null,
+  };
+  try {
+    const args = execSync(`ps -o args= -p ${Number(active.childPid)}`, {
+      cwd,
+      encoding: 'utf8',
+      timeout: 1000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (!args) return {};
+    const parts = args.match(/(?:[^\s"]+|"[^"]*")+/g)?.map(s => s.replace(/^"|"$/g, '')) || [];
+    const modelIdx = parts.indexOf('--model');
+    const effortIdx = parts.indexOf('--effort');
+    const model = modelIdx !== -1 ? parts[modelIdx + 1] : null;
+    const effort = effortIdx !== -1 ? parts[effortIdx + 1] : null;
+    return {
+      provider: active.provider || provider,
+      model: _modelMatchesProvider(model, provider) ? model : fallback.model,
+      effort: effort || fallback.effort || null,
+    };
+  } catch { return fallback; }
+}
+
 async function processPendingRuntimeSwitch(cwd) {
   const pending = readPendingRuntimeSwitch(cwd);
   if (!pending || pending.status !== 'confirmed' || pending.autoLaunch === false) return false;
 
   let sessions = [];
   try { sessions = enrichSessions(importReplitSessions(cwd), cwd); } catch {}
-  const sess = sessions.find(s => s.id === pending.sessionId) || sessions[0];
+  const sess = sessions.find(s => s.id === pending.sessionId) || {
+    id: pending.sessionId,
+    tool: pending.fromProvider || pending.provider || 'claude',
+    smartName: pending.sessionName || pending.sessionId,
+  };
   if (!sess) {
     clearPendingRuntimeSwitch(cwd);
     return false;
@@ -2811,7 +2911,12 @@ async function processPendingRuntimeSwitch(cwd) {
 
   const launchArgs = runtimeLaunchArgsForPending(sess, cwd, pending);
   process.stdout.write(`  Launching: ${targetTool} ${launchArgs.join(' ')}\n\n`);
-  writeActiveConversation(cwd, sess, targetTool);
+  writeActiveConversation(cwd, sess, targetTool, {
+    model: pending.model || null,
+    effort: pending.effort || null,
+    automode: pending.automode === true,
+    bypassPermissions: pending.bypassPermissions === true,
+  });
   try {
     await launchSupervisedHead(targetTool, launchArgs, cwd, sess);
   } finally {
@@ -2831,6 +2936,10 @@ function writeActiveConversation(cwd, session, tool, extra = {}) {
     terminalId,
     ownerPid: process.pid,
     childPid: extra.childPid || null,
+    model: extra.model || null,
+    effort: extra.effort || null,
+    automode: extra.automode === true,
+    bypassPermissions: extra.bypassPermissions === true,
     startedAt: new Date().toISOString(),
     lastHeartbeat: new Date().toISOString(),
     mode: 'active-head',
