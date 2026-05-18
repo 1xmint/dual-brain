@@ -1481,6 +1481,9 @@ async function cmdRuntimeSwitch(args = []) {
   let provider = _sessionTool(sess);
   let reason = 'head-runtime-switch';
   const confirmed = args.includes('--confirm') || args.includes('--go');
+  const explicitModel = args.includes('--model') || args.includes('--head-model');
+  const explicitEffort = args.includes('--effort');
+  const explicitLevel = args.includes('--level') || args.includes('--intelligence') || args.includes('--intelligence-level');
 
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
@@ -1514,6 +1517,12 @@ async function cmdRuntimeSwitch(args = []) {
     settings.bypassPermissions = true;
   }
 
+  const existingPending = readPendingRuntimeSwitch(cwd);
+  if (!explicitModel && !explicitLevel && existingPending?.sessionId === sess.id && existingPending.provider === provider && _modelMatchesProvider(existingPending.model, provider)) {
+    settings.headModel = existingPending.model;
+    if (!explicitEffort && existingPending.effort) settings.effort = existingPending.effort;
+  }
+
   const headPolicy = _headPolicyFor(provider, profile, settings);
   if (!settings.headModel || !_modelMatchesProvider(settings.headModel, provider)) {
     settings.headModel = headPolicy.model;
@@ -1536,6 +1545,7 @@ async function cmdRuntimeSwitch(args = []) {
     effort: settings.effort,
     confirmed,
     reason,
+    changedBy: 'HEAD',
   });
 
   const launchArgs = provider === _sessionTool(sess)
@@ -1546,6 +1556,9 @@ async function cmdRuntimeSwitch(args = []) {
   console.log(`Runtime switch ${confirmed ? 'confirmed' : 'prepared'} for ${pending?.sessionName || sess.id}`);
   console.log(`Provider: ${provider}`);
   console.log(`Mode: ${getEffectiveConversationMode(profile, cwd)}`);
+  console.log(`Model: ${settings.headModel || 'default'}${settings.effort ? ` (${settings.effort})` : ''}`);
+  console.log(`Changed by: HEAD`);
+  console.log(`Reason: ${reason}`);
   console.log(`Launch: ${provider} ${launchArgs.join(' ')}`);
   if (confirmed) {
     const activeForSwitch = readActiveConversation(cwd);
@@ -2714,6 +2727,7 @@ function writePendingRuntimeSwitch(cwd, session, updates = {}) {
     automode: typeof updates.automode === 'boolean' ? updates.automode : null,
     bypassPermissions: typeof updates.bypassPermissions === 'boolean' ? updates.bypassPermissions : null,
     reason: updates.reason || 'runtime-settings-change',
+    changedBy: updates.changedBy || 'HEAD',
     autoLaunch: updates.autoLaunch !== false,
     handoffBrief: updates.handoffBrief || _sessionBrief(session, tool),
   };
