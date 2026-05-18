@@ -6,6 +6,7 @@ import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawnSync as _spawnSyncTop } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
 
 import {
   ensureProfile, loadProfile, saveProfile, runOnboarding,
@@ -65,6 +66,22 @@ function _codexResumeArgs(sessionId, cwd) {
     ..._codexApprovalArgs(workspace, approvalMode),
     'resume',
     sessionId,
+  ];
+}
+
+function _codexNewArgs(cwd) {
+  const workspace = cwd || process.cwd();
+  if (getEffectiveBypassPermissions(workspace)) {
+    return ['--dangerously-bypass-approvals-and-sandbox'];
+  }
+  const settings = loadSessionSettings(workspace);
+  const approvalMode = getEffectiveAutomode(loadProfile(workspace), workspace) ? 'never' : 'on-request';
+  return [
+    ..._codexModelEffortArgs(
+      _modelMatchesProvider(settings.headModel, 'codex') ? settings.headModel : null,
+      settings.effort,
+    ),
+    ..._codexApprovalArgs(workspace, approvalMode),
   ];
 }
 
@@ -4795,11 +4812,79 @@ async function mainScreen(rl, ask) {
 
 async function newSessionScreen(rl, ask) {
   const cwd = process.cwd();
-  const input = (await ask('\n  What do you want to do? ')).trim();
-  if (!input) { return { next: 'main' }; }
+  const profile = loadProfile(cwd);
+  const settings = loadSessionSettings(cwd);
+  settings.automode = true;
+  settings.bypassPermissions = false;
 
-  // All work routes through pipeline — detect → decide → dispatch with mandatory gates.
-  await cmdGo([input], { cwd });
+  let provider = _modelMatchesProvider(settings.headModel, 'claude') ? 'claude' : 'codex';
+  if (!_modelMatchesProvider(settings.headModel, provider)) {
+    const policy = _headPolicyFor(provider, profile, settings);
+    settings.headModel = policy.model;
+    settings.effort = policy.effort;
+  }
+  saveSessionSettings(cwd, settings);
+
+  const renderStart = () => {
+    const policy = _headPolicyFor(provider, profile, settings);
+    if (!_modelMatchesProvider(settings.headModel, provider)) {
+      settings.headModel = policy.model;
+      settings.effort = policy.effort;
+      saveSessionSettings(cwd, settings);
+    }
+    process.stdout.write('\n');
+    process.stdout.write('  New HEAD Conversation\n\n');
+    process.stdout.write('  Recommended Balanced Session\n');
+    process.stdout.write(`  Provider:    ${provider === 'codex' ? 'GPT/Codex' : 'Claude'}\n`);
+    process.stdout.write(`  Model:       ${settings.headModel || policy.model} (${settings.effort || policy.effort || 'default'})\n`);
+    process.stdout.write('  Mode:        Smart Auto\n');
+    process.stdout.write(`  Permissions: ${provider === 'codex' ? 'never ask + Replit sandbox boundary' : 'auto'}\n\n`);
+    process.stdout.write('  Enter start recommended  p start with pasted prompt  b back\n\n');
+  };
+
+  renderStart();
+  let choice = (await ask('  Choice: ')).trim().toLowerCase();
+  let initialPrompt = '';
+  if (choice === 'b' || choice === 'q') return { next: 'main' };
+  if (choice === 'p' || choice === 'prompt') {
+    initialPrompt = (await ask('  Initial prompt: ')).trim();
+  }
+
+  const policy = _headPolicyFor(provider, profile, settings);
+  if (!_modelMatchesProvider(settings.headModel, provider)) settings.headModel = policy.model;
+  if (!settings.effort) settings.effort = policy.effort;
+  settings.automode = true;
+  settings.bypassPermissions = false;
+  saveSessionSettings(cwd, settings);
+
+  const session = {
+    id: randomUUID(),
+    tool: provider,
+    smartName: 'New HEAD Conversation',
+    firstPrompt: initialPrompt || 'New dual-brain HEAD conversation',
+  };
+  const launchArgs = provider === 'codex'
+    ? _codexNewArgs(cwd)
+    : ['--session-id', session.id, ..._claudeNewArgs(cwd)];
+  if (initialPrompt) launchArgs.push(initialPrompt);
+
+  process.stdout.write('\n');
+  process.stdout.write('  Starting HEAD in Smart Auto...\n');
+  process.stdout.write(`  Provider: ${provider === 'codex' ? 'GPT/Codex' : 'Claude'}\n`);
+  process.stdout.write(`  Model: ${settings.headModel || 'default'}${settings.effort ? ` (${settings.effort})` : ''}\n`);
+  process.stdout.write(`  Launch: ${provider} ${launchArgs.join(' ')}\n\n`);
+
+  writeActiveConversation(cwd, session, provider, {
+    model: settings.headModel || null,
+    effort: settings.effort || null,
+    automode: true,
+    bypassPermissions: false,
+  });
+  try {
+    await launchSupervisedHead(provider, launchArgs, cwd, session);
+  } finally {
+    clearActiveConversation(cwd, session.id);
+  }
 
   return { next: 'main' };
 }
