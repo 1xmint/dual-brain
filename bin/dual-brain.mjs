@@ -1552,6 +1552,10 @@ async function cmdRuntimeSwitch(args = []) {
     ? runtimeLaunchArgsForPending(sess, cwd, pending)
     : ['handoff', '--to', provider];
 
+  const activeForSwitch = confirmed ? readActiveConversation(cwd) : null;
+  const activeMatches = activeForSwitch?.sessionId === sess.id;
+  let restartSignaled = false;
+
   console.log('');
   console.log(`Runtime switch ${confirmed ? 'confirmed' : 'prepared'} for ${pending?.sessionName || sess.id}`);
   console.log(`Provider: ${provider}`);
@@ -1561,10 +1565,16 @@ async function cmdRuntimeSwitch(args = []) {
   console.log(`Reason: ${reason}`);
   console.log(`Launch: ${provider} ${launchArgs.join(' ')}`);
   if (confirmed) {
-    const activeForSwitch = readActiveConversation(cwd);
-    if (activeForSwitch?.sessionId === sess.id) {
-      console.log('Active supervisor detected: HEAD will restart with these settings.');
-      signalActiveConversation(cwd, sess.id);
+    if (activeMatches) {
+      restartSignaled = signalActiveConversation(cwd, sess.id);
+      if (restartSignaled) {
+        const terminalNote = activeForSwitch.terminalId && activeForSwitch.terminalId !== getTerminalId()
+          ? ` in ${activeForSwitch.terminalId}`
+          : '';
+        console.log(`Active supervisor detected${terminalNote}: restart signal sent.`);
+      } else {
+        console.log('Active supervisor was detected, but the restart signal could not be delivered.');
+      }
     } else if (!args.includes('--apply')) {
       console.log('No active supervisor detected: saved for the next dual-brain resume/switch, not live yet.');
     }
@@ -1573,7 +1583,12 @@ async function cmdRuntimeSwitch(args = []) {
 
   if (args.includes('--apply')) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      console.log('Non-interactive shell detected: saved for the active dual-brain terminal to apply.');
+      if (restartSignaled) {
+        console.log('Non-interactive shell detected: command applied by signaling the active dual-brain terminal.');
+      } else {
+        console.log('Non-interactive shell detected: saved for the next dual-brain resume/switch.');
+        console.log('This command cannot mutate an unattached API/chat surface that is already running under another provider.');
+      }
     } else {
       const applied = await processPendingRuntimeSwitch(cwd);
       if (!applied) console.log('Could not apply live here; resume the session through dual-brain to use these settings.');
